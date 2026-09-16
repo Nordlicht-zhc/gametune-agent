@@ -117,6 +117,28 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertFalse(page.save_button.isEnabled())
         page.deleteLater()
 
+    def test_internal_graphics_mode_is_shown_as_clear_chinese(self):
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT,
+            "测试独显直连",
+            "显卡输出模式",
+            "混合输出",
+            "独显直连",
+            "原因",
+            "假设",
+            "方法",
+            "标准",
+            "恢复",
+            1,
+            setting_id="graphics_mode",
+        )
+        page = ExperimentPage(TaskState(graphics_mode="hybrid"), plan)
+        self.assertEqual(page.actual_setting.text(), "混合输出")
+        self.assertEqual(page._supplement_value(), "hybrid")
+        page.actual_setting.setText("独显直连")
+        self.assertEqual(page._supplement_value(), "dgpu")
+        page.deleteLater()
+
     def test_retest_keeps_the_same_round_and_plan(self):
         controller = FakeController()
         with tempfile.TemporaryDirectory() as folder:

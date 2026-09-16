@@ -3,7 +3,7 @@ from __future__ import annotations
 from models.schemas import Decision, Evidence, ExperimentPlan, OptimizationTask
 
 from .api import ModelAPIError, ModelProvider
-from .prompts import decision_explanation_request, parse_explanation
+from .prompts import decision_explanation_request, final_report_request, parse_explanation
 
 
 def explain_decision(
@@ -25,7 +25,12 @@ def explain_decision(
     if provider is None:
         return fallback
     try:
-        response = provider.complete(decision_explanation_request(task, decision, evidence, plan))
+        request_factory = (
+            final_report_request
+            if decision.task_complete or decision.action.value == "finish"
+            else decision_explanation_request
+        )
+        response = provider.complete(request_factory(task, decision, evidence, plan))
         explanation = parse_explanation(response.content)
         explanation["source"] = "model"
         return explanation

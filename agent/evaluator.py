@@ -112,30 +112,30 @@ def evaluate_result(
 
     if not candidate.configuration_confirmed:
         return bounded_retest(
-            "尚未确认本轮配置已执行，暂不把结果作为有效实验。",
-            ["请确认已按本轮方案执行，并记录实际配置后再评估。"],
+            "还没有确认本轮设置已经执行，因此暂不评估结果。",
+            ["请先确认已经完成调整，并填写实际使用的配置。"],
         )
     if not candidate.comparable or candidate.test_scene.strip() != baseline.test_scene.strip():
         return bounded_retest(
-            "测试条件不一致，暂不判断调整效果。",
-            ["请使用与基线相同的场景、路线、供电模式和采集口径重新测试。"],
+            "测试条件与基线不同，当前结果不能直接比较。",
+            ["请使用与基线相同的场景、路线、供电模式和采集方法重新测试。"],
         )
 
     actual_runs, avg_spread, low_spread = _run_dispersion(candidate)
     if actual_runs < minimum_repeats:
         return bounded_retest(
-            f"本轮只有 {actual_runs} 次有效测试，至少需要 {minimum_repeats} 次才能确认收益。",
-            ["请在保持同一配置和测试条件的情况下追加测试。"],
+            f"本轮只有 {actual_runs} 次有效测试，至少需要 {minimum_repeats} 次。",
+            ["请保持配置和测试条件不变，再补充测试。"],
         )
     if avg_spread is not None and low_spread is not None and (
         avg_spread > _DISPERSION_LIMIT_PCT or low_spread > _DISPERSION_LIMIT_PCT
     ):
         return bounded_retest(
-            "同一配置的多次测试波动超过 5%，暂不能确认调整效果。",
+            "同一配置的测试结果相差超过 5%，暂时无法确认是否有效。",
             [
                 f"平均 FPS 波动 {avg_spread:.1f}%",
                 f"1% Low 波动 {low_spread:.1f}%",
-                "请控制测试条件后追加同一配置的复测。",
+                "请保持测试条件一致，再测试几次。",
             ],
         )
 
@@ -152,7 +152,7 @@ def evaluate_result(
         # explicit fields make acceptance and completion unambiguous.
         return _decision(
             AgentAction.FINISH,
-            "平均 FPS 与 1% Low 均达到目标，可结束当前优化任务。",
+            "平均 FPS 和 1% Low 都已达到目标，可以结束优化。",
             avg_delta=avg_delta,
             low_delta=low_delta,
             score_delta=score_delta,
@@ -162,35 +162,35 @@ def evaluate_result(
             reasons=[
                 f"平均 FPS 变化 {avg_delta:+.1f}%",
                 f"1% Low 变化 {low_delta:+.1f}%",
-                f"归一化得分变化 {score_delta:+.1f}",
+                f"综合得分变化 {score_delta:+.1f}",
             ],
         )
 
     if avg_delta <= -minimum_change_pct or low_delta <= -minimum_change_pct:
         action = AgentAction.REVERT_CHANGE
-        summary = "候选配置出现明确退步，建议恢复上一组已验证配置。"
+        summary = "本轮设置使性能明显下降，建议恢复上一组配置。"
         accepted = False
         rollback_required = True
     elif max(abs(avg_delta), abs(low_delta)) < minimum_change_pct:
         action = AgentAction.RETEST
-        summary = "变化未明显超过判断阈值，需要复测确认。"
+        summary = "变化不够明显，需要保持相同设置再测一次。"
         accepted = False
         rollback_required = False
     elif score_delta > 0:
         action = AgentAction.KEEP_CHANGE
-        summary = "综合得分改善，建议保留本轮调整并继续优化。"
+        summary = "整体表现有所提高，建议保留本轮设置并继续优化。"
         accepted = True
         rollback_required = False
     else:
         action = AgentAction.REVERT_CHANGE
-        summary = "综合目标没有改善，建议恢复上一组配置。"
+        summary = "整体表现没有改善，建议恢复上一组配置。"
         accepted = False
         rollback_required = True
 
     reasons = [
         f"平均 FPS 变化 {avg_delta:+.1f}%",
         f"1% Low 变化 {low_delta:+.1f}%",
-        f"归一化得分变化 {score_delta:+.1f}",
+        f"综合得分变化 {score_delta:+.1f}",
     ]
     if avg_spread is not None:
         reasons.extend([f"平均 FPS 波动 {avg_spread:.1f}%", f"1% Low 波动 {low_spread:.1f}%"])
@@ -202,11 +202,11 @@ def evaluate_result(
     stop_reason = "max_rounds" if task_complete else ""
     if task_complete:
         if action == AgentAction.RETEST:
-            summary = "已达到最大实验轮数，当前结果无法确认，保留最后一组已验证配置。"
+            summary = "已达到实验轮数上限。当前结果仍不明确，保留上一组已验证配置。"
         elif action == AgentAction.KEEP_CHANGE:
-            summary = "已达到最大实验轮数，保留本轮已验证改善并结束任务。"
+            summary = "已达到实验轮数上限。本轮确有改善，保留设置并结束任务。"
         elif action == AgentAction.REVERT_CHANGE:
-            summary = "已达到最大实验轮数，建议恢复上一组已验证配置后结束任务。"
+            summary = "已达到实验轮数上限。请恢复上一组配置，然后结束任务。"
 
     return _decision(
         action,

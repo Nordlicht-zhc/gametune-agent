@@ -15,7 +15,7 @@ from agent.planner import plan_next_experiment
 from agent.state_machine import Workflow, WorkflowState
 from agent.validator import KnowledgeBase, PlanValidationError, validate_plan
 from models.schemas import ExperimentPlan
-from models.schemas import AgentAction, BenchmarkRecord, OptimizationTask
+from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
 from tools.calculate_metrics import metrics_from_frame_times, normalized_score
 from tools.import_benchmark import import_benchmark_csv
 from tools.resolution import aspect_ratio_name, lower_resolution_same_aspect, normalize_resolution
@@ -265,7 +265,30 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertEqual(explanation["source"], "model")
         self.assertIsNotNone(provider.last_request)
         self.assertEqual(provider.last_request.response_format, "json")
+        self.assertEqual(provider.last_request.metadata["purpose"], "decision_explanation")
         self.assertEqual(provider.last_request.metadata["task_id"], current_task.task_id)
+
+    def test_completed_task_uses_final_report_prompt(self):
+        provider = FakeProvider()
+        current_task = task()
+        decision = Decision(
+            AgentAction.REVERT_CHANGE,
+            "已达到实验轮数上限，请恢复上一组配置后结束任务。",
+            reasons=["候选配置的平均 FPS 明显下降"],
+            task_complete=True,
+            rollback_required=True,
+            stop_reason="max_rounds",
+        )
+        explanation = explain_decision(provider, current_task, decision)
+        self.assertEqual(explanation["source"], "model")
+        self.assertIsNotNone(provider.last_request)
+        self.assertEqual(provider.last_request.metadata["purpose"], "final_report")
+        self.assertEqual(provider.last_request.max_output_tokens, 900)
+        self.assertIn("最终报告撰写器", provider.last_request.messages[0].content)
+        payload = json.loads(provider.last_request.messages[1].content)
+        self.assertEqual(payload["report_type"], "final_report")
+        self.assertTrue(payload["final_decision"]["rollback_required"])
+        self.assertTrue(any("先要求恢复" in item for item in payload["constraints"]))
 
     def test_missing_provider_uses_local_fallback(self):
         current_task = task()

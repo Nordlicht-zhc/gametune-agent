@@ -10,6 +10,8 @@ from .api import ModelMessage, ModelRequest
 
 SYSTEM_PROMPT = """你是 GameTune 的结果解释器。确定性分析模块已经作出结论，你不能修改数值、动作或虚构测试数据。请用简洁中文解释结论，并只返回 JSON 对象。"""
 
+FINAL_REPORT_SYSTEM_PROMPT = """你是 GameTune 的最终报告撰写器。任务是否结束、最终动作和已验证结论均由确定性分析模块决定，你不能修改这些结论。你只能依据提供的任务、最终决策、证据和最后计划撰写报告；不得虚构测试数据或硬件瓶颈，不得把未验证建议、失败动作或待回滚配置写成最佳已验证配置。请明确说明最终结论、主要证据、必要的回滚或保存操作以及数据局限，并只返回 JSON 对象。"""
+
 
 def decision_explanation_request(
     task: OptimizationTask,
@@ -35,6 +37,43 @@ def decision_explanation_request(
         max_output_tokens=600,
         response_format="json",
         metadata={"purpose": "decision_explanation", "task_id": task.task_id},
+    )
+
+
+def final_report_request(
+    task: OptimizationTask,
+    decision: Decision,
+    evidence: list[Evidence] | None = None,
+    plan: ExperimentPlan | None = None,
+) -> ModelRequest:
+    payload = {
+        "report_type": "final_report",
+        "task": task.to_dict(),
+        "final_decision": decision.to_dict(),
+        "evidence": [asdict(item) for item in (evidence or [])],
+        "last_plan": _plan_dict(plan),
+        "required_output": {
+            "summary": "不超过 120 字的最终结论；明确任务为何结束以及应保留或恢复哪类配置",
+            "reasoning": ["3 到 4 条严格基于输入证据的关键发现，不重复或虚构数据"],
+            "next_step": "用户保存最佳已验证配置、执行必要回滚或继续采集数据的具体操作",
+            "warning": "测试局限、未确认项或空字符串",
+        },
+        "constraints": [
+            "最终动作、数值变化和任务完成状态以 final_decision 为准",
+            "不能把 last_plan 中尚未验证的建议描述为已验证结果",
+            "final_decision.rollback_required 为真时，next_step 必须先要求恢复上一组已验证配置",
+            "证据不足时应在 warning 中明确说明，不能自行补充结论",
+        ],
+    }
+    return ModelRequest(
+        messages=(
+            ModelMessage("system", FINAL_REPORT_SYSTEM_PROMPT),
+            ModelMessage("user", json.dumps(payload, ensure_ascii=False)),
+        ),
+        temperature=0.1,
+        max_output_tokens=900,
+        response_format="json",
+        metadata={"purpose": "final_report", "task_id": task.task_id},
     )
 
 
