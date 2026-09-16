@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
+from agent.api import APIConfig, OpenAICompatibleProvider
 from app import APISettingsPage, ExperimentPage, MainWindow, TaskState
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from agent.controller import GameTuneController
@@ -130,6 +131,17 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertEqual(page.model.itemText(0), "custom-model")
         self.assertEqual(page.model.currentText(), "custom-model")
         page.deleteLater()
+
+    def test_main_window_loads_saved_api_config(self):
+        config = APIConfig("https://example.test/v1", "secret-token", "model-a", 20, "low")
+        with tempfile.TemporaryDirectory() as folder, patch("app.load_saved_api_config", return_value=config):
+            window = MainWindow(database_path=Path(folder) / "ui.db")
+            self.assertIsInstance(window.controller.model_provider, OpenAICompatibleProvider)
+            self.assertEqual(window.api_settings.base_url.text(), config.base_url)
+            self.assertEqual(window.api_settings.api_key.text(), config.api_key)
+            self.assertEqual(window.api_settings.model.currentText(), config.model)
+            self.assertEqual(window.api_settings.reasoning.currentData(), config.reasoning_effort)
+            window.close()
 
     def test_internal_graphics_mode_is_shown_as_clear_chinese(self):
         plan = ExperimentPlan(

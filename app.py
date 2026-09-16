@@ -28,6 +28,12 @@ from tools.analyze_evidence import analyze_evidence, dominant_hypothesis
 from tools.calculate_metrics import normalized_score
 from tools.resolution import RESOLUTION_PRESETS, aspect_ratio_name, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog, HardwareEntry
+from tools.api_settings import (
+    LocalAPISettingsError,
+    clear_saved_api_config,
+    load_saved_api_config,
+    save_saved_api_config,
+)
 from agent.planner import plan_next_experiment
 
 
@@ -1141,7 +1147,7 @@ class APISettingsPage(QScrollArea):
         self.base_url.setPlaceholderText("https://your-service.example/v1")
         self.api_key = QLineEdit(config.api_key if config else "")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key.setPlaceholderText("密钥只在本次运行中使用")
+        self.api_key.setPlaceholderText("密钥只在本次运行中使用；记住时使用 Windows 账户保护")
         self.model = QComboBox()
         self.model.setEditable(True)
         self.model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -1175,14 +1181,20 @@ class APISettingsPage(QScrollArea):
         form.addRow("请求超时", self.timeout)
         form.addRow("思考模式", self.reasoning)
         root.addWidget(card)
+        self.remember_config = QCheckBox("记住本机 API 配置（密钥使用 Windows 账户保护）")
+        self.remember_config.setChecked(True)
+        root.addWidget(self.remember_config)
         root.addWidget(label("使用兼容 OpenAI Chat Completions 的接口。如果服务不支持思考模式，请选择“关闭”。密钥不会保存到数据库。", "ruleText", True))
         buttons = QHBoxLayout()
         self.apply_button = QPushButton("应用配置")
         self.apply_button.setObjectName("primaryButton")
         self.test_button = QPushButton("测试连接")
         self.test_button.setObjectName("secondaryButton")
+        self.clear_saved_button = QPushButton("清除已保存配置")
+        self.clear_saved_button.setObjectName("secondaryButton")
         buttons.addWidget(self.apply_button)
         buttons.addWidget(self.test_button)
+        buttons.addWidget(self.clear_saved_button)
         buttons.addStretch()
         root.addLayout(buttons)
         self.status = label("尚未启用模型；当前使用本地说明", "sectionMeta", True)
@@ -1191,6 +1203,7 @@ class APISettingsPage(QScrollArea):
         self.apply_button.clicked.connect(self._apply)
         self.test_button.clicked.connect(self._test)
         self.fetch_models_button.clicked.connect(self._discover_models)
+        self.clear_saved_button.clicked.connect(self._clear_saved)
 
     def _config(self) -> APIConfig:
         return APIConfig(
@@ -1246,6 +1259,30 @@ class APISettingsPage(QScrollArea):
         self.status.setText(f"获取模型失败：{message}")
         QMessageBox.warning(self, "获取模型失败", message)
 
+    def _persist_config(self, config: APIConfig) -> str:
+        if not self.remember_config.isChecked():
+            try:
+                clear_saved_api_config()
+            except LocalAPISettingsError as error:
+                QMessageBox.warning(self, "清除本机配置失败", str(error))
+                return " · 本机配置清除失败"
+            return " · 不保存本机配置"
+        try:
+            save_saved_api_config(config)
+        except LocalAPISettingsError as error:
+            QMessageBox.warning(self, "保存本机配置失败", str(error))
+            return " · 本机配置保存失败"
+        return " · 已保存本机配置"
+
+    def _clear_saved(self):
+        try:
+            clear_saved_api_config()
+        except LocalAPISettingsError as error:
+            QMessageBox.warning(self, "清除本机配置失败", str(error))
+            return
+        self.remember_config.setChecked(False)
+        self.status.setText("已清除本机保存的 API 配置；当前输入仍保留在页面中。")
+
     def _apply(self):
         try:
             provider = OpenAICompatibleProvider(self._config())
@@ -1253,7 +1290,8 @@ class APISettingsPage(QScrollArea):
             QMessageBox.warning(self, "配置无效", str(error))
             return
         self.provider_applied.emit(provider)
-        self.status.setText(f"已启用 {provider.config.model} · 思考模式：{self.reasoning.currentText()}")
+        persistence = self._persist_config(provider.config)
+        self.status.setText(f"已启用 {provider.config.model} · 思考模式：{self.reasoning.currentText()}{persistence}")
 
     def _test(self):
         try:
@@ -1283,7 +1321,8 @@ class APISettingsPage(QScrollArea):
         self.apply_button.setEnabled(True)
         self.provider_applied.emit(provider)
         preview = response.content.strip().replace("\n", " ")[:120]
-        self.status.setText(f"连接成功 · {response.model} · {preview}")
+        persistence = self._persist_config(provider.config)
+        self.status.setText(f"连接成功 · {response.model} · {preview}{persistence}")
         QMessageBox.information(self, "连接测试", f"连接成功\n模型：{response.model}\n响应：{preview}")
 
     def _test_failed(self, generation: int, error: Exception):
@@ -1428,11 +1467,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = TaskState()
         self.api_config_error = ""
+        loaded_saved_config = False
         try:
             model_provider = provider_from_env()
         except ValueError as error:
             model_provider = None
             self.api_config_error = str(error)
+        if model_provider is None and not self.api_config_error:
+            saved_config = load_saved_api_config()
+            if saved_config is not None:
+                model_provider = OpenAICompatibleProvider(saved_config)
+                loaded_saved_config = True
         self.controller = controller or GameTuneController(
             database_path or APP_DIR / ".data" / "gametune.db",
             model_provider=model_provider,
@@ -1479,7 +1524,8 @@ class MainWindow(QMainWindow):
         if self.api_config_error:
             self.statusBar().showMessage(f"模型未启用 · {self.api_config_error}", 0)
         elif model_provider:
-            self.statusBar().showMessage(f"就绪 · 已连接模型 {model_provider.name}", 0)
+            source = "已载入本机配置" if loaded_saved_config else "已连接模型"
+            self.statusBar().showMessage(f"就绪 · {source} {model_provider.name}", 0)
         else:
             self.statusBar().showMessage("就绪 · 当前使用本地规则", 0)
 
