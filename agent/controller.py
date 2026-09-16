@@ -514,6 +514,7 @@ class GameTuneController:
             "cooling_mode",
             "is_laptop",
             "shadow_quality",
+            "dynamic_shadows",
         }
         unknown = set(values) - allowed
         if unknown:
@@ -591,6 +592,8 @@ class GameTuneController:
         # authoritative and must not be overwritten by the older supplement.
         if supplement.get("shadow_quality") not in (None, "") and not str(config.get("shadow_quality", "")).strip():
             config["shadow_quality"] = str(supplement["shadow_quality"])
+        if supplement.get("dynamic_shadows") not in (None, "") and not str(config.get("dynamic_shadows", "")).strip():
+            config["dynamic_shadows"] = str(supplement["dynamic_shadows"])
         return replace(record, configuration=config) if config != (record.configuration or {}) else record
 
     def plan_after_result(

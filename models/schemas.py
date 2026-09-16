@@ -40,6 +40,11 @@ class OptimizationTask:
     graphics_mode: str = "unknown"
     power_mode: str = "unknown"
     cooling_mode: str = "unknown"
+    display_mode: str = "fullscreen"
+    fps_cap: int | None = None
+    vsync: str = "unknown"
+    shadow_quality: str = "unknown"
+    dynamic_shadows: str = "unknown"
     task_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=utc_now)
 
@@ -59,6 +64,18 @@ class OptimizationTask:
             or not 20 <= self.gpu_power_w <= 250
         ):
             raise ValueError("笔记本 GPU 功耗应在 20W 到 250W 之间，未知时请留空")
+        if self.fps_cap is not None and (
+            isinstance(self.fps_cap, bool) or not isinstance(self.fps_cap, int) or not 0 <= self.fps_cap <= 1000
+        ):
+            raise ValueError("游戏内最大 FPS 应在 0 到 1000 之间，0 表示不限制")
+        if self.display_mode not in {"fullscreen", "borderless", "windowed"}:
+            raise ValueError("显示模式不受支持")
+        if self.vsync not in {"disabled", "enabled", "unknown"}:
+            raise ValueError("垂直同步状态不受支持")
+        if self.shadow_quality not in {"低", "中", "高", "非常高", "unknown"}:
+            raise ValueError("全局阴影质量档位不受支持")
+        if self.dynamic_shadows not in {"sun_only", "all", "unknown"}:
+            raise ValueError("动态阴影档位不受支持")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

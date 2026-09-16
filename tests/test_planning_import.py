@@ -16,6 +16,7 @@ class PlanningImportTests(unittest.TestCase):
         self.knowledge = KnowledgeBase(Path(__file__).resolve().parents[1] / "knowledge")
 
     def gpu_plan(self, settings):
+        settings = {"dynamic_shadows": "all", **settings}
         record = BenchmarkRecord(200, 150, 99, "2560 × 1440", "scene", repeats=3, configuration=settings)
         evidence = analyze_evidence(self.task, record, fps_cap_known=True, vsync_known=True)
         return plan_next_experiment(self.task, record, evidence, 1)
@@ -25,6 +26,17 @@ class PlanningImportTests(unittest.TestCase):
         validate_plan(self.task, plan, self.knowledge)
         self.assertEqual(plan.action, AgentAction.REQUEST_DATA)
         self.assertEqual(plan.setting_id, "shadow_quality")
+
+    def test_dynamic_shadows_is_recorded_before_shadow_quality_change(self):
+        record = BenchmarkRecord(200, 150, 99, "2560 × 1440", "scene", repeats=3, configuration={"shadow_quality": "高"})
+        evidence = analyze_evidence(self.task, record, fps_cap_known=True, vsync_known=True)
+        plan = plan_next_experiment(self.task, record, evidence, 1)
+        self.assertEqual(plan.action, AgentAction.REQUEST_DATA)
+        self.assertEqual(plan.setting_id, "dynamic_shadows")
+
+    def test_shadow_change_keeps_dynamic_shadow_scope(self):
+        plan = self.gpu_plan({"shadow_quality": "高"})
+        self.assertIn("动态阴影保持“全部”", plan.method)
 
     def test_gpu_known_setting_changes_exactly_one_level(self):
         plan = self.gpu_plan({"shadow_quality": "高"})

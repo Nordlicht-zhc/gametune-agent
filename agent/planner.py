@@ -29,15 +29,15 @@ def plan_next_experiment(
     if "cap_unknown" in codes:
         return ExperimentPlan(
             AgentAction.PROPOSE_EXPERIMENT,
-            "检查是否被限帧",
-            "帧率上限与垂直同步",
+            "确认并排除帧率限制",
+            "游戏内最大 FPS 与等待垂直同步",
             "未确认",
-            "关闭并记录",
+            "最大 FPS 设为 0，等待垂直同步关闭",
             "限帧会让帧率停止增长，同时使 GPU 占用偏低。",
             "关闭限帧后再测试，可以避免把限帧误判为硬件瓶颈。",
-            "先记录原设置，再关闭游戏和驱动中的限帧与垂直同步，然后用相同场景测试 3 次。",
-            "确认限帧已经关闭，并得到 3 次结果接近的测试。",
-            "按记录恢复原限帧和垂直同步设置。",
+            "先记录“游戏内最大 FPS”和“等待垂直同步”的原值；将最大 FPS 设为 0、等待垂直同步设为关闭，再用相同场景测试 3 次。",
+            "确认两个设置的实际值，并得到 3 次结果接近的测试。",
+            "按记录恢复游戏内最大 FPS 和等待垂直同步。",
             round_number,
             setting_id="fps_cap",
         )
@@ -124,6 +124,22 @@ def plan_next_experiment(
             )
     if "high_gpu" in codes or "resolution_response" in codes:
         levels = ("低", "中", "高", "非常高")
+        dynamic_shadows = current.configuration.get("dynamic_shadows", "")
+        if dynamic_shadows not in {"all", "sun_only"}:
+            return ExperimentPlan(
+                AgentAction.REQUEST_DATA,
+                "记录当前动态阴影",
+                "动态阴影",
+                "未知",
+                "记录当前值",
+                "当前 CS2 将动态阴影与全局阴影质量分开保存，必须分别记录才能保证单变量测试。",
+                "记录动态阴影后，可以只降低全局阴影质量而不改变阴影显示范围。",
+                "打开高级视频设置，查看动态阴影是“全部”还是“仅太阳”；这一步不用测试帧率。",
+                "成功记录全部或仅太阳。",
+                "本步骤不修改配置。",
+                round_number,
+                setting_id="dynamic_shadows",
+            )
         old_value = current.configuration.get("shadow_quality", "")
         if old_value not in levels:
             return ExperimentPlan(
@@ -164,7 +180,7 @@ def plan_next_experiment(
             new_value,
             "当前更可能受显卡限制，先降低对显卡压力较大的阴影质量。",
             "降低一级后，平均 FPS 应提高，且 1% Low 不应下降。",
-            "只把阴影质量降低一级，分辨率和测试场景保持不变，测试 3 次。",
+            f"只把全局阴影质量降低一级；动态阴影保持“{'全部' if dynamic_shadows == 'all' else '仅太阳'}”，分辨率和测试场景保持不变，测试 3 次。",
             "平均 FPS 提高，1% Low 不下降，并且画质仍可接受。",
             f"将全局阴影质量恢复为{old_value}。",
             round_number,

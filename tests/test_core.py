@@ -256,6 +256,26 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", sent_payloads[0])
         self.assertEqual(sent_payloads[1]["reasoning_effort"], "high")
 
+    def test_openai_compatible_lists_models(self):
+        class HTTPResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"data": [{"id": "zeta"}, {"id": "alpha"}, {"id": "alpha"}]}).encode("utf-8")
+
+        def fake_urlopen(http_request, timeout):
+            self.assertTrue(http_request.full_url.endswith("/v1/models"))
+            self.assertEqual(timeout, 7.0)
+            return HTTPResponse()
+
+        with patch("agent.api.urllib.request.urlopen", side_effect=fake_urlopen):
+            models = OpenAICompatibleProvider.list_models("https://example.test/v1/", "secret", 7)
+        self.assertEqual(models, ["alpha", "zeta"])
+
     def test_provider_receives_structured_request(self):
         provider = FakeProvider()
         current_task = task()

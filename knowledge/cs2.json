@@ -15,10 +15,24 @@
     },
     {
       "id": "vsync",
-      "label": "垂直同步",
+      "label": "等待垂直同步",
       "values": ["关闭", "开启"],
       "primarily_affects": "cap",
       "diagnostic_use": "瓶颈判断前排除人为帧率限制"
+    },
+    {
+      "id": "fps_cap",
+      "label": "游戏内最大 FPS",
+      "values": [],
+      "primarily_affects": "cap",
+      "diagnostic_use": "排除游戏内帧率上限造成的假性瓶颈"
+    },
+    {
+      "id": "display_mode",
+      "label": "显示模式",
+      "values": ["全屏", "无边框窗口", "窗口化"],
+      "primarily_affects": "presentation",
+      "diagnostic_use": "固定刷新率与显示路径，保证前后测试条件一致"
     },
     {
       "id": "shadow_quality",
@@ -26,6 +40,13 @@
       "values": ["低", "中", "高", "非常高"],
       "primarily_affects": "gpu",
       "change_limit": "每轮最多调整一级"
+    },
+    {
+      "id": "dynamic_shadows",
+      "label": "动态阴影",
+      "values": ["仅太阳", "全部"],
+      "primarily_affects": "visibility",
+      "diagnostic_use": "决定显示哪些光源产生的动态阴影；竞技模式默认保留全部"
     }
   ]
 }

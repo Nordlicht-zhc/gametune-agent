@@ -103,6 +103,46 @@ class OpenAICompatibleProvider:
     def name(self) -> str:
         return "openai-compatible"
 
+    @staticmethod
+    def list_models(base_url: str, api_key: str, timeout_seconds: float = 30.0) -> list[str]:
+        """Return model ids exposed by an OpenAI-compatible ``/models`` endpoint."""
+        normalized_base = str(base_url).strip().rstrip("/")
+        normalized_key = str(api_key).strip()
+        if not normalized_base or not normalized_key:
+            raise ValueError("获取模型前请先填写 API 地址和 API 密钥")
+        if timeout_seconds <= 0:
+            raise ValueError("模型列表请求超时必须大于 0")
+        http_request = urllib.request.Request(
+            f"{normalized_base}/models",
+            headers={"Authorization": f"Bearer {normalized_key}", "Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(http_request, timeout=float(timeout_seconds)) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise ModelAPIError(f"模型服务返回 HTTP {error.code}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ModelAPIError("无法获取模型列表，请检查地址、网络和超时设置") from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ModelAPIError("模型服务返回了无法解析的模型列表") from error
+
+        candidates = body.get("data") if isinstance(body, dict) else None
+        if candidates is None and isinstance(body, dict):
+            # A few compatible gateways use ``models`` instead of OpenAI's
+            # standard ``data`` key; accepting it costs nothing for callers.
+            candidates = body.get("models")
+        if not isinstance(candidates, list):
+            raise ModelAPIError("模型服务返回的模型列表格式无法识别")
+        model_ids: set[str] = set()
+        for item in candidates:
+            value = item.get("id") if isinstance(item, dict) else item
+            if isinstance(value, str) and value.strip():
+                model_ids.add(value.strip())
+        if not model_ids:
+            raise ModelAPIError("模型服务未返回可用模型")
+        return sorted(model_ids, key=str.casefold)
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         payload: dict[str, Any] = {
             "model": self.config.model,

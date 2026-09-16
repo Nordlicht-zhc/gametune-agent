@@ -55,6 +55,11 @@ class TaskState:
     mode: str = "competitive"
     fps_cap_checked: bool = True
     vsync_checked: bool = True
+    fps_cap: int | None = 0
+    vsync: str = "disabled"
+    display_mode: str = "fullscreen"
+    shadow_quality: str = "高"
+    dynamic_shadows: str = "all"
     is_laptop: bool = True
     gpu_power_w: int | None = 100
     graphics_mode: str = "hybrid"
@@ -466,11 +471,28 @@ class NewTaskPage(QScrollArea):
         self.refresh_input = QComboBox()
         self.refresh_input.addItems(["300 Hz", "240 Hz", "165 Hz", "144 Hz"])
         self.scene_input = QLineEdit(state.test_scene)
-        self.cap_input = QComboBox()
-        self.cap_input.addItems(["已检查并关闭", "尚未确认"])
+        self.display_mode_input = QComboBox()
+        self.display_mode_input.addItem("全屏", "fullscreen")
+        self.display_mode_input.addItem("无边框窗口", "borderless")
+        self.display_mode_input.addItem("窗口化", "windowed")
+        self.display_mode_input.setCurrentIndex(max(0, self.display_mode_input.findData(state.display_mode)))
+        self.cap_input = self._spin(-1, 1000, state.fps_cap if state.fps_cap is not None else -1, 10)
+        self.cap_input.setSpecialValueText("未确认")
+        self.cap_input.setToolTip("填写游戏内“最大 FPS”；0 表示不限制")
         self.vsync_input = QComboBox()
-        self.vsync_input.addItems(["已检查并关闭", "尚未确认"])
-        for name, widget in [("任务名称", self.name_input), ("游戏", self.game_input), ("处理器", cpu_field), ("显卡", gpu_field), ("分辨率", resolution_field), ("刷新率", self.refresh_input), ("测试场景", self.scene_input), ("是否限帧", self.cap_input), ("垂直同步", self.vsync_input)]:
+        self.vsync_input.addItem("关闭", "disabled")
+        self.vsync_input.addItem("开启", "enabled")
+        self.vsync_input.addItem("未确认", "unknown")
+        self.vsync_input.setCurrentIndex(max(0, self.vsync_input.findData(state.vsync)))
+        self.shadow_quality_input = QComboBox()
+        self.shadow_quality_input.addItems(["低", "中", "高", "非常高", "未确认"])
+        self.shadow_quality_input.setCurrentText(state.shadow_quality if state.shadow_quality != "unknown" else "未确认")
+        self.dynamic_shadows_input = QComboBox()
+        self.dynamic_shadows_input.addItem("全部", "all")
+        self.dynamic_shadows_input.addItem("仅太阳", "sun_only")
+        self.dynamic_shadows_input.addItem("未确认", "unknown")
+        self.dynamic_shadows_input.setCurrentIndex(max(0, self.dynamic_shadows_input.findData(state.dynamic_shadows)))
+        for name, widget in [("任务名称", self.name_input), ("游戏", self.game_input), ("处理器", cpu_field), ("显卡", gpu_field), ("分辨率（常用候选）", resolution_field), ("显示模式", self.display_mode_input), ("刷新率", self.refresh_input), ("测试场景", self.scene_input), ("游戏内最大 FPS", self.cap_input), ("等待垂直同步", self.vsync_input), ("全局阴影质量", self.shadow_quality_input), ("动态阴影", self.dynamic_shadows_input)]:
             basic_form.addRow(name, widget)
         self.target_avg = self._spin(30, 1000, state.target_avg, 10)
         self.target_low = self._spin(30, 1000, state.target_low, 10)
@@ -652,8 +674,15 @@ class NewTaskPage(QScrollArea):
             )
             return
         self.state.mode = ("competitive", "balanced", "visual")[self.mode_input.currentIndex()]
-        self.state.fps_cap_checked = self.cap_input.currentIndex() == 0
-        self.state.vsync_checked = self.vsync_input.currentIndex() == 0
+        self.state.fps_cap = None if self.cap_input.value() < 0 else self.cap_input.value()
+        self.state.fps_cap_checked = self.state.fps_cap is not None
+        self.state.vsync = str(self.vsync_input.currentData())
+        self.state.vsync_checked = self.state.vsync != "unknown"
+        self.state.display_mode = str(self.display_mode_input.currentData())
+        self.state.shadow_quality = self.shadow_quality_input.currentText()
+        if self.state.shadow_quality == "未确认":
+            self.state.shadow_quality = "unknown"
+        self.state.dynamic_shadows = str(self.dynamic_shadows_input.currentData())
         self.state.has_task = True
         self.state.step = "分析完成"
         self.task_created.emit(self.state)
@@ -782,6 +811,10 @@ class ExperimentPage(QScrollArea):
             "graphics_mode": display_values["graphics_mode"].get(self.state.graphics_mode, self.state.graphics_mode),
             "power_mode": display_values["power_mode"].get(self.state.power_mode, self.state.power_mode),
             "cooling_mode": display_values["cooling_mode"].get(self.state.cooling_mode, self.state.cooling_mode),
+            "shadow_quality": "" if self.state.shadow_quality == "unknown" else self.state.shadow_quality,
+            "dynamic_shadows": {"all": "全部", "sun_only": "仅太阳", "unknown": ""}.get(self.state.dynamic_shadows, ""),
+            "fps_cap": "" if self.state.fps_cap is None else str(self.state.fps_cap),
+            "display_mode": {"fullscreen": "全屏", "borderless": "无边框窗口", "windowed": "窗口化"}.get(self.state.display_mode, self.state.display_mode),
         }
         if setting_id in values:
             return values[setting_id]
@@ -793,6 +826,10 @@ class ExperimentPage(QScrollArea):
             "显卡输出模式": values["graphics_mode"],
             "供电 / 性能模式": values["power_mode"],
             "散热模式": values["cooling_mode"],
+            "全局阴影质量": values["shadow_quality"],
+            "动态阴影": values["dynamic_shadows"],
+            "游戏内最大 FPS": values["fps_cap"],
+            "显示模式": values["display_mode"],
         }
         return labels.get(setting, "")
 
@@ -804,6 +841,8 @@ class ExperimentPage(QScrollArea):
             "graphics_mode": {"独显直连": "dgpu", "混合输出": "hybrid", "自动切换": "advanced_optimus", "不确定": "unknown"},
             "power_mode": {"接通电源 · 性能模式": "ac_performance", "接通电源 · 平衡模式": "ac_balanced", "电池供电": "battery", "不确定": "unknown"},
             "cooling_mode": {"性能 / 狂暴模式": "performance", "平衡模式": "balanced", "安静模式": "quiet", "不确定": "unknown"},
+            "dynamic_shadows": {"全部": "all", "仅太阳": "sun_only", "未确认": "unknown"},
+            "display_mode": {"全屏": "fullscreen", "无边框窗口": "borderless", "窗口化": "windowed"},
         }
         return aliases.get(setting_id, {}).get(value, value)
 
@@ -827,9 +866,19 @@ class ExperimentPage(QScrollArea):
 
     def _actual_configuration(self) -> dict[str, str]:
         config = {key: field.text().strip() for key, field in self._actual_fields.items()}
+        config.update({
+            "display_mode": self.state.display_mode,
+            "fps_cap": "unknown" if self.state.fps_cap is None else str(self.state.fps_cap),
+            "vsync": self.state.vsync,
+            "shadow_quality": self.state.shadow_quality,
+            "dynamic_shadows": self.state.dynamic_shadows,
+        })
         config["planned_setting"] = str(getattr(self.plan, "setting", "") or "") if self.plan else ""
         config["planned_setting_id"] = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
         config["actual_setting_value"] = self.actual_setting.text().strip()
+        setting_id = config["planned_setting_id"]
+        if setting_id and config["actual_setting_value"]:
+            config[setting_id] = self._supplement_value()
         return {key: value for key, value in config.items() if value}
 
     def _choose_file(self):
@@ -1093,8 +1142,16 @@ class APISettingsPage(QScrollArea):
         self.api_key = QLineEdit(config.api_key if config else "")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("密钥只在本次运行中使用")
-        self.model = QLineEdit(config.model if config else "")
+        self.model = QComboBox()
+        self.model.setEditable(True)
+        self.model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.model.setPlaceholderText("模型名称，例如 your-model-name")
+        self.model.lineEdit().setPlaceholderText("模型名称，例如 your-model-name")
+        if config and config.model:
+            self.model.addItem(config.model)
+            self.model.setCurrentText(config.model)
+        self.fetch_models_button = QPushButton("获取模型")
+        self.fetch_models_button.setObjectName("secondaryButton")
         self.timeout = QDoubleSpinBox()
         self.timeout.setRange(1, 300)
         self.timeout.setDecimals(0)
@@ -1108,7 +1165,13 @@ class APISettingsPage(QScrollArea):
         self.reasoning.setCurrentIndex(next((i for i, item in enumerate(self.THINKING_OPTIONS) if item[1] == current_reasoning), 0))
         form.addRow("API 地址", self.base_url)
         form.addRow("API 密钥", self.api_key)
-        form.addRow("模型名称", self.model)
+        model_row = QWidget()
+        model_layout = QHBoxLayout(model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(8)
+        model_layout.addWidget(self.model, 1)
+        model_layout.addWidget(self.fetch_models_button)
+        form.addRow("模型名称", model_row)
         form.addRow("请求超时", self.timeout)
         form.addRow("思考模式", self.reasoning)
         root.addWidget(card)
@@ -1127,12 +1190,61 @@ class APISettingsPage(QScrollArea):
         root.addStretch()
         self.apply_button.clicked.connect(self._apply)
         self.test_button.clicked.connect(self._test)
+        self.fetch_models_button.clicked.connect(self._discover_models)
 
     def _config(self) -> APIConfig:
         return APIConfig(
             self.base_url.text().strip().rstrip("/"), self.api_key.text().strip(),
-            self.model.text().strip(), self.timeout.value(), self.reasoning.currentData(),
+            self.model.currentText().strip(), self.timeout.value(), self.reasoning.currentData(),
         )
+
+    def _discover_models(self):
+        base_url = self.base_url.text().strip().rstrip("/")
+        api_key = self.api_key.text().strip()
+        timeout = self.timeout.value()
+        if not base_url or not api_key:
+            message = "获取模型前请先填写 API 地址和 API 密钥"
+            self.status.setText(f"获取模型失败：{message}")
+            QMessageBox.warning(self, "获取模型失败", message)
+            return
+        self._request_generation += 1
+        generation = self._request_generation
+        self.fetch_models_button.setEnabled(False)
+        self.test_button.setEnabled(False)
+        self.apply_button.setEnabled(False)
+        self.status.setText("正在获取模型列表……")
+        self._start_model_worker(
+            lambda: OpenAICompatibleProvider.list_models(base_url, api_key, timeout),
+            lambda models: self._models_succeeded(generation, models),
+            lambda error: self._models_failed(generation, error),
+        )
+
+    def _models_succeeded(self, generation: int, models: list[str]):
+        if generation != self._request_generation:
+            return
+        self.fetch_models_button.setEnabled(True)
+        self.test_button.setEnabled(True)
+        self.apply_button.setEnabled(True)
+        current = self.model.currentText().strip()
+        values = list(models)
+        if current and current not in values:
+            values.insert(0, current)
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems(values)
+        self.model.setCurrentText(current or values[0])
+        self.model.blockSignals(False)
+        self.status.setText(f"已获取 {len(models)} 个模型，可从下拉框选择或继续手动输入。")
+
+    def _models_failed(self, generation: int, error: Exception):
+        if generation != self._request_generation:
+            return
+        self.fetch_models_button.setEnabled(True)
+        self.test_button.setEnabled(True)
+        self.apply_button.setEnabled(True)
+        message = str(error) if isinstance(error, (ModelAPIError, ValueError)) else "无法获取模型列表。请检查地址、密钥和网络。"
+        self.status.setText(f"获取模型失败：{message}")
+        QMessageBox.warning(self, "获取模型失败", message)
 
     def _apply(self):
         try:
@@ -1453,7 +1565,8 @@ class MainWindow(QMainWindow):
     def _load_state_from_task(self, task: OptimizationTask, current: BenchmarkRecord):
         for field_name in ("name", "game", "cpu", "gpu", "resolution", "refresh_rate", "test_scene",
                            "target_avg_fps", "target_low_fps", "mode", "is_laptop", "gpu_power_w",
-                           "graphics_mode", "power_mode", "cooling_mode"):
+                           "graphics_mode", "power_mode", "cooling_mode", "display_mode", "fps_cap",
+                           "vsync", "shadow_quality", "dynamic_shadows"):
             state_name = {"target_avg_fps": "target_avg", "target_low_fps": "target_low"}.get(field_name, field_name)
             if hasattr(task, field_name) and hasattr(self.state, state_name):
                 setattr(self.state, state_name, getattr(task, field_name))
@@ -1737,8 +1850,12 @@ class MainWindow(QMainWindow):
         if record.gpu_usage is not None:
             self.state.gpu_usage = round(record.gpu_usage)
         config = record.configuration or {}
+        if str(config.get("fps_cap", "")).isdigit():
+            self.state.fps_cap = int(config["fps_cap"])
         for key, state_name in (("resolution", "resolution"), ("refresh_rate", "refresh_rate"), ("test_scene", "test_scene"),
-                                ("cpu", "cpu"), ("gpu", "gpu")):
+                                ("cpu", "cpu"), ("gpu", "gpu"), ("display_mode", "display_mode"),
+                                ("vsync", "vsync"), ("shadow_quality", "shadow_quality"),
+                                ("dynamic_shadows", "dynamic_shadows")):
             if config.get(key):
                 setattr(self.state, state_name, str(config[key]))
 
@@ -1951,6 +2068,11 @@ class MainWindow(QMainWindow):
             graphics_mode=self.state.graphics_mode,
             power_mode=self.state.power_mode,
             cooling_mode=self.state.cooling_mode,
+            display_mode=self.state.display_mode,
+            fps_cap=self.state.fps_cap,
+            vsync=self.state.vsync,
+            shadow_quality=self.state.shadow_quality,
+            dynamic_shadows=self.state.dynamic_shadows,
         )
         baseline = BenchmarkRecord(
             avg_fps=self.state.avg_fps,
@@ -1964,6 +2086,16 @@ class MainWindow(QMainWindow):
             notes="用户录入的基线摘要；未勾选基线采集确认时不视为仪器已核验数据。"
             if not self.state.baseline_confirmed else "",
             configuration_confirmed=self.state.baseline_confirmed,
+            configuration={
+                "resolution": self.state.resolution,
+                "refresh_rate": self.state.refresh_rate,
+                "test_scene": self.state.test_scene,
+                "display_mode": self.state.display_mode,
+                "fps_cap": "unknown" if self.state.fps_cap is None else str(self.state.fps_cap),
+                "vsync": self.state.vsync,
+                "shadow_quality": self.state.shadow_quality,
+                "dynamic_shadows": self.state.dynamic_shadows,
+            },
         )
         return task, baseline
 

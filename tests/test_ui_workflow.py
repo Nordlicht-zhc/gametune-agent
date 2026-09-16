@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from app import ExperimentPage, MainWindow, TaskState
+from app import APISettingsPage, ExperimentPage, MainWindow, TaskState
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from agent.controller import GameTuneController
 
@@ -117,6 +117,20 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertFalse(page.save_button.isEnabled())
         page.deleteLater()
 
+    def test_model_picker_accepts_discovered_and_manual_models(self):
+        page = APISettingsPage()
+        self.assertTrue(page.model.isEditable())
+        self.assertEqual(page.model.count(), 0)
+        page._models_succeeded(0, ["gpt-zeta", "gpt-alpha"])
+        self.assertEqual([page.model.itemText(i) for i in range(page.model.count())], ["gpt-zeta", "gpt-alpha"])
+        self.assertEqual(page.model.currentText(), "gpt-zeta")
+
+        page.model.setCurrentText("custom-model")
+        page._models_succeeded(0, ["gpt-alpha"])
+        self.assertEqual(page.model.itemText(0), "custom-model")
+        self.assertEqual(page.model.currentText(), "custom-model")
+        page.deleteLater()
+
     def test_internal_graphics_mode_is_shown_as_clear_chinese(self):
         plan = ExperimentPlan(
             AgentAction.PROPOSE_EXPERIMENT,
@@ -215,7 +229,7 @@ class UiWorkflowTests(unittest.TestCase):
             baseline = replace(
                 record(200, 100),
                 gpu_usage=99,
-                configuration={"shadow_quality": "高", "resolution": current_task.resolution},
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all", "resolution": current_task.resolution},
             )
             controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
             candidate = replace(
