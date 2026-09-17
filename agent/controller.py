@@ -136,6 +136,7 @@ class GameTuneController:
             reference=comparison,
             retry_count=retry_count,
             max_retries=task.max_rounds,
+            accept_neutral_change=self._accept_neutral_platform_change(candidate, pending),
         )
         next_workflow = Workflow(workflow.state, workflow.round_number)
         next_workflow.begin_evaluation()
@@ -323,6 +324,34 @@ class GameTuneController:
         )
 
     @staticmethod
+    def _canonical_setting_value(setting_id: str, value: Any) -> str:
+        text = str(value).strip()
+        aliases = {
+            "graphics_mode": {"独显直连": "dgpu", "混合输出": "hybrid", "自动切换": "advanced_optimus", "不确定": "unknown"},
+            "power_mode": {"接通电源 · 性能模式": "ac_performance", "接通电源 · 平衡模式": "ac_balanced", "电池供电": "battery", "不确定": "unknown"},
+            "cooling_mode": {"性能 / 狂暴模式": "performance", "平衡模式": "balanced", "安静模式": "quiet", "不确定": "unknown"},
+            "dynamic_shadows": {"全部": "all", "仅太阳": "sun_only", "未确认": "unknown"},
+            "display_mode": {"全屏": "fullscreen", "无边框窗口": "borderless", "窗口化": "windowed"},
+        }
+        return aliases.get(setting_id, {}).get(text, text)
+
+    @classmethod
+    def _accept_neutral_platform_change(
+        cls,
+        candidate: BenchmarkRecord,
+        pending: ExperimentPlan | None,
+    ) -> bool:
+        if pending is None or pending.setting_id != "power_mode":
+            return False
+        configuration = candidate.configuration or {}
+        return (
+            candidate.configuration_confirmed
+            and candidate.comparable
+            and cls._canonical_setting_value("power_mode", configuration.get("power_mode", "")) == "ac_performance"
+            and cls._canonical_setting_value("power_mode", pending.new_value) == "ac_performance"
+        )
+
+    @staticmethod
     def _mark_configuration_mismatch(
         candidate: BenchmarkRecord,
         pending: ExperimentPlan | None,
@@ -338,11 +367,12 @@ class GameTuneController:
         actual_value = str(configuration.get("actual_setting_value", "")).strip()
         if actual_id and expected_id and actual_id != expected_id:
             return replace(candidate, configuration_confirmed=False)
-        if actual_value and pending.new_value and actual_value != str(pending.new_value).strip():
+        canonical_expected = GameTuneController._canonical_setting_value(expected_id, pending.new_value)
+        if actual_value and pending.new_value and GameTuneController._canonical_setting_value(expected_id, actual_value) != canonical_expected:
             return replace(candidate, configuration_confirmed=False)
         expected_keys = [key for key in (expected_id, pending.setting) if key]
         for key in expected_keys:
-            if key in configuration and str(configuration[key]).strip() != str(pending.new_value).strip():
+            if key in configuration and GameTuneController._canonical_setting_value(expected_id, configuration[key]) != canonical_expected:
                 return replace(candidate, configuration_confirmed=False)
         return candidate
 

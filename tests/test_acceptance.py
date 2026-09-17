@@ -25,6 +25,63 @@ class OptimizationAcceptanceTests(unittest.TestCase):
             _, second = controller.plan_after_result(task, controller.current_record(task.task_id), baseline, 2)
             self.assertEqual((second.old_value, second.new_value), ("中", "低"))
 
+    def test_confirmed_power_mode_round_advances_without_repeating_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = GameTuneController(Path(directory) / "power-mode.db")
+            task = OptimizationTask(
+                "供电模式复测", "Counter-Strike 2", "CPU", "Laptop GPU",
+                "1440 × 900", "300Hz", "scene", 700, 300,
+                is_laptop=True, gpu_power_w=100, graphics_mode="dgpu",
+                power_mode="ac_balanced", cooling_mode="performance",
+            )
+            baseline = BenchmarkRecord(
+                598, 209, 85, task.resolution, task.test_scene, repeats=3,
+                configuration={"power_mode": "ac_balanced", "graphics_mode": "dgpu", "cooling_mode": "performance"},
+            )
+            _, plan = controller.create_task(task, baseline, fps_cap_known=True, vsync_known=True)
+            self.assertEqual(plan.setting_id, "power_mode")
+            self.assertEqual(plan.old_value, "接通电源 · 平衡模式")
+
+            candidate = BenchmarkRecord(
+                591, 202, 85, task.resolution, task.test_scene, repeats=3,
+                configuration={
+                    "planned_setting_id": "power_mode",
+                    "actual_setting_value": "接通电源 · 性能模式",
+                    "power_mode": "ac_performance",
+                    "graphics_mode": "dgpu",
+                    "cooling_mode": "performance",
+                },
+                configuration_confirmed=True,
+            )
+            decision = controller.evaluate(task, baseline, candidate, 1)
+            self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
+            self.assertTrue(decision.accepted)
+            evidence, next_plan = controller.plan_after_result(
+                task, controller.current_record(task.task_id), baseline, 2,
+                fps_cap_known=True, vsync_known=True,
+            )
+            self.assertNotIn("laptop_power_mode", {item.code for item in evidence})
+            self.assertNotEqual(next_plan.setting_id, "power_mode")
+
+    def test_power_mode_regression_still_requires_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = GameTuneController(Path(directory) / "power-regression.db")
+            task = OptimizationTask(
+                "供电回滚", "Counter-Strike 2", "CPU", "Laptop GPU",
+                "1440 × 900", "300Hz", "scene", 700, 300,
+                is_laptop=True, gpu_power_w=100, graphics_mode="dgpu",
+                power_mode="ac_balanced", cooling_mode="performance",
+            )
+            baseline = BenchmarkRecord(600, 210, 85, task.resolution, task.test_scene, repeats=3)
+            controller.create_task(task, baseline, fps_cap_known=True, vsync_known=True)
+            candidate = BenchmarkRecord(
+                540, 185, 85, task.resolution, task.test_scene, repeats=3,
+                configuration={"power_mode": "ac_performance"},
+            )
+            decision = controller.evaluate(task, baseline, candidate, 1)
+            self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+            self.assertFalse(decision.accepted)
+
     def test_restore_does_not_double_count_cumulative_retests(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "counts.db"

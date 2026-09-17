@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from agent.api import APIConfig, OpenAICompatibleProvider
-from app import APISettingsPage, ExperimentPage, MainWindow, TaskState
+from app import APISettingsPage, ExperimentPage, MainWindow, ReportPage, TaskState
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from agent.controller import GameTuneController
 
@@ -163,6 +163,57 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertEqual(page._supplement_value(), "hybrid")
         page.actual_setting.setText("独显直连")
         self.assertEqual(page._supplement_value(), "dgpu")
+        page.deleteLater()
+
+    def test_power_mode_uses_selectable_values_and_stores_domain_value(self):
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT,
+            "开启笔记本性能模式",
+            "供电 / 性能模式",
+            "接通电源 · 平衡模式",
+            "接通电源 · 性能模式",
+            "原因", "假设", "方法", "标准", "恢复", 1,
+            setting_id="power_mode",
+        )
+        page = ExperimentPage(TaskState(power_mode="ac_balanced"), plan)
+        self.assertFalse(page.actual_setting.isEditable())
+        self.assertEqual(page.actual_setting.count(), 4)
+        page.actual_setting.setText("接通电源 · 性能模式")
+        configuration = page._actual_configuration()
+        self.assertEqual(configuration["actual_setting_value"], "接通电源 · 性能模式")
+        self.assertEqual(configuration["power_mode"], "ac_performance")
+        page.deleteLater()
+
+    def test_report_identifies_the_model_that_generated_ai_text(self):
+        page = ReportPage(
+            TaskState(),
+            explanation={
+                "summary": "这次调整可以保留。",
+                "reasoning": ["帧率变化很小。"],
+                "next_step": "继续下一项。",
+                "warning": "",
+                "source": "model",
+                "model": "deepseek-flash",
+            },
+        )
+        texts = {item.text() for item in page.findChildren(QLabel)}
+        self.assertIn("AI 说明 · deepseek-flash", texts)
+        page.deleteLater()
+
+    def test_report_warning_text_keeps_vertical_padding(self):
+        page = ReportPage(
+            TaskState(),
+            explanation={
+                "summary": "这次调整可以保留。",
+                "reasoning": ["帧率变化很小。"],
+                "next_step": "继续下一项。",
+                "warning": "当前只有汇总数据，请补充逐次测试记录后再下结论。",
+                "source": "local",
+            },
+        )
+        warning = page.findChild(QLabel, "warningBox")
+        self.assertIsNotNone(warning)
+        self.assertGreaterEqual(warning.minimumHeight(), 30)
         page.deleteLater()
 
     def test_retest_keeps_the_same_round_and_plan(self):

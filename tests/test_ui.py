@@ -18,6 +18,10 @@ class ThemeRegressionTests(unittest.TestCase):
         self.assertIn("QMessageBox QLabel { background: transparent; color: #202422;", STYLESHEET)
         self.assertIn("QMessageBox QPushButton:default", STYLESHEET)
 
+    def test_wrapped_warning_box_has_explicit_height(self):
+        self.assertIn("QLabel#warningBox", STYLESHEET)
+        self.assertIn("min-height: 28px", STYLESHEET)
+
 
 if __name__ == "__main__":
     unittest.main()

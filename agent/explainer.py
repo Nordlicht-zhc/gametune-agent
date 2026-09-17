@@ -33,6 +33,7 @@ def explain_decision(
         response = provider.complete(request_factory(task, decision, evidence, plan))
         explanation = parse_explanation(response.content)
         explanation["source"] = "model"
+        explanation["model"] = response.model
         return explanation
     except (ModelAPIError, ValueError, KeyError, TypeError):
         return fallback

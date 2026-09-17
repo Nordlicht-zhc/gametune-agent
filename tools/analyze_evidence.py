@@ -26,14 +26,18 @@ def analyze_evidence(
         ratio = current.low_fps / task.target_low_fps
         evidence.append(Evidence("low_target_miss", "1% Low 未达标", f"当前只达到目标的 {ratio:.0%}，画面稳定性仍需改善。", min(1.0, 1.0 - ratio + 0.45), "frametime"))
     if task.is_laptop:
+        configuration = current.configuration or {}
+        graphics_mode = str(configuration.get("graphics_mode", task.graphics_mode))
+        power_mode = str(configuration.get("power_mode", task.power_mode))
+        cooling_mode = str(configuration.get("cooling_mode", task.cooling_mode))
         if task.gpu_power_w is None:
             evidence.append(Evidence("laptop_power_unknown", "缺少 GPU 功耗", "同型号笔记本显卡可能有不同功耗，请补充测试时的 GPU 功耗。", 0.75, "insufficient"))
-        if task.graphics_mode in {"hybrid", "unknown"}:
-            detail = "当前为混合输出，高帧率游戏可能因此损失部分性能。" if task.graphics_mode == "hybrid" else "请确认当前是独显直连还是混合输出。"
-            evidence.append(Evidence("laptop_graphics_mode", "检查显卡输出方式", detail, 0.45, "platform" if task.graphics_mode == "hybrid" else "insufficient"))
-        if task.power_mode not in {"ac_performance"}:
+        if graphics_mode in {"hybrid", "unknown"}:
+            detail = "当前为混合输出，高帧率游戏可能因此损失部分性能。" if graphics_mode == "hybrid" else "请确认当前是独显直连还是混合输出。"
+            evidence.append(Evidence("laptop_graphics_mode", "检查显卡输出方式", detail, 0.45, "platform" if graphics_mode == "hybrid" else "insufficient"))
+        if power_mode not in {"ac_performance"}:
             evidence.append(Evidence("laptop_power_mode", "检查供电模式", "请接通电源，并确认已开启性能模式。", 0.65, "platform"))
-        if task.cooling_mode in {"quiet", "unknown"}:
+        if cooling_mode in {"quiet", "unknown"}:
             evidence.append(Evidence("laptop_cooling", "检查散热模式", "安静模式可能限制持续性能，请确认当前风扇模式。", 0.55, "platform"))
     if baseline and _is_resolution_comparison(baseline, current):
         delta = (current.avg_fps - baseline.avg_fps) / baseline.avg_fps * 100

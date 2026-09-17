@@ -69,6 +69,7 @@ def evaluate_result(
     minimum_repeats: int = 3,
     retry_count: int = 0,
     max_retries: int = 2,
+    accept_neutral_change: bool = False,
 ) -> Decision:
     """Evaluate one candidate against the currently accepted configuration.
 
@@ -171,6 +172,11 @@ def evaluate_result(
         summary = "本轮设置使性能明显下降，建议恢复上一组配置。"
         accepted = False
         rollback_required = True
+    elif max(abs(avg_delta), abs(low_delta)) < minimum_change_pct and accept_neutral_change:
+        action = AgentAction.KEEP_CHANGE
+        summary = "本轮性能变化处于正常波动范围，保留已确认的平台配置并继续分析。"
+        accepted = True
+        rollback_required = False
     elif max(abs(avg_delta), abs(low_delta)) < minimum_change_pct:
         action = AgentAction.RETEST
         summary = "变化不够明显，需要保持相同设置再测一次。"

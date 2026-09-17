@@ -57,11 +57,18 @@ def plan_next_experiment(
             setting_id="gpu_power_w",
         )
     if "laptop_power_mode" in codes:
+        power_mode = str((current.configuration or {}).get("power_mode", task.power_mode))
+        power_mode_label = {
+            "ac_performance": "接通电源 · 性能模式",
+            "ac_balanced": "接通电源 · 平衡模式",
+            "battery": "电池供电",
+            "unknown": "不确定",
+        }.get(power_mode, power_mode)
         return ExperimentPlan(
             AgentAction.PROPOSE_EXPERIMENT,
             "开启笔记本性能模式",
             "供电 / 性能模式",
-            task.power_mode,
+            power_mode_label,
             "接通电源 · 性能模式",
             "电池供电或平衡模式可能限制 CPU 和 GPU 性能。",
             "切换到性能模式后，平均 FPS 或 1% Low 可能提高。",

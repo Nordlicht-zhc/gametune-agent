@@ -79,6 +79,29 @@ class TaskState:
     baseline_confirmed: bool = False
 
 
+class ActualSettingInput(QComboBox):
+    """A selectable setting editor with QLineEdit-compatible text helpers."""
+
+    def __init__(self, value: str, options: list[str]):
+        super().__init__()
+        self.setEditable(not bool(options))
+        if options:
+            self.addItems(options)
+        self.setText(value)
+        if self.isEditable() and self.lineEdit() is not None:
+            self.lineEdit().setPlaceholderText("填写你实际使用的值")
+
+    def text(self) -> str:
+        return self.currentText()
+
+    def setText(self, value: str) -> None:
+        index = self.findText(value)
+        if index >= 0:
+            self.setCurrentIndex(index)
+        elif self.isEditable():
+            self.setEditText(value)
+
+
 STYLESHEET = """
 * { font-family: "Microsoft YaHei UI"; font-size: 13px; color: #202422; }
 QMainWindow, QWidget#root, QStackedWidget, QScrollArea,
@@ -115,6 +138,7 @@ QLabel#tagGreen, QLabel#tagOrange, QLabel#tagNeutral { border-radius: 9px; paddi
 QLabel#tagGreen { color: #426220; background: #e9f4d2; }
 QLabel#tagOrange { color: #95501f; background: #ffefe2; }
 QLabel#tagNeutral { color: #565d58; background: #eff1ed; }
+QLabel#warningBox { color: #95501f; background: #ffefe2; border: 1px solid #f5d8c1; border-radius: 7px; padding: 6px 10px; min-height: 28px; }
 QLabel#actionNumber { color: #d7ff62; background: #222723; border-radius: 7px; padding: 5px 7px; font-size: 10px; font-weight: 800; }
 QLabel#actionTitle { font-size: 15px; font-weight: 800; }
 QLabel#settingOld, QLabel#settingNew { border-radius: 8px; padding: 7px 10px; font-size: 11px; font-weight: 700; }
@@ -223,10 +247,19 @@ class ModelWorker(QObject):
 class SectionHeader(QWidget):
     def __init__(self, title: str, meta: str = ""):
         super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         row = set_margins(QHBoxLayout(self), spacing=12)
-        row.addWidget(label(title, "sectionTitle"))
+        title_label = label(title, "sectionTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        meta_label = label(meta, "sectionMeta")
+        meta_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # Keep the font's ascent/descent inside the row.  Without a little
+        # vertical room, some Windows fonts render only the top of Chinese
+        # glyphs when a card is laid out at its minimum height.
+        self.setMinimumHeight(24)
+        row.addWidget(title_label)
         row.addStretch()
-        row.addWidget(label(meta, "sectionMeta"))
+        row.addWidget(meta_label)
 
 
 class PageHeader(QWidget):
@@ -268,11 +301,20 @@ class MetricCard(QFrame):
 class RuleRow(QWidget):
     def __init__(self, name: str, value: str, name_width: int = 82):
         super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         row = set_margins(QHBoxLayout(self), 0, 4, 0, 4, 9)
         name_label = label(name, "ruleName")
         name_label.setFixedWidth(name_width)
+        name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        value_label = label(value, "ruleText", True)
+        value_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(name_label)
-        row.addWidget(label(value, "ruleText", True), 1)
+        row.addWidget(value_label, 1)
+        # The layout adds 4 px above and below the text.  Honour the wrapped
+        # label's natural height so a two-line value is never squeezed into
+        # the one-line minimum used by QWidget.
+        self.setMinimumHeight(max(19, value_label.sizeHint().height() + 8))
 
 
 class DashboardPage(QScrollArea):
@@ -740,8 +782,10 @@ class ExperimentPage(QScrollArea):
         self.actual_resolution = QLineEdit(state.resolution)
         self.actual_refresh_rate = QLineEdit(state.refresh_rate)
         self.actual_scene = QLineEdit(state.test_scene)
-        self.actual_setting = QLineEdit(self._setting_value_from_state())
-        self.actual_setting.setPlaceholderText("填写你实际使用的值")
+        self.actual_setting = ActualSettingInput(
+            self._setting_value_from_state(),
+            self._setting_options(),
+        )
         self._actual_fields = {
             "cpu": self.actual_cpu,
             "gpu": self.actual_gpu,
@@ -751,7 +795,7 @@ class ExperimentPage(QScrollArea):
         }
         for field in self._actual_fields.values():
             field.textChanged.connect(self._clear_csv_if_manual_edit)
-        self.actual_setting.textChanged.connect(self._clear_csv_if_manual_edit)
+        self.actual_setting.currentTextChanged.connect(self._clear_csv_if_manual_edit)
         self.configuration_confirmed = QCheckBox("我已完成本轮调整，并核对上述实际配置")
         # A proposed value is not evidence that the user executed it.
         self.configuration_confirmed.setChecked(False)
@@ -780,9 +824,9 @@ class ExperimentPage(QScrollArea):
         self.rollback_button.setVisible(False)
         self.rollback_button.clicked.connect(self.rollback_requested.emit)
         input_layout.addWidget(self.rollback_button)
-        guide = QFrame()
-        guide.setObjectName("card")
-        guide_layout = set_margins(QVBoxLayout(guide), 20, 18, 20, 20, 7)
+        guide_box = QFrame()
+        guide_box.setObjectName("card")
+        guide_layout = set_margins(QVBoxLayout(guide_box), 20, 18, 20, 20, 7)
         guide_layout.addWidget(label("本轮只改这一项", "cardKicker"))
         change_title = f"{plan.setting}：{plan.old_value} → {plan.new_value}" if plan else "等待生成实验计划"
         guide_layout.addWidget(label(change_title, "actionTitle", True))
@@ -791,10 +835,14 @@ class ExperimentPage(QScrollArea):
             guide_layout.addWidget(hline())
             guide_layout.addWidget(RuleRow(name, value))
         guide_layout.addSpacing(8)
-        guide_layout.addWidget(label("提示：GPU 占用低不一定是 CPU 瓶颈，也可能是限帧或垂直同步造成的。", "tagOrange", True))
+        guide_label = label("提示：GPU 占用低不一定是 CPU 瓶颈，也可能是限帧或垂直同步造成的。", "warningBox", True)
+        guide_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        guide_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        guide_label.setMinimumHeight(max(30, guide_label.sizeHint().height()))
+        guide_layout.addWidget(guide_label)
         guide_layout.addStretch()
         columns.addWidget(input_card, 3)
-        columns.addWidget(guide, 2)
+        columns.addWidget(guide_box, 2)
         root.addLayout(columns)
         root.addStretch()
 
@@ -838,6 +886,18 @@ class ExperimentPage(QScrollArea):
             "显示模式": values["display_mode"],
         }
         return labels.get(setting, "")
+
+    def _setting_options(self) -> list[str]:
+        """Return controlled choices for settings with a finite domain."""
+        setting_id = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
+        return {
+            "graphics_mode": ["独显直连", "混合输出", "自动切换", "不确定"],
+            "power_mode": ["接通电源 · 性能模式", "接通电源 · 平衡模式", "电池供电", "不确定"],
+            "cooling_mode": ["性能 / 狂暴模式", "平衡模式", "安静模式", "不确定"],
+            "shadow_quality": ["低", "中", "高", "非常高", "未确认"],
+            "dynamic_shadows": ["全部", "仅太阳", "未确认"],
+            "display_mode": ["全屏", "无边框窗口", "窗口化"],
+        }.get(setting_id, [])
 
     def _supplement_value(self) -> str:
         """Convert friendly UI labels back to stable domain values."""
@@ -1034,7 +1094,7 @@ class HistoryPage(QWidget):
             self.table.setRowHeight(row, 46)
 
 
-class ReportPage(QWidget):
+class ReportPage(QScrollArea):
     def __init__(
         self,
         state: TaskState,
@@ -1048,7 +1108,10 @@ class ReportPage(QWidget):
         last_decision: dict | None = None,
     ):
         super().__init__()
-        root = set_margins(QVBoxLayout(self), 34, 27, 34, 36, 16)
+        self.setWidgetResizable(True)
+        page_body = QWidget()
+        self.setWidget(page_body)
+        root = set_margins(QVBoxLayout(page_body), 34, 27, 34, 36, 16)
         root.addWidget(PageHeader("优化结果", "已验证的最佳配置", "这里只汇总实际测试过、且测试条件一致的结果。"))
         empty = QFrame()
         empty.setObjectName("card")
@@ -1065,23 +1128,36 @@ class ReportPage(QWidget):
             decision.summary if decision else str((last_decision or {}).get("summary") or
             "录入复测结果后，这里会显示性能变化和当前最佳配置。")
         )
-        body = label(body_text, "ruleText", True)
-        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        body.setFixedWidth(610)
-        body.setMinimumHeight(42)
-        empty_layout.addWidget(body, 0, Qt.AlignmentFlag.AlignHCenter)
+        summary_text = label(body_text, "ruleText", True)
+        summary_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        summary_text.setFixedWidth(610)
+        summary_text.setMinimumHeight(42)
+        empty_layout.addWidget(summary_text, 0, Qt.AlignmentFlag.AlignHCenter)
         root.addWidget(empty)
         if explanation:
             summary_card = QFrame()
             summary_card.setObjectName("card")
             summary_layout = set_margins(QVBoxLayout(summary_card), 22, 18, 22, 18, 8)
-            source = "AI 说明" if explanation.get("source") == "model" else "本地说明"
+            model_name = str(explanation.get("model", "")).strip()
+            source = f"AI 说明 · {model_name}" if explanation.get("source") == "model" and model_name else (
+                "AI 说明" if explanation.get("source") == "model" else "本地说明"
+            )
             summary_layout.addWidget(SectionHeader(source, "不会修改测试结论"))
             for reason in explanation.get("reasoning", []):
-                summary_layout.addWidget(label(f"• {reason}", "ruleText", True))
-            summary_layout.addWidget(label(f"下一步：{explanation['next_step']}", "ruleName", True))
+                reason_label = label(f"• {reason}", "ruleText", True)
+                reason_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+                reason_label.setMinimumHeight(max(20, reason_label.sizeHint().height()))
+                summary_layout.addWidget(reason_label)
+            next_step = label(f"下一步：{explanation['next_step']}", "ruleName", True)
+            next_step.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+            next_step.setMinimumHeight(max(22, next_step.sizeHint().height()))
+            summary_layout.addWidget(next_step)
             if explanation.get("warning"):
-                summary_layout.addWidget(label(str(explanation["warning"]), "tagOrange", True))
+                warning = label(str(explanation["warning"]), "warningBox", True)
+                warning.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+                warning.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                warning.setMinimumHeight(max(30, warning.sizeHint().height()))
+                summary_layout.addWidget(warning)
             root.addWidget(summary_card)
         if best_record:
             snapshot = QFrame()
@@ -1901,7 +1977,8 @@ class MainWindow(QMainWindow):
         for key, state_name in (("resolution", "resolution"), ("refresh_rate", "refresh_rate"), ("test_scene", "test_scene"),
                                 ("cpu", "cpu"), ("gpu", "gpu"), ("display_mode", "display_mode"),
                                 ("vsync", "vsync"), ("shadow_quality", "shadow_quality"),
-                                ("dynamic_shadows", "dynamic_shadows")):
+                                ("dynamic_shadows", "dynamic_shadows"), ("graphics_mode", "graphics_mode"),
+                                ("power_mode", "power_mode"), ("cooling_mode", "cooling_mode")):
             if config.get(key):
                 setattr(self.state, state_name, str(config[key]))
 
