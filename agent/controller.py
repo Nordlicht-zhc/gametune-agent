@@ -14,7 +14,7 @@ from agent.validator import KnowledgeBase, validate_plan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from storage.repository import SQLiteRepository
 from tools.analyze_evidence import analyze_evidence
-from tools.calculate_metrics import normalized_score
+from tools.calculate_metrics import weighted_performance_score
 
 
 class GameTuneController:
@@ -62,8 +62,18 @@ class GameTuneController:
         if not baseline.configuration_confirmed:
             raise ValueError("请先确认基线配置和测试条件，再创建优化任务")
         baseline_runs = len(baseline.runs) if baseline.runs else baseline.repeats
-        if baseline_runs < 3:
-            raise ValueError("基线至少需要 3 次有效测试后才能创建优化任务")
+        if baseline_runs < 2:
+            raise ValueError("基线至少需要 2 次有效测试后才能创建优化任务")
+        if len(baseline.runs) == 2:
+            avg_values = [float(run["avg_fps"]) for run in baseline.runs]
+            low_values = [float(run["low_fps"]) for run in baseline.runs]
+
+            def spread(values: list[float]) -> float:
+                centre = median(values)
+                return (max(values) - min(values)) / centre * 100 if centre else float("inf")
+
+            if spread(avg_values) > 5.0 or spread(low_values) > 5.0:
+                raise ValueError("两次基线结果差异超过 5%，请补充第 3 次基线测试")
         workflow = Workflow()
         workflow.start()
         workflow.validated()
@@ -128,14 +138,20 @@ class GameTuneController:
         # previous candidate in this round.
         comparison = self.current_records.get(task.task_id) or reference or baseline
         retry_count = self._retry_counts.get(task.task_id, 0)
+        adaptive_plan = pending is not None and pending.action not in {
+            AgentAction.REQUEST_DATA,
+            AgentAction.FINISH,
+        }
         decision = evaluate_result(
             task,
             baseline,
             candidate,
             round_number=round_number,
             reference=comparison,
+            minimum_repeats=1 if adaptive_plan else 3,
+            acceptance_repeats=3 if adaptive_plan else None,
             retry_count=retry_count,
-            max_retries=task.max_rounds,
+            max_retries=2 if adaptive_plan else task.max_rounds,
             accept_neutral_change=self._accept_neutral_platform_change(candidate, pending),
         )
         next_workflow = Workflow(workflow.state, workflow.round_number)
@@ -257,15 +273,15 @@ class GameTuneController:
         candidate: BenchmarkRecord,
         best: BenchmarkRecord,
     ) -> BenchmarkRecord:
-        """Return the higher-scoring verified record, with deterministic ties."""
-        candidate_score = normalized_score(
+        """Return the higher uncapped weighted verified record, with ties."""
+        candidate_score = weighted_performance_score(
             candidate.avg_fps,
             candidate.low_fps,
             task.target_avg_fps,
             task.target_low_fps,
             task.mode,
         )
-        best_score = normalized_score(
+        best_score = weighted_performance_score(
             best.avg_fps,
             best.low_fps,
             task.target_avg_fps,
@@ -288,10 +304,12 @@ class GameTuneController:
         """Merge actual runs from same-round RETEST submissions.
 
         ``repeats`` on a manually entered summary is not evidence of separate
-        observations. When ``runs`` are present, only those finite samples
+        observations. A one-run manual submission is the exception: it is an
+        explicit observation and can be accumulated with later one-run
+        submissions. When ``runs`` are present, only those finite samples
         count and the summary is recalculated from their medians.
         """
-        if not candidate.runs or not candidate.configuration_confirmed or not candidate.comparable:
+        if not candidate.configuration_confirmed or not candidate.comparable:
             return candidate, None
         fingerprint = self._record_fingerprint(candidate)
         known_fingerprint = self._round_fingerprints.get(task_id, {}).get(round_number)
@@ -300,7 +318,18 @@ class GameTuneController:
             # continuation of the previous RETEST sample set.
             return replace(candidate, configuration_confirmed=False), None
         previous = list(self._round_runs.get(task_id, {}).get(round_number, []))
-        combined = previous + [dict(run) for run in candidate.runs]
+        submitted_runs = [dict(run) for run in candidate.runs]
+        if not submitted_runs:
+            if candidate.repeats != 1:
+                return candidate, None
+            observation: dict[str, float] = {
+                "avg_fps": float(candidate.avg_fps),
+                "low_fps": float(candidate.low_fps),
+            }
+            if candidate.gpu_usage is not None:
+                observation["gpu_usage"] = float(candidate.gpu_usage)
+            submitted_runs = [observation]
+        combined = previous + submitted_runs
         avg_values = [float(run["avg_fps"]) for run in combined]
         low_values = [float(run["low_fps"]) for run in combined]
         gpu_values = [float(run["gpu_usage"]) for run in combined if run.get("gpu_usage") is not None]
@@ -330,8 +359,8 @@ class GameTuneController:
             "graphics_mode": {"独显直连": "dgpu", "混合输出": "hybrid", "自动切换": "advanced_optimus", "不确定": "unknown"},
             "power_mode": {"接通电源 · 性能模式": "ac_performance", "接通电源 · 平衡模式": "ac_balanced", "电池供电": "battery", "不确定": "unknown"},
             "cooling_mode": {"性能 / 狂暴模式": "performance", "平衡模式": "balanced", "安静模式": "quiet", "不确定": "unknown"},
-            "dynamic_shadows": {"全部": "all", "仅太阳": "sun_only", "未确认": "unknown"},
-            "display_mode": {"全屏": "fullscreen", "无边框窗口": "borderless", "窗口化": "windowed"},
+            "dynamic_shadows": {"全部": "all", "仅限日光": "sun_only", "仅太阳": "sun_only", "未确认": "unknown"},
+            "display_mode": {"全屏": "fullscreen", "全屏窗口模式": "borderless", "无边框窗口": "borderless", "窗口模式": "windowed", "窗口化": "windowed"},
         }
         return aliases.get(setting_id, {}).get(text, text)
 
@@ -598,7 +627,13 @@ class GameTuneController:
             fps_cap_known=fps_cap_known,
             vsync_known=vsync_known,
         )
-        plan = plan_next_experiment(effective_task, current_for_planning, evidence, workflow.round_number)
+        plan = plan_next_experiment(
+            effective_task,
+            current_for_planning,
+            evidence,
+            workflow.round_number,
+            blocked_setting_ids=self._failed_setting_ids(task_id),
+        )
         validate_plan(effective_task, plan, self.knowledge)
         plan = self._skip_failed_plan(effective_task, plan, workflow.round_number)
         if plan.action == AgentAction.FINISH:
@@ -664,7 +699,13 @@ class GameTuneController:
             validate_plan(task, pending, self.knowledge)
             return evidence, pending
 
-        plan = plan_next_experiment(task, accepted_current, evidence, round_number)
+        plan = plan_next_experiment(
+            task,
+            accepted_current,
+            evidence,
+            round_number,
+            blocked_setting_ids=self._failed_setting_ids(task.task_id),
+        )
         validate_plan(task, plan, self.knowledge)
         plan = self._skip_failed_plan(task, plan, round_number)
         if plan.action == AgentAction.FINISH:
@@ -701,6 +742,13 @@ class GameTuneController:
             round_number=round_number,
             setting_id=plan.setting_id,
         )
+
+    def _failed_setting_ids(self, task_id: str) -> set[str]:
+        """Return setting identifiers that have already failed in this task."""
+        setting_ids: set[str] = set()
+        for action_key in self._failed_actions.get(task_id, set()):
+            setting_ids.add(str(action_key).split("\x1f", 1)[0])
+        return setting_ids
 
     def explain(
         self,

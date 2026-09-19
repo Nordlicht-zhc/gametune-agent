@@ -45,7 +45,7 @@ def _fallback_next_step(decision: Decision) -> str:
             return "恢复上一组已验证配置；任务已结束，请保存最终报告。"
         return "任务已结束，保存最佳已验证配置与最终报告。"
     steps = {
-        "retest": "保持配置和测试条件不变，再完成一轮复测。",
+        "retest": "保持配置和测试条件不变，按页面提示补测；累计达到要求后再确认结果。",
         "keep_change": "保留本轮配置，按下一项单变量实验继续。",
         "revert_change": "恢复上一组已验证配置，再选择其他假设。",
         "finish": "保存最佳已验证配置并生成最终报告。",

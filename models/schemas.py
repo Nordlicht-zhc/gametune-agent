@@ -45,6 +45,7 @@ class OptimizationTask:
     vsync: str = "unknown"
     shadow_quality: str = "unknown"
     dynamic_shadows: str = "unknown"
+    video_settings: dict[str, str] = field(default_factory=dict)
     task_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=utc_now)
 
@@ -76,6 +77,11 @@ class OptimizationTask:
             raise ValueError("全局阴影质量档位不受支持")
         if self.dynamic_shadows not in {"sun_only", "all", "unknown"}:
             raise ValueError("动态阴影档位不受支持")
+        if not isinstance(self.video_settings, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.video_settings.items()
+        ):
+            raise ValueError("高级视频设置必须是文本键值对")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -177,6 +183,10 @@ class Decision:
     avg_delta_pct: float = 0.0
     low_delta_pct: float = 0.0
     score_delta: float = 0.0
+    # Raw, uncapped change using the task mode's FPS/1% Low preference.  This
+    # is kept separate from ``score_delta`` because the latter is a capped
+    # target-completion display value.
+    weighted_delta_pct: float = 0.0
     needs_retest: bool = False
     reasons: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)

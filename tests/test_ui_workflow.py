@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from agent.api import APIConfig, OpenAICompatibleProvider
-from app import APISettingsPage, ExperimentPage, MainWindow, ReportPage, TaskState
+from app import APISettingsPage, ExperimentPage, MainWindow, NewTaskPage, ReportPage, TaskState
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from agent.controller import GameTuneController
 
@@ -113,9 +113,31 @@ class UiWorkflowTests(unittest.TestCase):
     def test_actual_configuration_is_unchecked_by_default(self):
         page = ExperimentPage(TaskState())
         self.assertFalse(page.configuration_confirmed.isChecked())
+        self.assertEqual(page.repeats.value(), 1)
         self.assertTrue(page.save_button.isEnabled())
         page.set_completed()
         self.assertFalse(page.save_button.isEnabled())
+        page.deleteLater()
+
+    def test_baseline_and_experiment_copy_explain_adaptive_test_count(self):
+        new_task = NewTaskPage(TaskState())
+        self.assertEqual(new_task.baseline_repeats_input.value(), 2)
+        self.assertIn("至少 2 次", new_task.baseline_confirmed_input.text())
+        new_task.deleteLater()
+
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT,
+            "降低分辨率",
+            "分辨率",
+            "2560 × 1440",
+            "1920 × 1080",
+            "原因", "假设", "方法", "标准", "恢复", 1,
+            setting_id="resolution",
+        )
+        page = ExperimentPage(TaskState(), plan)
+        guide_text = " ".join(item.text() for item in page.findChildren(QLabel))
+        self.assertIn("先测 1 次", guide_text)
+        self.assertIn("累计 3 次", guide_text)
         page.deleteLater()
 
     def test_model_picker_accepts_discovered_and_manual_models(self):
@@ -182,6 +204,34 @@ class UiWorkflowTests(unittest.TestCase):
         configuration = page._actual_configuration()
         self.assertEqual(configuration["actual_setting_value"], "接通电源 · 性能模式")
         self.assertEqual(configuration["power_mode"], "ac_performance")
+        page.deleteLater()
+
+    def test_cs2_choices_match_installed_simplified_chinese_menu(self):
+        page = NewTaskPage(TaskState())
+        labels = {item.text() for item in page.findChildren(QLabel)}
+        self.assertTrue({"游戏最高FPS", "V-Sync", "全局阴影效果", "动态阴影"}.issubset(labels))
+        self.assertEqual(
+            [page.display_mode_input.itemText(index) for index in range(page.display_mode_input.count())],
+            ["全屏", "全屏窗口模式", "窗口模式"],
+        )
+        self.assertEqual(
+            [page.vsync_input.itemText(index) for index in range(page.vsync_input.count())],
+            ["已禁用", "已启用", "未确认"],
+        )
+        self.assertEqual(
+            [page.dynamic_shadows_input.itemText(index) for index in range(page.dynamic_shadows_input.count())],
+            ["全部", "仅限日光", "未确认"],
+        )
+        self.assertEqual(
+            [page.advanced_video_inputs["texture_filtering"].itemText(index) for index in range(6)],
+            ["双线性", "三线性", "异向 2X", "异向 4X", "异向 8X", "异向 16X"],
+        )
+        self.assertEqual(
+            set(page.advanced_video_inputs),
+            {"video_preset", "player_contrast", "nvidia_gsync", "nvidia_reflex", "amd_anti_lag", "msaa_mode",
+             "texture_detail", "texture_filtering", "shader_detail", "particle_detail",
+             "ambient_occlusion", "hdr", "fsr"},
+        )
         page.deleteLater()
 
     def test_report_identifies_the_model_that_generated_ai_text(self):
@@ -267,7 +317,7 @@ class UiWorkflowTests(unittest.TestCase):
             window.current_plan = ExperimentPlan(
                 AgentAction.REQUEST_DATA,
                 "确认阴影质量",
-                "全局阴影质量",
+                "全局阴影效果",
                 "未知",
                 "记录当前值",
                 "原因",

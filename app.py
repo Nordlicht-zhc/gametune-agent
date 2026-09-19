@@ -24,7 +24,7 @@ from agent.api import (
 )
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from tools.import_benchmark import import_benchmark_csv
-from tools.analyze_evidence import analyze_evidence, dominant_hypothesis
+from tools.analyze_evidence import analyze_evidence, dominant_hypothesis, evidence_support_level
 from tools.calculate_metrics import normalized_score
 from tools.resolution import RESOLUTION_PRESETS, aspect_ratio_name, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog, HardwareEntry
@@ -66,6 +66,7 @@ class TaskState:
     display_mode: str = "fullscreen"
     shadow_quality: str = "高"
     dynamic_shadows: str = "all"
+    video_settings: dict[str, str] | None = None
     is_laptop: bool = True
     gpu_power_w: int | None = 100
     graphics_mode: str = "hybrid"
@@ -74,9 +75,21 @@ class TaskState:
     # Baseline values are entered by the user.  Keep the execution marker
     # separate from candidate configuration confirmation so a typed summary
     # cannot be presented as instrument-backed evidence by default.
-    baseline_repeats: int = 3
+    baseline_repeats: int = 2
     baseline_duration_seconds: int = 60
     baseline_confirmed: bool = False
+
+    def __post_init__(self):
+        if self.video_settings is None:
+            self.video_settings = {
+                "video_preset": "custom", "player_contrast": "enabled",
+                "menu_fps_cap": "0", "msaa_mode": "4x_msaa",
+                "texture_detail": "medium", "texture_filtering": "anisotropic_16x",
+                "shader_detail": "low", "particle_detail": "low",
+                "ambient_occlusion": "disabled", "hdr": "quality",
+                "fsr": "disabled", "nvidia_reflex": "enabled",
+                "nvidia_gsync": "not_available", "amd_anti_lag": "not_available",
+            }
 
 
 class ActualSettingInput(QComboBox):
@@ -337,7 +350,7 @@ class DashboardPage(QScrollArea):
             MetricCard("平均帧率", f"{state.avg_fps} FPS", f"目标 {state.target_avg} FPS", round(state.avg_fps / state.target_avg * 100)),
             MetricCard("1% LOW", f"{state.low_fps} FPS", "当前重点", round(state.low_fps / state.target_low * 100)),
             MetricCard("GPU 占用", f"{state.gpu_usage}%", "用于辅助判断瓶颈", state.gpu_usage),
-            MetricCard("性能得分", f"{self._score():.0f} / 100", self._mode_name(), round(self._score())),
+            MetricCard("目标完成度", f"{self._score():.0f} / 100", self._mode_name(), round(self._score())),
         ]
         for index, card in enumerate(cards):
             metrics.addWidget(card, 0, index)
@@ -362,7 +375,7 @@ class DashboardPage(QScrollArea):
         card.setMinimumHeight(220)
         layout = set_margins(QVBoxLayout(card), 22, 18, 22, 18, 9)
         layout.addWidget(label("当前判断", "cardKicker"))
-        hypothesis, confidence = dominant_hypothesis(self.evidence)
+        hypothesis, _ = dominant_hypothesis(self.evidence)
         names = {"cpu": "更可能受 CPU 限制", "gpu": "更可能受 GPU 限制", "frametime": "帧率稳定性需要改善", "platform": "笔记本模式可能限制性能", "insufficient": "数据还不够，先补充测试"}
         layout.addWidget(label(names.get(hypothesis, "需要补充证据"), "heroTitle", True))
         body_text = "；".join(item.detail for item in self.evidence[:2]) or "创建任务后，这里会显示最重要的两条判断依据。"
@@ -374,7 +387,7 @@ class DashboardPage(QScrollArea):
         tags.addStretch()
         layout.addLayout(tags)
         layout.addStretch()
-        confidence = label(f"可信度：{'中等' if confidence < .75 else '较高'}（{confidence:.0%}）", "confidence")
+        confidence = label(f"证据支持：{evidence_support_level(self.evidence)}", "confidence")
         confidence.setFixedWidth(190)
         layout.addWidget(confidence)
         return card
@@ -482,7 +495,7 @@ class NewTaskPage(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
-        root.addWidget(PageHeader("任务设置", "创建优化任务", "填写硬件、目标和基线数据。基线应在同一场景下至少测试 3 次。"))
+        root.addWidget(PageHeader("任务设置", "创建优化任务", "填写硬件、目标和基线数据。基线先完成 2 次；两次差异超过 5% 时再补第 3 次。"))
         columns = QHBoxLayout()
         columns.setSpacing(15)
         basic_card, basic_form = self._form_card("设备与测试环境")
@@ -521,15 +534,15 @@ class NewTaskPage(QScrollArea):
         self.scene_input = QLineEdit(state.test_scene)
         self.display_mode_input = QComboBox()
         self.display_mode_input.addItem("全屏", "fullscreen")
-        self.display_mode_input.addItem("无边框窗口", "borderless")
-        self.display_mode_input.addItem("窗口化", "windowed")
+        self.display_mode_input.addItem("全屏窗口模式", "borderless")
+        self.display_mode_input.addItem("窗口模式", "windowed")
         self.display_mode_input.setCurrentIndex(max(0, self.display_mode_input.findData(state.display_mode)))
         self.cap_input = self._spin(-1, 1000, state.fps_cap if state.fps_cap is not None else -1, 10)
         self.cap_input.setSpecialValueText("未确认")
         self.cap_input.setToolTip("填写游戏内“最大 FPS”；0 表示不限制")
         self.vsync_input = QComboBox()
-        self.vsync_input.addItem("关闭", "disabled")
-        self.vsync_input.addItem("开启", "enabled")
+        self.vsync_input.addItem("已禁用", "disabled")
+        self.vsync_input.addItem("已启用", "enabled")
         self.vsync_input.addItem("未确认", "unknown")
         self.vsync_input.setCurrentIndex(max(0, self.vsync_input.findData(state.vsync)))
         self.shadow_quality_input = QComboBox()
@@ -537,10 +550,10 @@ class NewTaskPage(QScrollArea):
         self.shadow_quality_input.setCurrentText(state.shadow_quality if state.shadow_quality != "unknown" else "未确认")
         self.dynamic_shadows_input = QComboBox()
         self.dynamic_shadows_input.addItem("全部", "all")
-        self.dynamic_shadows_input.addItem("仅太阳", "sun_only")
+        self.dynamic_shadows_input.addItem("仅限日光", "sun_only")
         self.dynamic_shadows_input.addItem("未确认", "unknown")
         self.dynamic_shadows_input.setCurrentIndex(max(0, self.dynamic_shadows_input.findData(state.dynamic_shadows)))
-        for name, widget in [("任务名称", self.name_input), ("游戏", self.game_input), ("处理器", cpu_field), ("显卡", gpu_field), ("分辨率（常用候选）", resolution_field), ("显示模式", self.display_mode_input), ("刷新率", self.refresh_input), ("测试场景", self.scene_input), ("游戏内最大 FPS", self.cap_input), ("等待垂直同步", self.vsync_input), ("全局阴影质量", self.shadow_quality_input), ("动态阴影", self.dynamic_shadows_input)]:
+        for name, widget in [("任务名称", self.name_input), ("游戏", self.game_input), ("处理器", cpu_field), ("显卡", gpu_field), ("分辨率（常用候选）", resolution_field), ("显示模式", self.display_mode_input), ("刷新率", self.refresh_input), ("测试场景", self.scene_input)]:
             basic_form.addRow(name, widget)
         self.target_avg = self._spin(30, 1000, state.target_avg, 10)
         self.target_low = self._spin(30, 1000, state.target_low, 10)
@@ -551,7 +564,7 @@ class NewTaskPage(QScrollArea):
         self.gpu_usage_input = self._spin(0, 100, state.gpu_usage)
         self.baseline_repeats_input = self._spin(1, 20, state.baseline_repeats)
         self.baseline_duration_input = self._spin(10, 3600, state.baseline_duration_seconds)
-        self.baseline_confirmed_input = QCheckBox("我已在相同场景下完成至少 3 次基线测试")
+        self.baseline_confirmed_input = QCheckBox("我已在相同场景下完成至少 2 次基线测试，并核对测试条件")
         self.baseline_confirmed_input.setChecked(state.baseline_confirmed)
         for name, widget in [("平均 FPS 目标", self.target_avg), ("1% Low 目标", self.target_low), ("优化模式", self.mode_input), ("当前平均 FPS", self.avg_input), ("当前 1% Low", self.low_input), ("当前 GPU 占用", self.gpu_usage_input), ("测试次数", self.baseline_repeats_input), ("每次时长（秒）", self.baseline_duration_input), ("确认基线", self.baseline_confirmed_input)]:
             goal_form.addRow(name, widget)
@@ -581,6 +594,38 @@ class NewTaskPage(QScrollArea):
         laptop_form.addRow("风扇 / 散热模式", self.cooling_mode_input)
         root.addWidget(self.laptop_card)
         self._update_laptop_fields()
+        advanced_card, advanced_form = self._form_card("CS2 高级视频设置")
+        self.advanced_video_inputs: dict[str, QComboBox] = {}
+        advanced_definitions = [
+            ("video_preset", "当前视频值预设", [("自定义", "custom"), ("低", "low"), ("中", "medium"), ("高", "high"), ("非常高", "very_high")]),
+            ("player_contrast", "增强角色对比度", [("已启用", "enabled"), ("已禁用", "disabled")]),
+            ("nvidia_gsync", "NVIDIA G-Sync", [("已禁用", "disabled"), ("已启用", "enabled"), ("此设备不可用", "not_available")]),
+            ("nvidia_reflex", "NVIDIA Reflex 低延迟", [("已禁用", "disabled"), ("已启用", "enabled"), ("已启用 + 加速", "enabled_boost"), ("此设备不可用", "not_available")]),
+            ("amd_anti_lag", "AMD Anti-Lag 2.0", [("已禁用", "disabled"), ("已启用", "enabled"), ("此设备不可用", "not_available")]),
+            ("msaa_mode", "多重采样抗锯齿模式", [("无", "none"), ("CMAA2 抗锯齿", "cmaa2"), ("2x MSAA", "2x_msaa"), ("4x MSAA", "4x_msaa"), ("8x MSAA", "8x_msaa")]),
+            ("texture_detail", "模型/贴图细节", [("低", "low"), ("中", "medium"), ("高", "high")]),
+            ("texture_filtering", "贴图过滤模式", [("双线性", "bilinear"), ("三线性", "trilinear"), ("异向 2X", "anisotropic_2x"), ("异向 4X", "anisotropic_4x"), ("异向 8X", "anisotropic_8x"), ("异向 16X", "anisotropic_16x")]),
+            ("shader_detail", "光影细节", [("低", "low"), ("高", "high")]),
+            ("particle_detail", "粒子细节", [("低", "low"), ("中", "medium"), ("高", "high"), ("非常高", "very_high")]),
+            ("ambient_occlusion", "环境光遮蔽", [("已禁用", "disabled"), ("中", "medium"), ("高", "high")]),
+            ("hdr", "高动态范围", [("品质", "quality"), ("性能", "performance")]),
+            ("fsr", "Fidelity FX 超级分辨率", [("已禁用（最高品质）", "disabled"), ("超高品质", "ultra_quality"), ("品质", "quality"), ("均衡", "balanced"), ("性能", "performance")]),
+        ]
+        for key, name, options in advanced_definitions:
+            combo = QComboBox()
+            for text, value in options:
+                combo.addItem(text, value)
+            current = (state.video_settings or {}).get(key, options[0][1])
+            combo.setCurrentIndex(max(0, combo.findData(current)))
+            self.advanced_video_inputs[key] = combo
+            advanced_form.addRow(name, combo)
+        self.menu_cap_input = self._spin(0, 1000, int((state.video_settings or {}).get("menu_fps_cap", "0")), 10)
+        advanced_form.addRow("菜单最高FPS", self.menu_cap_input)
+        advanced_form.addRow("游戏最高FPS", self.cap_input)
+        advanced_form.addRow("V-Sync", self.vsync_input)
+        advanced_form.addRow("全局阴影效果", self.shadow_quality_input)
+        advanced_form.addRow("动态阴影", self.dynamic_shadows_input)
+        root.insertWidget(2, advanced_card)
         root.addWidget(label("硬件型号只用于识别设备，性能判断以实测数据为准。不清楚笔记本选项时可以选择“不确定”。", "metricNote", True))
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -714,11 +759,11 @@ class NewTaskPage(QScrollArea):
         self.state.baseline_repeats = self.baseline_repeats_input.value()
         self.state.baseline_duration_seconds = self.baseline_duration_input.value()
         self.state.baseline_confirmed = self.baseline_confirmed_input.isChecked()
-        if self.state.baseline_repeats < 3 or not self.state.baseline_confirmed:
+        if self.state.baseline_repeats < 2 or not self.state.baseline_confirmed:
             QMessageBox.warning(
                 self,
                 "基线测试不足",
-                "请在相同场景下至少测试 3 次，然后勾选基线确认。",
+                "请在相同场景下至少测试 2 次，然后勾选基线确认；如果两次结果差异超过 5%，再补第 3 次。",
             )
             return
         self.state.mode = ("competitive", "balanced", "visual")[self.mode_input.currentIndex()]
@@ -731,6 +776,10 @@ class NewTaskPage(QScrollArea):
         if self.state.shadow_quality == "未确认":
             self.state.shadow_quality = "unknown"
         self.state.dynamic_shadows = str(self.dynamic_shadows_input.currentData())
+        self.state.video_settings = {
+            key: str(combo.currentData()) for key, combo in self.advanced_video_inputs.items()
+        }
+        self.state.video_settings["menu_fps_cap"] = str(self.menu_cap_input.value())
         self.state.has_task = True
         self.state.step = "分析完成"
         self.task_created.emit(self.state)
@@ -752,7 +801,13 @@ class ExperimentPage(QScrollArea):
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
         round_number = plan.round_number if plan else state.round_number
-        root.addWidget(PageHeader("实验结果", f"录入第 {round_number} 轮结果", "请按同一场景测试至少 3 次。条件有变化时，请如实选择“有变化”。", "等待录入"))
+        if plan and plan.action == AgentAction.REQUEST_DATA:
+            subtitle = "这一步只记录实际设置，不需要测试帧率；条件有变化时，请如实选择“有变化”。"
+        elif plan and plan.action == AgentAction.FINISH:
+            subtitle = "当前没有新的测试要求；如需继续，请先补充可验证的设置规则。"
+        else:
+            subtitle = "先测试 1 次筛选明显退步；没有明显下降时，再补测到累计 3 次。条件有变化时，请如实选择“有变化”。"
+        root.addWidget(PageHeader("实验结果", f"录入第 {round_number} 轮结果", subtitle, "等待录入"))
         columns = QHBoxLayout()
         columns.setSpacing(15)
         input_card = QFrame()
@@ -773,7 +828,7 @@ class ExperimentPage(QScrollArea):
         self.avg = NewTaskPage._spin(1, 1000, 296)
         self.low = NewTaskPage._spin(1, 1000, 174)
         self.gpu = NewTaskPage._spin(0, 100, 59)
-        self.repeats = NewTaskPage._spin(1, 10, 3)
+        self.repeats = NewTaskPage._spin(1, 10, 1)
         self.duration = NewTaskPage._spin(10, 3600, 60)
         self.condition = QComboBox()
         self.condition.addItems(["与基线一致", "有变化，需要说明"])
@@ -831,7 +886,13 @@ class ExperimentPage(QScrollArea):
         change_title = f"{plan.setting}：{plan.old_value} → {plan.new_value}" if plan else "等待生成实验计划"
         guide_layout.addWidget(label(change_title, "actionTitle", True))
         guide_layout.addWidget(label("其他设置保持不变", "metricNote"))
-        for name, value in [("测试场景", state.test_scene), ("测试要求", "每次 60 秒，共 3 次"), ("基线数据", f"{state.avg_fps} / {state.low_fps} FPS"), ("有效变化", "平均帧率变化超过 5%")]:
+        if plan and plan.action == AgentAction.REQUEST_DATA:
+            test_requirement = "仅记录设置，不需要测试帧率"
+        elif plan and plan.action == AgentAction.FINISH:
+            test_requirement = "当前不需要新测试"
+        else:
+            test_requirement = "先测 1 次；无明显下降再补到累计 3 次"
+        for name, value in [("测试场景", state.test_scene), ("测试要求", test_requirement), ("基线数据", f"{state.avg_fps} / {state.low_fps} FPS"), ("有效变化", "平均帧率变化超过 5%")]:
             guide_layout.addWidget(hline())
             guide_layout.addWidget(RuleRow(name, value))
         guide_layout.addSpacing(8)
@@ -866,9 +927,9 @@ class ExperimentPage(QScrollArea):
             "power_mode": display_values["power_mode"].get(self.state.power_mode, self.state.power_mode),
             "cooling_mode": display_values["cooling_mode"].get(self.state.cooling_mode, self.state.cooling_mode),
             "shadow_quality": "" if self.state.shadow_quality == "unknown" else self.state.shadow_quality,
-            "dynamic_shadows": {"all": "全部", "sun_only": "仅太阳", "unknown": ""}.get(self.state.dynamic_shadows, ""),
+            "dynamic_shadows": {"all": "全部", "sun_only": "仅限日光", "unknown": ""}.get(self.state.dynamic_shadows, ""),
             "fps_cap": "" if self.state.fps_cap is None else str(self.state.fps_cap),
-            "display_mode": {"fullscreen": "全屏", "borderless": "无边框窗口", "windowed": "窗口化"}.get(self.state.display_mode, self.state.display_mode),
+            "display_mode": {"fullscreen": "全屏", "borderless": "全屏窗口模式", "windowed": "窗口模式"}.get(self.state.display_mode, self.state.display_mode),
         }
         if setting_id in values:
             return values[setting_id]
@@ -880,8 +941,10 @@ class ExperimentPage(QScrollArea):
             "显卡输出模式": values["graphics_mode"],
             "供电 / 性能模式": values["power_mode"],
             "散热模式": values["cooling_mode"],
+            "全局阴影效果": values["shadow_quality"],
             "全局阴影质量": values["shadow_quality"],
             "动态阴影": values["dynamic_shadows"],
+            "游戏最高FPS": values["fps_cap"],
             "游戏内最大 FPS": values["fps_cap"],
             "显示模式": values["display_mode"],
         }
@@ -895,8 +958,8 @@ class ExperimentPage(QScrollArea):
             "power_mode": ["接通电源 · 性能模式", "接通电源 · 平衡模式", "电池供电", "不确定"],
             "cooling_mode": ["性能 / 狂暴模式", "平衡模式", "安静模式", "不确定"],
             "shadow_quality": ["低", "中", "高", "非常高", "未确认"],
-            "dynamic_shadows": ["全部", "仅太阳", "未确认"],
-            "display_mode": ["全屏", "无边框窗口", "窗口化"],
+            "dynamic_shadows": ["全部", "仅限日光", "未确认"],
+            "display_mode": ["全屏", "全屏窗口模式", "窗口模式"],
         }.get(setting_id, [])
 
     def _supplement_value(self) -> str:
@@ -907,8 +970,8 @@ class ExperimentPage(QScrollArea):
             "graphics_mode": {"独显直连": "dgpu", "混合输出": "hybrid", "自动切换": "advanced_optimus", "不确定": "unknown"},
             "power_mode": {"接通电源 · 性能模式": "ac_performance", "接通电源 · 平衡模式": "ac_balanced", "电池供电": "battery", "不确定": "unknown"},
             "cooling_mode": {"性能 / 狂暴模式": "performance", "平衡模式": "balanced", "安静模式": "quiet", "不确定": "unknown"},
-            "dynamic_shadows": {"全部": "all", "仅太阳": "sun_only", "未确认": "unknown"},
-            "display_mode": {"全屏": "fullscreen", "无边框窗口": "borderless", "窗口化": "windowed"},
+            "dynamic_shadows": {"全部": "all", "仅限日光": "sun_only", "仅太阳": "sun_only", "未确认": "unknown"},
+            "display_mode": {"全屏": "fullscreen", "全屏窗口模式": "borderless", "无边框窗口": "borderless", "窗口模式": "windowed", "窗口化": "windowed"},
         }
         return aliases.get(setting_id, {}).get(value, value)
 
@@ -939,6 +1002,7 @@ class ExperimentPage(QScrollArea):
             "shadow_quality": self.state.shadow_quality,
             "dynamic_shadows": self.state.dynamic_shadows,
         })
+        config.update(self.state.video_settings or {})
         config["planned_setting"] = str(getattr(self.plan, "setting", "") or "") if self.plan else ""
         config["planned_setting_id"] = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
         config["actual_setting_value"] = self.actual_setting.text().strip()
@@ -1688,7 +1752,7 @@ class MainWindow(QMainWindow):
         for field_name in ("name", "game", "cpu", "gpu", "resolution", "refresh_rate", "test_scene",
                            "target_avg_fps", "target_low_fps", "mode", "is_laptop", "gpu_power_w",
                            "graphics_mode", "power_mode", "cooling_mode", "display_mode", "fps_cap",
-                           "vsync", "shadow_quality", "dynamic_shadows"):
+                           "vsync", "shadow_quality", "dynamic_shadows", "video_settings"):
             state_name = {"target_avg_fps": "target_avg", "target_low_fps": "target_low"}.get(field_name, field_name)
             if hasattr(task, field_name) and hasattr(self.state, state_name):
                 setattr(self.state, state_name, getattr(task, field_name))
@@ -1981,6 +2045,13 @@ class MainWindow(QMainWindow):
                                 ("power_mode", "power_mode"), ("cooling_mode", "cooling_mode")):
             if config.get(key):
                 setattr(self.state, state_name, str(config[key]))
+        known_video_keys = set((self.state.video_settings or {}).keys())
+        updated_video = {
+            key: str(value) for key, value in config.items()
+            if key in known_video_keys and value not in (None, "")
+        }
+        if updated_video:
+            self.state.video_settings = {**(self.state.video_settings or {}), **updated_video}
 
     def _same_retest_plan(self, round_number: int) -> ExperimentPlan | None:
         if self.current_plan is None:
@@ -2196,6 +2267,7 @@ class MainWindow(QMainWindow):
             vsync=self.state.vsync,
             shadow_quality=self.state.shadow_quality,
             dynamic_shadows=self.state.dynamic_shadows,
+            video_settings=dict(self.state.video_settings or {}),
         )
         baseline = BenchmarkRecord(
             avg_fps=self.state.avg_fps,
@@ -2218,6 +2290,7 @@ class MainWindow(QMainWindow):
                 "vsync": self.state.vsync,
                 "shadow_quality": self.state.shadow_quality,
                 "dynamic_shadows": self.state.dynamic_shadows,
+                **(self.state.video_settings or {}),
             },
         )
         return task, baseline

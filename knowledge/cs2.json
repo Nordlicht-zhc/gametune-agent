@@ -15,14 +15,14 @@
     },
     {
       "id": "vsync",
-      "label": "等待垂直同步",
-      "values": ["关闭", "开启"],
+      "label": "V-Sync",
+      "values": ["已禁用", "已启用"],
       "primarily_affects": "cap",
       "diagnostic_use": "瓶颈判断前排除人为帧率限制"
     },
     {
       "id": "fps_cap",
-      "label": "游戏内最大 FPS",
+      "label": "游戏最高FPS",
       "values": [],
       "primarily_affects": "cap",
       "diagnostic_use": "排除游戏内帧率上限造成的假性瓶颈"
@@ -30,13 +30,13 @@
     {
       "id": "display_mode",
       "label": "显示模式",
-      "values": ["全屏", "无边框窗口", "窗口化"],
+      "values": ["全屏", "全屏窗口模式", "窗口模式"],
       "primarily_affects": "presentation",
       "diagnostic_use": "固定刷新率与显示路径，保证前后测试条件一致"
     },
     {
       "id": "shadow_quality",
-      "label": "全局阴影质量",
+      "label": "全局阴影效果",
       "values": ["低", "中", "高", "非常高"],
       "primarily_affects": "gpu",
       "change_limit": "每轮最多调整一级"
@@ -44,9 +44,48 @@
     {
       "id": "dynamic_shadows",
       "label": "动态阴影",
-      "values": ["仅太阳", "全部"],
+      "values": ["仅限日光", "全部"],
       "primarily_affects": "visibility",
       "diagnostic_use": "决定显示哪些光源产生的动态阴影；竞技模式默认保留全部"
+    },
+    {
+      "id": "player_contrast", "label": "增强角色对比度", "values": ["已启用", "已禁用"], "primarily_affects": "visibility"
+    },
+    {
+      "id": "nvidia_gsync", "label": "NVIDIA G-Sync", "values": ["已禁用", "已启用", "此设备不可用"], "primarily_affects": "presentation"
+    },
+    {
+      "id": "nvidia_reflex", "label": "NVIDIA Reflex 低延迟", "values": ["已禁用", "已启用", "已启用 + 加速", "此设备不可用"], "primarily_affects": "latency"
+    },
+    {
+      "id": "amd_anti_lag", "label": "AMD Anti-Lag 2.0", "values": ["已禁用", "已启用", "此设备不可用"], "primarily_affects": "latency"
+    },
+    {
+      "id": "menu_fps_cap", "label": "菜单最高FPS", "values": [], "primarily_affects": "cap"
+    },
+    {
+      "id": "msaa_mode", "label": "多重采样抗锯齿模式", "values": ["无", "CMAA2 抗锯齿", "2x MSAA", "4x MSAA", "8x MSAA"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "texture_detail", "label": "模型/贴图细节", "values": ["低", "中", "高"], "primarily_affects": "vram"
+    },
+    {
+      "id": "texture_filtering", "label": "贴图过滤模式", "values": ["双线性", "三线性", "异向 2X", "异向 4X", "异向 8X", "异向 16X"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "shader_detail", "label": "光影细节", "values": ["低", "高"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "particle_detail", "label": "粒子细节", "values": ["低", "中", "高", "非常高"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "ambient_occlusion", "label": "环境光遮蔽", "values": ["已禁用", "中", "高"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "hdr", "label": "高动态范围", "values": ["品质", "性能"], "primarily_affects": "gpu"
+    },
+    {
+      "id": "fsr", "label": "Fidelity FX 超级分辨率", "values": ["已禁用（最高品质）", "超高品质", "品质", "均衡", "性能"], "primarily_affects": "gpu"
     }
   ]
 }

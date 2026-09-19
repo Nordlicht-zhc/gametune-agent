@@ -67,12 +67,41 @@ def _is_resolution_comparison(baseline: BenchmarkRecord, current: BenchmarkRecor
 
 
 def dominant_hypothesis(evidence: list[Evidence]) -> tuple[str, float]:
+    """Return the leading cause and its evidence support strength.
+
+    ``frametime`` describes a visible symptom, while ``cpu``, ``gpu`` and
+    ``platform`` describe possible causes.  A symptom should not defeat a
+    measured cause merely because the target FPS was set unusually high.  If
+    a cause is available, the symptom is therefore kept out of the cause
+    ranking; it is still shown as an evidence tag in the UI.
+
+    Missing or unconfirmed inputs are included in the denominator.  The
+    result is a relative support strength, not a calibrated probability.
+    """
     scores: dict[str, float] = {}
+    missing = 0.0
     for item in evidence:
-        if item.supports != "insufficient":
+        if item.supports == "insufficient":
+            missing += item.weight
+        else:
             scores[item.supports] = scores.get(item.supports, 0.0) + item.weight
     if not scores:
         return "insufficient", 0.0
-    name, score = max(scores.items(), key=lambda pair: pair[1])
-    confidence = score / max(sum(scores.values()), 1.0)
+
+    causal_scores = {name: score for name, score in scores.items() if name in {"cpu", "gpu", "platform"}}
+    ranked = causal_scores or scores
+    name, score = max(ranked.items(), key=lambda pair: pair[1])
+    confidence = score / max(sum(ranked.values()) + missing, 1.0)
     return name, round(min(confidence, 0.95), 2)
+
+
+def evidence_support_level(evidence: list[Evidence]) -> str:
+    """Map relative support strength to player-facing language."""
+    hypothesis, confidence = dominant_hypothesis(evidence)
+    if hypothesis == "insufficient" or confidence < 0.45:
+        return "不足"
+    if confidence < 0.65:
+        return "弱"
+    if confidence < 0.80:
+        return "中"
+    return "强"

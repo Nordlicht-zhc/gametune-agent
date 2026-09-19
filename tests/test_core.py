@@ -16,11 +16,11 @@ from agent.state_machine import Workflow, WorkflowState
 from agent.validator import KnowledgeBase, PlanValidationError, validate_plan
 from models.schemas import ExperimentPlan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
-from tools.calculate_metrics import metrics_from_frame_times, normalized_score
+from tools.calculate_metrics import metrics_from_frame_times, normalized_score, weighted_relative_change
 from tools.import_benchmark import import_benchmark_csv
 from tools.resolution import aspect_ratio_name, lower_resolution_same_aspect, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog
-from tools.analyze_evidence import analyze_evidence
+from tools.analyze_evidence import analyze_evidence, dominant_hypothesis, evidence_support_level
 
 
 def task() -> OptimizationTask:
@@ -49,6 +49,10 @@ class MetricsTests(unittest.TestCase):
 
     def test_score_is_capped_at_target(self):
         self.assertEqual(normalized_score(600, 500, 300, 210, "competitive"), 100.0)
+
+    def test_weighted_change_is_not_capped_at_target(self):
+        self.assertAlmostEqual(weighted_relative_change(12.5, 0.0, "competitive"), 4.375)
+        self.assertAlmostEqual(weighted_relative_change(0.0, 10.0, "competitive"), 6.5)
 
 
 class ResolutionTests(unittest.TestCase):
@@ -97,6 +101,27 @@ class HardwareCatalogTests(unittest.TestCase):
         self.assertEqual(plan.setting, "GPU 功耗")
 
 
+class EvidenceWeightTests(unittest.TestCase):
+    def test_missing_conditions_reduce_support_strength(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 100, 57, current_task.resolution, current_task.test_scene, repeats=3)
+        known = analyze_evidence(current_task, current, fps_cap_known=True, vsync_known=True)
+        unknown = analyze_evidence(current_task, current, fps_cap_known=False, vsync_known=False)
+        known_hypothesis, known_strength = dominant_hypothesis(known)
+        unknown_hypothesis, unknown_strength = dominant_hypothesis(unknown)
+        self.assertEqual(known_hypothesis, "cpu")
+        self.assertEqual(unknown_hypothesis, "cpu")
+        self.assertLess(unknown_strength, known_strength)
+        self.assertEqual(evidence_support_level(unknown), "不足")
+
+    def test_measured_cause_is_not_overruled_by_target_miss_symptom(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 50, 98, current_task.resolution, current_task.test_scene, repeats=3)
+        evidence = analyze_evidence(current_task, current, fps_cap_known=True, vsync_known=True)
+        hypothesis, _ = dominant_hypothesis(evidence)
+        self.assertEqual(hypothesis, "gpu")
+
+
 class ImportTests(unittest.TestCase):
     def test_imports_summary_runs_and_uses_median(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -129,6 +154,44 @@ class EvaluationTests(unittest.TestCase):
         decision = evaluate_result(task(), record(284, 168), record(310, 215), round_number=1)
         self.assertEqual(decision.action, AgentAction.FINISH)
 
+    def test_above_target_average_gain_is_not_hidden_by_capped_score(self):
+        decision = evaluate_result(task(), record(320, 180), record(360, 180), round_number=1)
+        self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
+        self.assertGreater(decision.weighted_delta_pct, 1.0)
+
+    def test_regression_is_checked_before_target_completion(self):
+        decision = evaluate_result(task(), record(400, 205), record(310, 210), round_number=1)
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertTrue(decision.rollback_required)
+
+    def test_tiny_weighted_gain_requests_retest(self):
+        decision = evaluate_result(task(), record(200, 150), record(210, 146.25), round_number=1)
+        self.assertEqual(decision.action, AgentAction.RETEST)
+        self.assertLess(decision.weighted_delta_pct, 1.0)
+
+    def test_visual_mode_rejects_unconfirmed_quality_drop(self):
+        visual_task = OptimizationTask(
+            "视觉模式", "Counter-Strike 2", "CPU", "GPU", "2560 × 1440", "144 Hz", "Workshop", 300, 210,
+            mode="visual",
+        )
+        baseline = BenchmarkRecord(
+            250, 170, 95, visual_task.resolution, visual_task.test_scene, repeats=3,
+            configuration={"shadow_quality": "高"},
+        )
+        candidate = BenchmarkRecord(
+            300, 220, 95, visual_task.resolution, visual_task.test_scene, repeats=3,
+            configuration={"shadow_quality": "中"},
+        )
+        decision = evaluate_result(visual_task, baseline, candidate, round_number=1)
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertIn("画质下降", decision.reasons[0])
+
+    def test_best_record_ranking_keeps_above_target_weighted_gain(self):
+        best = record(320, 220)
+        candidate = record(400, 215)
+        selected = GameTuneController._better_record(task(), candidate, best)
+        self.assertIs(selected, candidate)
+
     def test_changed_conditions_are_not_evaluated(self):
         decision = evaluate_result(task(), record(284, 168), record(330, 220, comparable=False), round_number=1)
         self.assertEqual(decision.action, AgentAction.RETEST)
@@ -152,6 +215,56 @@ class EvaluationTests(unittest.TestCase):
         candidate.configuration_confirmed = False
         decision = evaluate_result(task(), record(284, 168), candidate, round_number=1)
         self.assertEqual(decision.action, AgentAction.RETEST)
+
+    def test_adaptive_screen_reverts_obvious_regression_after_one_run(self):
+        candidate = record(250, 140)
+        candidate.repeats = 1
+        candidate.runs = [{"avg_fps": 250, "low_fps": 140}]
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertTrue(decision.rollback_required)
+        self.assertFalse(decision.task_complete)
+
+    def test_adaptive_screen_accumulates_promising_runs_before_acceptance(self):
+        candidate = record(296, 174)
+        candidate.repeats = 1
+        candidate.runs = [{"avg_fps": 296, "low_fps": 174}]
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.RETEST)
+        self.assertIn("累计达到 3 次", decision.summary)
+
+    def test_adaptive_screen_does_not_repeat_three_evidence_backed_neutral_runs(self):
+        candidate = record(285, 169)
+        candidate.runs = [
+            {"avg_fps": 285, "low_fps": 169},
+            {"avg_fps": 285, "low_fps": 169},
+            {"avg_fps": 285, "low_fps": 169},
+        ]
+        candidate.repeats = 3
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertIn("下一项设置", decision.summary)
 
 
 class PersistenceTests(unittest.TestCase):
