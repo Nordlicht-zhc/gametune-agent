@@ -12,7 +12,7 @@ from agent.evaluator import evaluate_result
 from agent.api import APIConfig, ModelMessage, ModelRequest, ModelResponse, OpenAICompatibleProvider
 from agent.explainer import explain_decision
 from agent.planner import plan_next_experiment
-from agent.state_machine import Workflow, WorkflowState
+from agent.state_machine import Workflow, WorkflowPhase, WorkflowState
 from agent.validator import KnowledgeBase, PlanValidationError, validate_plan
 from models.schemas import ExperimentPlan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
@@ -109,10 +109,29 @@ class EvidenceWeightTests(unittest.TestCase):
         unknown = analyze_evidence(current_task, current, fps_cap_known=False, vsync_known=False)
         known_hypothesis, known_strength = dominant_hypothesis(known)
         unknown_hypothesis, unknown_strength = dominant_hypothesis(unknown)
-        self.assertEqual(known_hypothesis, "cpu")
-        self.assertEqual(unknown_hypothesis, "cpu")
+        self.assertEqual(known_hypothesis, "cpu_or_other")
+        self.assertEqual(unknown_hypothesis, "cpu_or_other")
         self.assertLess(unknown_strength, known_strength)
         self.assertEqual(evidence_support_level(unknown), "不足")
+
+    def test_invalid_resolution_diagnostic_cannot_become_cpu_evidence(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 100, 60, current_task.resolution, current_task.test_scene, repeats=3)
+        evidence = analyze_evidence(
+            current_task,
+            current,
+            fps_cap_known=True,
+            vsync_known=True,
+            diagnostic_results=[{
+                "kind": "resolution",
+                "avg_delta_pct": 0.0,
+                "supports": "insufficient",
+                "valid": False,
+                "summary": "诊断结果无效：测试条件不一致。",
+            }],
+        )
+        self.assertNotIn("diagnostic_resolution_flat", {item.code for item in evidence})
+        self.assertEqual(dominant_hypothesis(evidence)[0], "cpu_or_other")
 
     def test_measured_cause_is_not_overruled_by_target_miss_symptom(self):
         current_task = task()
@@ -287,9 +306,16 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             controller = GameTuneController(Path(folder) / "state.db")
             current_task = task()
-            baseline = record(284, 168)
+            baseline = BenchmarkRecord(
+                284, 168, 99, "2560 × 1440", "Workshop", repeats=3,
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all"},
+            )
             _, first_plan = controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
-            candidate = record(296, 174, resolution="1920 × 1080")
+            candidate = BenchmarkRecord(
+                296, 174, 99, baseline.resolution, baseline.test_scene,
+                repeats=3,
+                configuration={"shadow_quality": "中", "dynamic_shadows": "all"},
+            )
             decision = controller.evaluate(current_task, baseline, candidate, 1)
             self.assertEqual(decision.action, AgentAction.RETEST)
             evidence, plan = controller.plan_after_result(current_task, candidate, baseline, 1)
@@ -302,9 +328,16 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             controller = GameTuneController(Path(folder) / "state.db")
             current_task = task()
-            baseline = record(284, 168)
+            baseline = BenchmarkRecord(
+                284, 168, 99, "2560 × 1440", "Workshop", repeats=3,
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all"},
+            )
             controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
-            candidate = record(320, 190)
+            candidate = BenchmarkRecord(
+                320, 190, 99, baseline.resolution, baseline.test_scene,
+                repeats=3,
+                configuration={"shadow_quality": "中", "dynamic_shadows": "all"},
+            )
             decision = controller.evaluate(current_task, baseline, candidate, 1)
             self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
             self.assertEqual(controller.current_record(current_task.task_id).record_id, candidate.record_id)
@@ -456,6 +489,15 @@ class WorkflowTests(unittest.TestCase):
     def test_illegal_transition_is_rejected(self):
         with self.assertRaises(ValueError):
             Workflow().finish()
+
+    def test_data_collection_phase_depends_on_its_purpose(self):
+        workflow = Workflow()
+        workflow.set_phase("optimization", action="request_data", setting_id="cpu_metrics")
+        self.assertEqual(workflow.phase, WorkflowPhase.DIAGNOSIS)
+        workflow.set_phase("diagnostic", action="request_data", setting_id="user_adjustment")
+        self.assertEqual(workflow.phase, WorkflowPhase.OPTIMIZATION)
+        workflow.set_phase("diagnostic", action="request_data", setting_id="shadow_quality")
+        self.assertEqual(workflow.phase, WorkflowPhase.OPTIMIZATION)
 
     def test_unknown_recommendation_is_rejected(self):
         plan = ExperimentPlan(

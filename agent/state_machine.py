@@ -14,6 +14,11 @@ class WorkflowState(str, Enum):
     COMPLETE = "complete"
 
 
+class WorkflowPhase(str, Enum):
+    DIAGNOSIS = "diagnosis"
+    OPTIMIZATION = "optimization"
+
+
 ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     WorkflowState.WAITING_INPUT: {WorkflowState.VALIDATING},
     WorkflowState.VALIDATING: {WorkflowState.ANALYZING, WorkflowState.WAITING_INPUT},
@@ -33,6 +38,7 @@ ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
 class Workflow:
     state: WorkflowState = WorkflowState.WAITING_INPUT
     round_number: int = 0
+    phase: WorkflowPhase = WorkflowPhase.DIAGNOSIS
 
     def transition(self, target: WorkflowState) -> None:
         if target not in ALLOWED_TRANSITIONS[self.state]:
@@ -49,12 +55,26 @@ class Workflow:
         self.transition(WorkflowState.AWAITING_TEST)
         self.round_number += 1
 
+    def set_phase(self, purpose: str, *, action: str = "", setting_id: str = "") -> None:
+        diagnostic_inputs = {
+            "fps_cap", "vsync", "gpu_power_w", "graphics_mode", "power_mode",
+            "cooling_mode", "cpu_metrics", "test_conditions",
+        }
+        is_diagnostic = (
+            setting_id in diagnostic_inputs
+            if action == "request_data"
+            else purpose == "diagnostic"
+        )
+        self.phase = WorkflowPhase.DIAGNOSIS if is_diagnostic else WorkflowPhase.OPTIMIZATION
+
     def begin_evaluation(self) -> None:
         self.transition(WorkflowState.EVALUATING)
 
-    def continue_testing(self) -> None:
+    def continue_testing(self, purpose: str | None = None, *, action: str = "", setting_id: str = "") -> None:
         self.transition(WorkflowState.AWAITING_TEST)
         self.round_number += 1
+        if purpose is not None:
+            self.set_phase(purpose, action=action, setting_id=setting_id)
 
     def retest(self) -> None:
         """Retry the same experiment without advancing its optimization round."""

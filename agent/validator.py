@@ -34,7 +34,6 @@ class KnowledgeBase:
 
 
 def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: KnowledgeBase) -> None:
-    rules = knowledge.game_rules(task.game)
     if plan.round_number < 1 or plan.round_number > task.max_rounds:
         raise PlanValidationError("实验轮次超出任务上限")
     required = (plan.title, plan.setting, plan.rationale, plan.hypothesis, plan.method, plan.success_criteria, plan.rollback)
@@ -42,6 +41,27 @@ def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: Knowl
         raise PlanValidationError("实验计划缺少必要说明")
     if plan.old_value == plan.new_value and plan.action not in {AgentAction.REQUEST_DATA, AgentAction.FINISH}:
         raise PlanValidationError("实验计划没有产生可验证的变化")
+
+    try:
+        rules = knowledge.game_rules(task.game)
+    except PlanValidationError:
+        setting_id = getattr(plan, "setting_id", "")
+        if plan.action == AgentAction.FINISH:
+            return
+        if plan.action == AgentAction.REQUEST_DATA and setting_id in {
+            "fps_cap", "vsync", "gpu_power_w", "graphics_mode", "power_mode",
+            "cooling_mode", "cpu_metrics", "test_conditions", "user_adjustment",
+        }:
+            return
+        if (
+            plan.action == AgentAction.PROPOSE_EXPERIMENT
+            and plan.purpose == "diagnostic"
+            and setting_id in {"resolution", "power_mode", "cooling_mode", "graphics_mode"}
+        ):
+            return
+        if plan.action == AgentAction.RECOMMEND_CHANGE and setting_id == "user_defined":
+            return
+        raise
     if plan.action != AgentAction.RECOMMEND_CHANGE:
         return
     setting_id = getattr(plan, "setting_id", "")
@@ -51,6 +71,7 @@ def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: Knowl
     if setting is None:
         raise PlanValidationError(f"规则库中不存在设置项：{plan.setting}")
     values = setting.get("values", [])
+    configuration_values = setting.get("configuration_values", [])
     custom_resolution = False
     if plan.setting == "分辨率":
         try:
@@ -58,10 +79,14 @@ def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: Knowl
             custom_resolution = True
         except ValueError:
             pass
-    if values and plan.new_value not in values and not custom_resolution:
+    allowed_values = set(values if isinstance(values, list) else []) | set(
+        configuration_values if isinstance(configuration_values, list) else []
+    )
+    if allowed_values and plan.new_value not in allowed_values and not custom_resolution:
         raise PlanValidationError(f"设置值不合法：{plan.setting} = {plan.new_value}")
     if setting.get("change_limit"):
-        if plan.old_value not in values:
+        order = setting.get("optimization_order", configuration_values or values)
+        if not isinstance(order, list) or plan.old_value not in order:
             raise PlanValidationError(f"必须先记录实际原值：{plan.setting}")
-        if values.index(plan.old_value) - values.index(plan.new_value) != 1:
+        if plan.new_value not in order or order.index(plan.new_value) - order.index(plan.old_value) != 1:
             raise PlanValidationError(f"本轮只能降低一级：{plan.setting}")

@@ -111,6 +111,7 @@ def _decision(
     stop_reason: str = "",
     retry_same_experiment: bool = False,
     rollback_required: bool = False,
+    diagnostic_summary: str = "",
 ) -> Decision:
     return Decision(
         action=action,
@@ -126,6 +127,7 @@ def _decision(
         stop_reason=stop_reason,
         retry_same_experiment=retry_same_experiment,
         rollback_required=rollback_required,
+        diagnostic_summary=diagnostic_summary,
     )
 
 
@@ -397,4 +399,131 @@ def evaluate_result(
         stop_reason=stop_reason,
         retry_same_experiment=action == AgentAction.RETEST and not task_complete,
         rollback_required=rollback_required,
+    )
+
+
+def evaluate_diagnostic_result(
+    task: OptimizationTask,
+    candidate: BenchmarkRecord,
+    *,
+    round_number: int,
+    reference: BenchmarkRecord,
+    setting_id: str = "",
+    retry_count: int = 0,
+    max_retries: int = 1,
+) -> Decision:
+    """Judge whether a diagnostic run clarified a cause, then request restore.
+
+    Diagnostic changes are never accepted as performance improvements. A
+    borderline result may be repeated once; a usable result is recorded as
+    evidence and the workflow asks the player to restore the prior settings.
+    """
+    if round_number < 1:
+        raise ValueError("实验轮次必须大于 0")
+    if not candidate.configuration_confirmed:
+        if retry_count < max_retries:
+            return _decision(
+                AgentAction.RETEST,
+                "诊断设置还没有确认，请核对实际配置后重新提交。",
+                reasons=["诊断测试必须确认实际改动，才能判断结果。"],
+                retry_same_experiment=True,
+            )
+        return _diagnostic_restore(
+            round_number,
+            "诊断结果无效",
+            "本轮没有确认实际配置，未据此判断瓶颈。",
+            0.0,
+            0.0,
+        )
+    if not candidate.comparable or candidate.test_scene.strip() != reference.test_scene.strip():
+        if retry_count < max_retries:
+            return _decision(
+                AgentAction.RETEST,
+                "诊断测试条件与原设置不一致，请按相同场景和条件重测。",
+                reasons=["不同场景或采集条件会让分辨率对比失去解释价值。"],
+                retry_same_experiment=True,
+            )
+        return _diagnostic_restore(
+            round_number,
+            "诊断结果无效",
+            "测试条件不一致，未据此判断瓶颈。",
+            0.0,
+            0.0,
+        )
+
+    actual_runs, avg_spread, low_spread = _run_dispersion(candidate)
+    if actual_runs < 1 or (
+        avg_spread is not None
+        and low_spread is not None
+        and (avg_spread > _DISPERSION_LIMIT_PCT or low_spread > _DISPERSION_LIMIT_PCT)
+    ):
+        if retry_count < max_retries:
+            return _decision(
+                AgentAction.RETEST,
+                "诊断测试波动较大，再测一次有助于排除偶然变化。",
+                reasons=[
+                    f"平均 FPS 波动 {avg_spread:.1f}%" if avg_spread is not None else "缺少逐次测试数据",
+                    f"1% Low 波动 {low_spread:.1f}%" if low_spread is not None else "缺少逐次测试数据",
+                ],
+                retry_same_experiment=True,
+            )
+        summary = "诊断结果仍有明显波动，暂时无法区分主要限制。"
+        return _diagnostic_restore(round_number, summary, summary, 0.0, 0.0)
+
+    avg_delta = (candidate.avg_fps - reference.avg_fps) / reference.avg_fps * 100
+    low_delta = (candidate.low_fps - reference.low_fps) / reference.low_fps * 100
+    if 5.0 < abs(avg_delta) < 10.0 and retry_count < max_retries:
+        return _decision(
+            AgentAction.RETEST,
+            "分辨率对比的变化还不够明确，再测一次后判断原因。",
+            avg_delta=avg_delta,
+            low_delta=low_delta,
+            reasons=["当前变化处于模糊区间，再测一次可以降低偶然波动的影响。"],
+            retry_same_experiment=True,
+        )
+
+    if setting_id == "resolution":
+        if avg_delta >= 10.0:
+            summary = f"降低分辨率后平均 FPS 提高 {avg_delta:.1f}%，更支持 GPU 渲染负担是重要限制。"
+        elif abs(avg_delta) <= 5.0:
+            summary = f"降低分辨率后平均 FPS 变化 {avg_delta:+.1f}%，GPU 渲染负担可能不是主要限制；这还不能单独确认 CPU 瓶颈。"
+        else:
+            summary = f"降低分辨率后的平均 FPS 变化为 {avg_delta:+.1f}%，结果仍不明确，暂不锁定瓶颈方向。"
+    elif max(abs(avg_delta), abs(low_delta)) >= 5.0:
+        setting_names = {
+            "power_mode": "供电 / 性能模式",
+            "cooling_mode": "散热模式",
+            "graphics_mode": "显卡输出方式",
+        }
+        name = setting_names.get(setting_id, "平台设置")
+        summary = f"调整{name}后帧率发生明显变化（平均 FPS {avg_delta:+.1f}%，1% Low {low_delta:+.1f}%），说明它可能影响当前表现。"
+    else:
+        setting_names = {
+            "power_mode": "供电 / 性能模式",
+            "cooling_mode": "散热模式",
+            "graphics_mode": "显卡输出方式",
+        }
+        name = setting_names.get(setting_id, "平台设置")
+        summary = f"对比{name}后帧率变化较小（平均 FPS {avg_delta:+.1f}%，1% Low {low_delta:+.1f}%），暂未发现明显影响。"
+    if abs(low_delta) >= 10.0 and (low_delta > 0) != (avg_delta > 0):
+        summary = f"平均 FPS 与 1% Low 变化方向不一致（{avg_delta:+.1f}% / {low_delta:+.1f}%），暂不锁定瓶颈方向。"
+    return _diagnostic_restore(round_number, "诊断测试完成", summary, avg_delta, low_delta)
+
+
+def _diagnostic_restore(
+    round_number: int,
+    title: str,
+    finding: str,
+    avg_delta: float,
+    low_delta: float,
+) -> Decision:
+    return _decision(
+        AgentAction.REVERT_CHANGE,
+        f"{title}。请恢复原配置后继续。",
+        avg_delta=avg_delta,
+        low_delta=low_delta,
+        reasons=[finding, "本轮只用于判断原因，不作为长期优化配置。"],
+        rollback_required=True,
+        diagnostic_summary=finding,
+        task_complete=False,
     )

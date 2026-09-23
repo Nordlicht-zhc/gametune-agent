@@ -6,10 +6,17 @@ from statistics import median
 from typing import Any
 
 from agent.api import ModelProvider
-from agent.evaluator import evaluate_result
+from agent.evaluator import evaluate_diagnostic_result, evaluate_result
 from agent.explainer import explain_decision
-from agent.planner import plan_next_experiment
-from agent.state_machine import Workflow, WorkflowState
+from agent.next_step import NextStepSelection, choose_next_step
+from agent.planner import (
+    GENERIC_OPTIMIZATION_DIRECTIONS,
+    gpu_optimization_candidates,
+    plan_candidate_id,
+    plan_candidates,
+    plan_next_experiment,
+)
+from agent.state_machine import Workflow, WorkflowPhase, WorkflowState
 from agent.validator import KnowledgeBase, validate_plan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from storage.repository import SQLiteRepository
@@ -49,6 +56,7 @@ class GameTuneController:
         # the same failed action immediately after rollback.
         self._failed_actions: dict[str, set[str]] = {}
         self._supplements: dict[str, dict[str, Any]] = {}
+        self._diagnostic_results: dict[str, list[dict[str, Any]]] = {}
 
     def create_task(
         self,
@@ -77,14 +85,26 @@ class GameTuneController:
         workflow = Workflow()
         workflow.start()
         workflow.validated()
+        baseline_configuration = baseline.configuration or {}
+        cap_value = baseline_configuration.get("fps_cap", task.fps_cap)
+        vsync_value = baseline_configuration.get("vsync", task.vsync)
+        fps_cap_known = bool(fps_cap_known or task.fps_cap is not None or str(cap_value).strip().lower() not in {"", "none", "unknown", "未确认"})
+        vsync_known = bool(vsync_known or task.vsync != "unknown" or str(vsync_value).strip().lower() not in {"", "none", "unknown", "未确认"})
         evidence = analyze_evidence(task, baseline, fps_cap_known=fps_cap_known, vsync_known=vsync_known)
-        plan = plan_next_experiment(task, baseline, evidence, 1)
+        plan = self._local_next_plan(task, baseline, evidence, 1)
         # Validation intentionally happens before save_task/save_benchmark so
         # an unsupported or malformed plan cannot leave a half-created task.
         validate_plan(task, plan, self.knowledge)
 
-        workflow.wait_for_test() if plan.action != AgentAction.FINISH else workflow.complete_without_test()
-        initial_extra = {"pending_plan": asdict(plan)} if plan.action != AgentAction.FINISH else {}
+        if plan.action != AgentAction.FINISH:
+            workflow.set_phase(plan.purpose, action=plan.action.value, setting_id=plan.setting_id)
+            workflow.wait_for_test()
+        else:
+            workflow.complete_without_test()
+        initial_supplement = {"fps_cap_known": fps_cap_known, "vsync_known": vsync_known}
+        initial_extra = {"workflow_phase": workflow.phase.value, "supplement": initial_supplement}
+        if plan.action != AgentAction.FINISH:
+            initial_extra["pending_plan"] = asdict(plan)
         save_bundle = getattr(self.repository, "save_task_with_baseline", None)
         if callable(save_bundle):
             save_bundle(
@@ -103,7 +123,8 @@ class GameTuneController:
         self._round_fingerprints[task.task_id] = {}
         self._retry_counts[task.task_id] = 0
         self._failed_actions[task.task_id] = set()
-        self._supplements[task.task_id] = {}
+        self._supplements[task.task_id] = initial_supplement
+        self._diagnostic_results[task.task_id] = []
         if plan.action == AgentAction.FINISH:
             self._clear_pending_plan(task.task_id)
         else:
@@ -138,25 +159,40 @@ class GameTuneController:
         # previous candidate in this round.
         comparison = self.current_records.get(task.task_id) or reference or baseline
         retry_count = self._retry_counts.get(task.task_id, 0)
+        diagnostic_plan = pending is not None and pending.purpose == "diagnostic" and pending.action not in {
+            AgentAction.REQUEST_DATA,
+            AgentAction.FINISH,
+        }
         adaptive_plan = pending is not None and pending.action not in {
             AgentAction.REQUEST_DATA,
             AgentAction.FINISH,
         }
-        decision = evaluate_result(
-            task,
-            baseline,
-            candidate,
-            round_number=round_number,
-            reference=comparison,
-            minimum_repeats=1 if adaptive_plan else 3,
-            acceptance_repeats=3 if adaptive_plan else None,
-            retry_count=retry_count,
-            max_retries=2 if adaptive_plan else task.max_rounds,
-            accept_neutral_change=self._accept_neutral_platform_change(candidate, pending),
-        )
-        next_workflow = Workflow(workflow.state, workflow.round_number)
+        if diagnostic_plan:
+            decision = evaluate_diagnostic_result(
+                task,
+                candidate,
+                round_number=round_number,
+                reference=comparison,
+                setting_id=pending.setting_id if pending else "",
+                retry_count=retry_count,
+                max_retries=1,
+            )
+        else:
+            decision = evaluate_result(
+                task,
+                baseline,
+                candidate,
+                round_number=round_number,
+                reference=comparison,
+                minimum_repeats=1 if adaptive_plan else 3,
+                acceptance_repeats=3 if adaptive_plan else None,
+                retry_count=retry_count,
+                max_retries=2 if adaptive_plan else task.max_rounds,
+                accept_neutral_change=self._accept_neutral_platform_change(candidate, pending),
+            )
+        next_workflow = Workflow(workflow.state, workflow.round_number, workflow.phase)
         next_workflow.begin_evaluation()
-        self._transition_after_decision(next_workflow, decision)
+        self._transition_after_decision(next_workflow, decision, pending)
         accepted_current = candidate if decision.accepted else self.current_records.get(task.task_id, baseline)
         best = self.best_records.get(task.task_id, baseline)
         accepted_best = self._better_record(task, candidate, best) if decision.accepted else best
@@ -165,8 +201,34 @@ class GameTuneController:
         )
         pending_payload = asdict(pending) if keep_pending and pending else None
         failed_actions = set(self._failed_actions.get(task.task_id, set()))
-        if decision.action == AgentAction.REVERT_CHANGE and pending is not None:
+        if decision.action == AgentAction.REVERT_CHANGE and pending is not None and not diagnostic_plan:
             failed_actions.add(self._action_key(pending))
+        diagnostic_results = list(self._diagnostic_results.get(task.task_id, []))
+        if diagnostic_plan and decision.diagnostic_summary:
+            invalid_markers = ("未确认实际配置", "测试条件不一致", "仍有明显波动", "缺少逐次测试数据")
+            diagnostic_valid = not any(word in decision.diagnostic_summary for word in invalid_markers)
+            if not diagnostic_valid or any(word in decision.diagnostic_summary for word in ("不明确", "方向不一致")):
+                support = "insufficient"
+            elif pending.setting_id in {"power_mode", "cooling_mode", "graphics_mode"}:
+                support = (
+                    "platform"
+                    if abs(decision.avg_delta_pct) >= 5 or abs(decision.low_delta_pct) >= 5
+                    else "insufficient"
+                )
+            elif decision.avg_delta_pct >= 10:
+                support = "gpu"
+            elif abs(decision.avg_delta_pct) <= 5:
+                support = "cpu_or_other"
+            else:
+                support = "insufficient"
+            diagnostic_results.append({
+                "kind": pending.setting_id or pending.setting,
+                "summary": decision.diagnostic_summary,
+                "avg_delta_pct": decision.avg_delta_pct,
+                "low_delta_pct": decision.low_delta_pct,
+                "supports": support,
+                "valid": diagnostic_valid,
+            })
         if decision.action != AgentAction.RETEST:
             next_retry_count = 0
         else:
@@ -182,6 +244,7 @@ class GameTuneController:
             pending_payload=pending_payload,
             retry_count=next_retry_count,
             failed_actions=failed_actions,
+            diagnostic_results=diagnostic_results,
         )
 
         # Memory is changed only after the transactional repository write.
@@ -195,6 +258,7 @@ class GameTuneController:
             self._round_fingerprints.setdefault(task.task_id, {}).pop(round_number, None)
         self._retry_counts[task.task_id] = next_retry_count
         self._failed_actions[task.task_id] = failed_actions
+        self._diagnostic_results[task.task_id] = diagnostic_results
         if decision.accepted:
             self.current_records[task.task_id] = candidate
             if accepted_best.record_id == candidate.record_id:
@@ -206,7 +270,11 @@ class GameTuneController:
         return decision
 
     @staticmethod
-    def _transition_after_decision(workflow: Workflow, decision: Decision) -> None:
+    def _transition_after_decision(
+        workflow: Workflow,
+        decision: Decision,
+        pending: ExperimentPlan | None = None,
+    ) -> None:
         if decision.action == AgentAction.RETEST:
             workflow.retest() if not decision.task_complete else workflow.finish()
         elif decision.action == AgentAction.REVERT_CHANGE:
@@ -214,7 +282,11 @@ class GameTuneController:
         elif decision.task_complete or decision.action == AgentAction.FINISH:
             workflow.finish()
         else:
-            workflow.continue_testing()
+            workflow.continue_testing(
+                pending.purpose if pending else None,
+                action=pending.action.value if pending else "",
+                setting_id=pending.setting_id if pending else "",
+            )
 
     def _commit_evaluation(
         self,
@@ -229,6 +301,7 @@ class GameTuneController:
         pending_payload: dict[str, Any] | None,
         retry_count: int = 0,
         failed_actions: set[str] | None = None,
+        diagnostic_results: list[dict[str, Any]] | None = None,
     ) -> None:
         """Write candidate and decision, using the storage transaction if available."""
         commit = getattr(self.repository, "commit_evaluation", None)
@@ -246,6 +319,8 @@ class GameTuneController:
                     "pending_plan": pending_payload,
                     "retest": {"count": retry_count, "same_round": decision.action == AgentAction.RETEST},
                     "failed_actions": sorted(failed_actions or set()),
+                    "diagnostic_results": list(diagnostic_results or []),
+                    "workflow_phase": workflow.phase.value,
                 },
             )
             return
@@ -414,6 +489,7 @@ class GameTuneController:
             best_record_id=best.record_id if best else None,
             workflow_state=workflow.state.value,
             round_number=workflow.round_number,
+            extra={"workflow_phase": workflow.phase.value},
         )
 
     def _save_pending_plan(self, task_id: str, plan: ExperimentPlan) -> None:
@@ -487,10 +563,16 @@ class GameTuneController:
             return None
         self.current_records[task_id] = current
         self.best_records[task_id] = best
-        self.workflows[task_id] = Workflow(WorkflowState(runtime["workflow_state"]), int(runtime["round_number"]))
         metadata = runtime.get("extra", {}) or {}
+        try:
+            phase = WorkflowPhase(str(metadata.get("workflow_phase", "diagnosis")))
+        except ValueError:
+            phase = WorkflowPhase.DIAGNOSIS
+        self.workflows[task_id] = Workflow(WorkflowState(runtime["workflow_state"]), int(runtime["round_number"]), phase)
         supplement = metadata.get("supplement", {})
         self._supplements[task_id] = dict(supplement) if isinstance(supplement, dict) else {}
+        diagnostics = metadata.get("diagnostic_results", [])
+        self._diagnostic_results[task_id] = [dict(item) for item in diagnostics if isinstance(item, dict)] if isinstance(diagnostics, list) else []
         retest = metadata.get("retest", {})
         self._retry_counts[task_id] = int(retest.get("count", 0)) if isinstance(retest, dict) else 0
         failed = metadata.get("failed_actions", [])
@@ -524,6 +606,11 @@ class GameTuneController:
                         tuple(sorted((str(key), str(value)) for key, value in (current_round_entry.get("configuration") or {}).items())),
                     )
         self.pending_plan(task_id)
+        pending = self.pending_plans.get(task_id)
+        if pending is not None:
+            self.workflows[task_id].set_phase(
+                pending.purpose, action=pending.action.value, setting_id=pending.setting_id
+            )
         return task
 
     def current_record(self, task_id: str) -> BenchmarkRecord | None:
@@ -531,6 +618,9 @@ class GameTuneController:
 
     def best_record(self, task_id: str) -> BenchmarkRecord | None:
         return self.best_records.get(task_id)
+
+    def diagnostic_results(self, task_id: str) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._diagnostic_results.get(task_id, [])]
 
     def workflow_state(self, task_id: str) -> WorkflowState:
         workflow = self.workflows.get(task_id)
@@ -574,12 +664,28 @@ class GameTuneController:
             "is_laptop",
             "shadow_quality",
             "dynamic_shadows",
+            "cpu_metrics",
+            "fps_cap",
+            "vsync",
+            "user_adjustment",
         }
         unknown = set(values) - allowed
         if unknown:
             raise ValueError(f"不支持的补充字段：{', '.join(sorted(unknown))}")
+        custom_adjustment: tuple[str, str, str, str] | None = None
+        if "user_adjustment" in values:
+            parts = tuple(part.strip() for part in str(values["user_adjustment"]).split("|"))
+            if len(parts) != 4 or any(not part for part in parts):
+                raise ValueError("请按“优化方向 | 设置名称 | 当前值 | 调整后值”填写四项内容")
+            if parts[0] not in GENERIC_OPTIMIZATION_DIRECTIONS:
+                raise ValueError("请选择列表中的通用优化方向")
+            if parts[2] == parts[3]:
+                raise ValueError("当前值与调整值相同，无法形成可验证的单项实验")
+            custom_adjustment = (parts[0], parts[1], parts[2], parts[3])
         task_fields = {
             "gpu_power_w",
+            "fps_cap",
+            "vsync",
             "graphics_mode",
             "power_mode",
             "cooling_mode",
@@ -594,6 +700,15 @@ class GameTuneController:
                         value = int(value)
                     except (TypeError, ValueError) as error:
                         raise ValueError("GPU 功耗必须是整数瓦数") from error
+                if field_name == "fps_cap" and value not in (None, ""):
+                    try:
+                        value = int(value)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("游戏内最高 FPS 必须是 0 到 1000 的整数") from error
+                    if not 0 <= value <= 1000:
+                        raise ValueError("游戏内最高 FPS 必须是 0 到 1000 的整数")
+                if field_name == "vsync":
+                    value = {"已禁用": "disabled", "已启用": "enabled", "未确认": "unknown"}.get(str(value), value)
                 updates[field_name] = value
         effective_task = replace(task, **updates) if updates else task
         supplement_payload = dict(self._supplements.get(task_id, {}))
@@ -618,22 +733,51 @@ class GameTuneController:
         if current is None:
             raise ValueError("任务缺少当前基线记录")
         current_for_planning = self._apply_supplements(task_id, current)
-        fps_cap_known = bool(values.get("fps_cap_known", True))
-        vsync_known = bool(values.get("vsync_known", True))
+        cap_value = (current_for_planning.configuration or {}).get("fps_cap", effective_task.fps_cap)
+        vsync_value = (current_for_planning.configuration or {}).get("vsync", effective_task.vsync)
+        fps_cap_known = bool(values.get(
+            "fps_cap_known",
+            supplement_payload.get("fps_cap_known", effective_task.fps_cap is not None or str(cap_value).strip().lower() not in {"", "none", "unknown", "未确认"}),
+        ))
+        vsync_known = bool(values.get(
+            "vsync_known",
+            supplement_payload.get("vsync_known", effective_task.vsync != "unknown" or str(vsync_value).strip().lower() not in {"", "none", "unknown", "未确认"}),
+        ))
+        supplement_payload["fps_cap_known"] = fps_cap_known
+        supplement_payload["vsync_known"] = vsync_known
         evidence = analyze_evidence(
             effective_task,
             current_for_planning,
             self.repository.benchmark_for_role(task_id, "baseline"),
             fps_cap_known=fps_cap_known,
             vsync_known=vsync_known,
+            diagnostic_results=self._diagnostic_results.get(task_id, []),
         )
-        plan = plan_next_experiment(
-            effective_task,
-            current_for_planning,
-            evidence,
-            workflow.round_number,
-            blocked_setting_ids=self._failed_setting_ids(task_id),
-        )
+        self._add_supplement_evidence(task_id, evidence)
+        if custom_adjustment is not None:
+            direction, setting, old_value, new_value = custom_adjustment
+            plan = ExperimentPlan(
+                AgentAction.RECOMMEND_CHANGE,
+                f"验证{direction}方向的一项调整",
+                setting,
+                old_value,
+                new_value,
+                f"根据诊断结果，由你选择“{direction}”方向中的一项已确认游戏设置。",
+                "只检验本轮列出的一个设置；结果只适用于当前设备、游戏版本和测试条件。",
+                f"只把“{setting}”从“{old_value}”调整为“{new_value}”，其他设置、场景和采集方式保持不变；先测 1 次筛选，出现改善迹象时再累计确认。",
+                "设置执行已确认、前后测试条件一致，并且累计结果达到可靠收益门槛；否则恢复原值。",
+                f"将“{setting}”恢复为“{old_value}”。",
+                workflow.round_number,
+                setting_id="user_defined",
+                purpose="optimization",
+            )
+            validate_plan(task, plan, self.knowledge)
+            self.pending_plans[task_id] = plan
+            self._save_pending_plan(task_id, plan)
+            workflow.set_phase(plan.purpose, action=plan.action.value, setting_id=plan.setting_id)
+            self.repository.save_runtime_metadata(task_id, workflow_phase=workflow.phase.value)
+            return evidence, plan
+        plan = self._local_next_plan(effective_task, current_for_planning, evidence, workflow.round_number)
         validate_plan(effective_task, plan, self.knowledge)
         plan = self._skip_failed_plan(effective_task, plan, workflow.round_number)
         if plan.action == AgentAction.FINISH:
@@ -644,6 +788,8 @@ class GameTuneController:
         else:
             self.pending_plans[task_id] = plan
             self._save_pending_plan(task_id, plan)
+            workflow.set_phase(plan.purpose, action=plan.action.value, setting_id=plan.setting_id)
+            self.repository.save_runtime_metadata(task_id, workflow_phase=workflow.phase.value)
         return evidence, plan
 
     def _apply_supplements(self, task_id: str, record: BenchmarkRecord) -> BenchmarkRecord:
@@ -655,10 +801,14 @@ class GameTuneController:
         # A supplement fills a previously unknown setting.  Once a later
         # accepted benchmark contains the real setting, that snapshot is
         # authoritative and must not be overwritten by the older supplement.
-        if supplement.get("shadow_quality") not in (None, "") and not str(config.get("shadow_quality", "")).strip():
+        if supplement.get("shadow_quality") not in (None, "") and str(config.get("shadow_quality", "")).strip() in {"", "unknown", "未确认"}:
             config["shadow_quality"] = str(supplement["shadow_quality"])
-        if supplement.get("dynamic_shadows") not in (None, "") and not str(config.get("dynamic_shadows", "")).strip():
+        if supplement.get("dynamic_shadows") not in (None, "") and str(config.get("dynamic_shadows", "")).strip() in {"", "unknown", "未确认"}:
             config["dynamic_shadows"] = str(supplement["dynamic_shadows"])
+        if supplement.get("fps_cap") not in (None, "") and str(config.get("fps_cap", "")).strip() in {"", "unknown", "未确认"}:
+            config["fps_cap"] = str(supplement["fps_cap"])
+        if supplement.get("vsync") not in (None, "") and str(config.get("vsync", "")).strip() in {"", "unknown", "未确认"}:
+            config["vsync"] = str(supplement["vsync"])
         return replace(record, configuration=config) if config != (record.configuration or {}) else record
 
     def plan_after_result(
@@ -689,7 +839,9 @@ class GameTuneController:
             baseline,
             fps_cap_known=fps_cap_known,
             vsync_known=vsync_known,
+            diagnostic_results=self._diagnostic_results.get(task.task_id, []),
         )
+        self._add_supplement_evidence(task.task_id, evidence)
         pending = self.pending_plan(task.task_id)
         last = self.last_decisions.get(task.task_id)
         if pending is not None and (last is None or last.retry_same_experiment):
@@ -699,13 +851,7 @@ class GameTuneController:
             validate_plan(task, pending, self.knowledge)
             return evidence, pending
 
-        plan = plan_next_experiment(
-            task,
-            accepted_current,
-            evidence,
-            round_number,
-            blocked_setting_ids=self._failed_setting_ids(task.task_id),
-        )
+        plan = self._local_next_plan(task, accepted_current, evidence, round_number)
         validate_plan(task, plan, self.knowledge)
         plan = self._skip_failed_plan(task, plan, round_number)
         if plan.action == AgentAction.FINISH:
@@ -716,7 +862,138 @@ class GameTuneController:
         else:
             self.pending_plans[task.task_id] = plan
             self._save_pending_plan(task.task_id, plan)
+            workflow.set_phase(plan.purpose, action=plan.action.value, setting_id=plan.setting_id)
+            self.repository.save_runtime_metadata(task.task_id, workflow_phase=workflow.phase.value)
         return evidence, plan
+
+    def _local_next_plan(
+        self,
+        task: OptimizationTask,
+        current: BenchmarkRecord,
+        evidence: list[Evidence],
+        round_number: int,
+    ) -> ExperimentPlan:
+        candidates = self.next_step_candidates(task, current, evidence, round_number)
+        if candidates:
+            return candidates[0]
+        return plan_next_experiment(
+            task,
+            current,
+            evidence,
+            round_number,
+            blocked_setting_ids=self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id),
+        )
+
+    def _add_supplement_evidence(self, task_id: str, evidence: list[Evidence]) -> None:
+        note = str(self._supplements.get(task_id, {}).get("cpu_metrics", "")).strip()
+        if note:
+            evidence.append(Evidence(
+                "cpu_metrics_note",
+                "玩家补充的 CPU 监控记录",
+                f"测试期间 CPU 监控记录：{note}。该文本仅作参考，程序不会据此自动确认 CPU 或温度限制。",
+                0.25,
+                "insufficient",
+            ))
+
+    def next_step_candidates(
+        self,
+        task: OptimizationTask,
+        current: BenchmarkRecord,
+        evidence: list[Evidence],
+        round_number: int,
+    ) -> list[ExperimentPlan]:
+        """Return only locally generated and rule-validated model options."""
+        blocked = self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id)
+        candidates = plan_candidates(
+            task,
+            current,
+            evidence,
+            round_number,
+            blocked_setting_ids=blocked,
+        )
+        try:
+            rules = self.knowledge.game_rules(task.game).get("settings", [])
+        except ValueError:
+            rules = []
+        candidates.extend(gpu_optimization_candidates(
+            task,
+            current,
+            evidence,
+            round_number,
+            rules,
+            blocked_setting_ids=blocked,
+        ))
+        evidence_codes = {item.code for item in evidence}
+        if "conditions_changed" in evidence_codes:
+            candidates = [plan for plan in candidates if plan.setting_id == "test_conditions"]
+        elif "cap_unknown" in evidence_codes:
+            candidates = [plan for plan in candidates if plan.setting_id in {"fps_cap", "vsync"}]
+        elif task.game == "Counter-Strike 2" and evidence_codes & {"high_gpu", "resolution_response", "diagnostic_resolution_response"}:
+            config = current.configuration or {}
+            dynamic_shadows = str(config.get("dynamic_shadows", task.dynamic_shadows)).strip()
+            shadow_quality = str(config.get("shadow_quality", task.shadow_quality)).strip()
+            if dynamic_shadows not in {"all", "sun_only"}:
+                candidates = [plan for plan in candidates if plan.setting_id == "dynamic_shadows"]
+            elif shadow_quality not in {"低", "中", "高", "非常高"}:
+                candidates = [plan for plan in candidates if plan.setting_id == "shadow_quality"]
+        if len(candidates) > 1:
+            candidates = [plan for plan in candidates if plan.setting_id != "repeats"] or candidates
+        valid: list[ExperimentPlan] = []
+        seen: set[str] = set()
+        for plan in candidates:
+            identity = plan_candidate_id(plan)
+            if identity in seen:
+                continue
+            try:
+                validate_plan(task, plan, self.knowledge)
+            except (ValueError, TypeError):
+                continue
+            valid.append(plan)
+            seen.add(identity)
+        return valid
+
+    def choose_next_step(
+        self,
+        task: OptimizationTask,
+        current: BenchmarkRecord,
+        evidence: list[Evidence],
+        candidates: list[ExperimentPlan],
+        history: list[dict] | None = None,
+    ) -> NextStepSelection:
+        """Select a validated option in a worker thread, falling back locally."""
+        selection = choose_next_step(self.model_provider, task, current, evidence, candidates, history=history)
+        validate_plan(task, selection.plan, self.knowledge)
+        return selection
+
+    def accept_model_plan(
+        self,
+        task: OptimizationTask,
+        expected_plan_id: str,
+        selected_plan: ExperimentPlan,
+        allowed_candidate_ids: set[str],
+    ) -> bool:
+        """Atomically replace the displayed local plan if the task is unchanged."""
+        workflow = self.workflows.get(task.task_id)
+        pending = self.pending_plan(task.task_id)
+        if (
+            workflow is None
+            or workflow.state != WorkflowState.AWAITING_TEST
+            or pending is None
+            or workflow.round_number != selected_plan.round_number
+            or plan_candidate_id(pending) != expected_plan_id
+            or plan_candidate_id(selected_plan) not in allowed_candidate_ids
+        ):
+            return False
+        validate_plan(task, selected_plan, self.knowledge)
+        if self._action_key(selected_plan) in self._failed_actions.get(task.task_id, set()):
+            return False
+        self.pending_plans[task.task_id] = selected_plan
+        self._save_pending_plan(task.task_id, selected_plan)
+        workflow.set_phase(
+            selected_plan.purpose, action=selected_plan.action.value, setting_id=selected_plan.setting_id
+        )
+        self.repository.save_runtime_metadata(task.task_id, workflow_phase=workflow.phase.value)
+        return True
 
     def _skip_failed_plan(
         self,
@@ -749,6 +1026,19 @@ class GameTuneController:
         for action_key in self._failed_actions.get(task_id, set()):
             setting_ids.add(str(action_key).split("\x1f", 1)[0])
         return setting_ids
+
+    def _diagnosed_setting_ids(self, task_id: str) -> set[str]:
+        """Do not offer a completed diagnostic experiment again in this task."""
+        invalid_markers = ("无效", "测试条件不一致", "未确认实际配置", "波动较大", "仍有明显波动")
+        return {
+            str(item.get("kind", "")).strip()
+            for item in self._diagnostic_results.get(task_id, [])
+            if isinstance(item, dict)
+            and item.get("valid") is not False
+            and str(item.get("status", "")).strip().lower() != "invalid"
+            and not any(marker in str(item.get("summary", "")) for marker in invalid_markers)
+            and str(item.get("kind", "")).strip()
+        }
 
     def explain(
         self,

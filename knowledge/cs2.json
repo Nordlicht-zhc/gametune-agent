@@ -39,7 +39,9 @@
       "label": "全局阴影效果",
       "values": ["低", "中", "高", "非常高"],
       "primarily_affects": "gpu",
-      "change_limit": "每轮最多调整一级"
+      "change_limit": "每轮最多调整一级",
+      "optimization_order": ["非常高", "高", "中", "低"],
+      "visual_tradeoff": "阴影细节"
     },
     {
       "id": "dynamic_shadows",
@@ -64,28 +66,28 @@
       "id": "menu_fps_cap", "label": "菜单最高FPS", "values": [], "primarily_affects": "cap"
     },
     {
-      "id": "msaa_mode", "label": "多重采样抗锯齿模式", "values": ["无", "CMAA2 抗锯齿", "2x MSAA", "4x MSAA", "8x MSAA"], "primarily_affects": "gpu"
+      "id": "msaa_mode", "label": "多重采样抗锯齿模式", "values": ["无", "CMAA2 抗锯齿", "2x MSAA", "4x MSAA", "8x MSAA"], "configuration_values": ["none", "cmaa2", "2x_msaa", "4x_msaa", "8x_msaa"], "display_values": {"none": "无", "cmaa2": "CMAA2 抗锯齿", "2x_msaa": "2x MSAA", "4x_msaa": "4x MSAA", "8x_msaa": "8x MSAA"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["8x_msaa", "4x_msaa", "2x_msaa", "cmaa2", "none"], "visual_tradeoff": "边缘平滑效果"
     },
     {
-      "id": "texture_detail", "label": "模型/贴图细节", "values": ["低", "中", "高"], "primarily_affects": "vram"
+      "id": "texture_detail", "label": "模型/贴图细节", "values": ["低", "中", "高"], "configuration_values": ["low", "medium", "high"], "display_values": {"low": "低", "medium": "中", "high": "高"}, "primarily_affects": "vram", "change_limit": "每轮最多调整一级", "optimization_order": ["high", "medium", "low"], "visual_tradeoff": "模型和贴图清晰度"
     },
     {
-      "id": "texture_filtering", "label": "贴图过滤模式", "values": ["双线性", "三线性", "异向 2X", "异向 4X", "异向 8X", "异向 16X"], "primarily_affects": "gpu"
+      "id": "texture_filtering", "label": "贴图过滤模式", "values": ["双线性", "三线性", "异向 2X", "异向 4X", "异向 8X", "异向 16X"], "configuration_values": ["bilinear", "trilinear", "anisotropic_2x", "anisotropic_4x", "anisotropic_8x", "anisotropic_16x"], "display_values": {"bilinear": "双线性", "trilinear": "三线性", "anisotropic_2x": "异向 2X", "anisotropic_4x": "异向 4X", "anisotropic_8x": "异向 8X", "anisotropic_16x": "异向 16X"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["anisotropic_16x", "anisotropic_8x", "anisotropic_4x", "anisotropic_2x", "trilinear", "bilinear"], "visual_tradeoff": "斜角表面的远距离清晰度"
     },
     {
-      "id": "shader_detail", "label": "光影细节", "values": ["低", "高"], "primarily_affects": "gpu"
+      "id": "shader_detail", "label": "光影细节", "values": ["低", "高"], "configuration_values": ["low", "high"], "display_values": {"low": "低", "high": "高"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["high", "low"], "visual_tradeoff": "光影细节"
     },
     {
-      "id": "particle_detail", "label": "粒子细节", "values": ["低", "中", "高", "非常高"], "primarily_affects": "gpu"
+      "id": "particle_detail", "label": "粒子细节", "values": ["低", "中", "高", "非常高"], "configuration_values": ["low", "medium", "high", "very_high"], "display_values": {"low": "低", "medium": "中", "high": "高", "very_high": "非常高"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["very_high", "high", "medium", "low"], "visual_tradeoff": "粒子效果细节"
     },
     {
-      "id": "ambient_occlusion", "label": "环境光遮蔽", "values": ["已禁用", "中", "高"], "primarily_affects": "gpu"
+      "id": "ambient_occlusion", "label": "环境光遮蔽", "values": ["已禁用", "中", "高"], "configuration_values": ["disabled", "medium", "high"], "display_values": {"disabled": "已禁用", "medium": "中", "high": "高"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["high", "medium", "disabled"], "visual_tradeoff": "物体接触处的阴影层次"
     },
     {
-      "id": "hdr", "label": "高动态范围", "values": ["品质", "性能"], "primarily_affects": "gpu"
+      "id": "hdr", "label": "高动态范围", "values": ["品质", "性能"], "configuration_values": ["quality", "performance"], "display_values": {"quality": "品质", "performance": "性能"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["quality", "performance"], "visual_tradeoff": "高动态范围画面效果"
     },
     {
-      "id": "fsr", "label": "Fidelity FX 超级分辨率", "values": ["已禁用（最高品质）", "超高品质", "品质", "均衡", "性能"], "primarily_affects": "gpu"
+      "id": "fsr", "label": "Fidelity FX 超级分辨率", "values": ["已禁用（最高品质）", "超高品质", "品质", "均衡", "性能"], "configuration_values": ["disabled", "ultra_quality", "quality", "balanced", "performance"], "display_values": {"disabled": "已禁用（最高品质）", "ultra_quality": "超高品质", "quality": "品质", "balanced": "均衡", "performance": "性能"}, "primarily_affects": "gpu", "change_limit": "每轮最多调整一级", "optimization_order": ["disabled", "ultra_quality", "quality", "balanced", "performance"], "visual_tradeoff": "画面锐度与渲染清晰度"
     }
   ]
 }

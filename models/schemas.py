@@ -174,6 +174,17 @@ class ExperimentPlan:
     # Stable rule identifier.  Keep it optional for existing callers and
     # persisted plans that only contain the display label.
     setting_id: str = ""
+    purpose: str = "auto"
+    planning_source: str = "local"
+    selection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.purpose == "auto":
+            self.purpose = "diagnostic" if self.action == AgentAction.REQUEST_DATA else "optimization"
+        if self.purpose not in {"diagnostic", "optimization"}:
+            raise ValueError("实验用途必须是诊断或优化验证")
+        if self.planning_source not in {"local", "model"}:
+            raise ValueError("计划来源不受支持")
 
 
 @dataclass(slots=True)
@@ -197,6 +208,7 @@ class Decision:
     stop_reason: str = ""
     retry_same_experiment: bool = False
     rollback_required: bool = False
+    diagnostic_summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

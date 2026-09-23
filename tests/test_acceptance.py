@@ -3,13 +3,43 @@ import unittest
 from pathlib import Path
 
 from agent.controller import GameTuneController
-from agent.state_machine import WorkflowState
+from agent.state_machine import WorkflowPhase, WorkflowState
 from models.schemas import AgentAction, BenchmarkRecord, OptimizationTask
 from tools.import_benchmark import import_benchmark_csv
 
 
 class OptimizationAcceptanceTests(unittest.TestCase):
     """Exercise imported measurements across the real controller and database."""
+
+    def test_unsupported_game_can_continue_from_general_direction_to_custom_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = GameTuneController(Path(directory) / "general-game.db")
+            task = OptimizationTask(
+                "通用游戏", "Apex Legends", "CPU", "GPU", "2560 × 1440", "165 Hz",
+                "训练场", 200, 120,
+            )
+            baseline = BenchmarkRecord(
+                200, 100, 98, task.resolution, task.test_scene, repeats=3,
+                configuration={"fps_cap": "0", "vsync": "disabled"},
+            )
+            _, direction_request = controller.create_task(task, baseline)
+            self.assertEqual(direction_request.setting_id, "user_adjustment")
+            self.assertEqual(controller.workflows[task.task_id].phase, WorkflowPhase.OPTIMIZATION)
+
+            with self.assertRaisesRegex(ValueError, "优化方向"):
+                controller.supplement_data(task, {
+                    "user_adjustment": "任意文字 | 抗锯齿 | MSAA 4X | MSAA 2X",
+                })
+            _, custom_plan = controller.supplement_data(task, {
+                "user_adjustment": "GPU 画面负载 | 抗锯齿 | MSAA 4X | MSAA 2X",
+            })
+            self.assertEqual(custom_plan.setting_id, "user_defined")
+            self.assertEqual(custom_plan.purpose, "optimization")
+            self.assertEqual((custom_plan.old_value, custom_plan.new_value), ("MSAA 4X", "MSAA 2X"))
+            self.assertEqual(controller.repository.runtime_metadata(task.task_id)["workflow_phase"], "optimization")
+
+            controller.restore_task(task.task_id)
+            self.assertEqual(controller.workflows[task.task_id].phase, WorkflowPhase.OPTIMIZATION)
 
     def test_two_stable_baseline_runs_can_start_task(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -82,7 +112,10 @@ class OptimizationAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             controller = GameTuneController(Path(directory) / "supplement.db")
             task = OptimizationTask("补充信息", "Counter-Strike 2", "CPU", "GPU", "2560 × 1440", "300Hz", "scene", 300, 210)
-            baseline = BenchmarkRecord(200, 100, 99, task.resolution, task.test_scene, repeats=3, configuration={"dynamic_shadows": "all"})
+            baseline = BenchmarkRecord(
+                200, 100, 99, task.resolution, task.test_scene, repeats=3,
+                configuration={"dynamic_shadows": "all", "fps_cap": "0", "vsync": "disabled"},
+            )
             _, missing = controller.create_task(task, baseline, fps_cap_known=True, vsync_known=True)
             self.assertEqual(missing.action, AgentAction.REQUEST_DATA)
             _, first = controller.supplement_data(task, {"shadow_quality": "高"})
@@ -92,7 +125,7 @@ class OptimizationAcceptanceTests(unittest.TestCase):
             _, second = controller.plan_after_result(task, controller.current_record(task.task_id), baseline, 2)
             self.assertEqual((second.old_value, second.new_value), ("中", "低"))
 
-    def test_confirmed_power_mode_round_advances_without_repeating_plan(self):
+    def test_power_mode_diagnostic_is_restored_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = GameTuneController(Path(directory) / "power-mode.db")
             task = OptimizationTask(
@@ -121,8 +154,10 @@ class OptimizationAcceptanceTests(unittest.TestCase):
                 configuration_confirmed=True,
             )
             decision = controller.evaluate(task, baseline, candidate, 1)
-            self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
-            self.assertTrue(decision.accepted)
+            self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+            self.assertFalse(decision.accepted)
+            self.assertIn("只用于判断原因", " ".join(decision.reasons))
+            controller.confirm_rollback(task, confirmed=True)
             evidence, next_plan = controller.plan_after_result(
                 task, controller.current_record(task.task_id), baseline, 2,
                 fps_cap_known=True, vsync_known=True,

@@ -5,6 +5,7 @@ import sys
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
+from statistics import median
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPixmap
@@ -34,7 +35,7 @@ from tools.api_settings import (
     load_saved_api_config,
     save_saved_api_config,
 )
-from agent.planner import plan_next_experiment
+from agent.planner import GENERIC_OPTIMIZATION_DIRECTIONS, plan_candidate_id, plan_next_experiment
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -78,6 +79,7 @@ class TaskState:
     baseline_repeats: int = 2
     baseline_duration_seconds: int = 60
     baseline_confirmed: bool = False
+    baseline_runs: list[dict[str, float]] | None = None
 
     def __post_init__(self):
         if self.video_settings is None:
@@ -218,6 +220,32 @@ def label(text: str, object_name: str | None = None, wrap: bool = False) -> QLab
         widget.setObjectName(object_name)
     widget.setWordWrap(wrap)
     return widget
+
+
+ADVANCED_SETTING_LABELS = {
+    "msaa_mode": {"none": "无", "cmaa2": "CMAA2 抗锯齿", "2x_msaa": "2x MSAA", "4x_msaa": "4x MSAA", "8x_msaa": "8x MSAA"},
+    "texture_detail": {"low": "低", "medium": "中", "high": "高"},
+    "texture_filtering": {"bilinear": "双线性", "trilinear": "三线性", "anisotropic_2x": "异向 2X", "anisotropic_4x": "异向 4X", "anisotropic_8x": "异向 8X", "anisotropic_16x": "异向 16X"},
+    "shader_detail": {"low": "低", "high": "高"},
+    "particle_detail": {"low": "低", "medium": "中", "high": "高", "very_high": "非常高"},
+    "ambient_occlusion": {"disabled": "已禁用", "medium": "中", "high": "高"},
+    "hdr": {"quality": "品质", "performance": "性能"},
+    "fsr": {"disabled": "已禁用（最高品质）", "ultra_quality": "超高品质", "quality": "品质", "balanced": "均衡", "performance": "性能"},
+}
+ADVANCED_SETTING_OPTIONS = {
+    "msaa_mode": ["none", "cmaa2", "2x_msaa", "4x_msaa", "8x_msaa"],
+    "texture_detail": ["low", "medium", "high"],
+    "texture_filtering": ["bilinear", "trilinear", "anisotropic_2x", "anisotropic_4x", "anisotropic_8x", "anisotropic_16x"],
+    "shader_detail": ["low", "high"],
+    "particle_detail": ["low", "medium", "high", "very_high"],
+    "ambient_occlusion": ["disabled", "medium", "high"],
+    "hdr": ["quality", "performance"],
+    "fsr": ["disabled", "ultra_quality", "quality", "balanced", "performance"],
+}
+
+
+def setting_value_label(setting_id: str, value: str) -> str:
+    return ADVANCED_SETTING_LABELS.get(setting_id, {}).get(value, value)
 
 
 def hline() -> QFrame:
@@ -376,14 +404,14 @@ class DashboardPage(QScrollArea):
         layout = set_margins(QVBoxLayout(card), 22, 18, 22, 18, 9)
         layout.addWidget(label("当前判断", "cardKicker"))
         hypothesis, _ = dominant_hypothesis(self.evidence)
-        names = {"cpu": "更可能受 CPU 限制", "gpu": "更可能受 GPU 限制", "frametime": "帧率稳定性需要改善", "platform": "笔记本模式可能限制性能", "insufficient": "数据还不够，先补充测试"}
+        names = {"cpu": "更可能受 CPU 限制", "cpu_or_other": "GPU 渲染负担可能不是主要限制", "gpu": "更可能受 GPU 限制", "frametime": "帧率稳定性需要改善", "platform": "笔记本平台状态可能影响性能", "insufficient": "数据还不够，先补充测试"}
         layout.addWidget(label(names.get(hypothesis, "需要补充证据"), "heroTitle", True))
         body_text = "；".join(item.detail for item in self.evidence[:2]) or "创建任务后，这里会显示最重要的两条判断依据。"
         layout.addWidget(label(body_text, "heroBody", True))
         tags = QHBoxLayout()
         tags.setSpacing(7)
         for item in self.evidence[:3]:
-            tags.addWidget(label(item.title, "tagOrange" if item.supports == "insufficient" else "tagGreen"))
+            tags.addWidget(label(item.title, "tagOrange" if item.supports in {"insufficient", "cpu_or_other"} else "tagGreen"))
         tags.addStretch()
         layout.addLayout(tags)
         layout.addStretch()
@@ -398,7 +426,7 @@ class DashboardPage(QScrollArea):
         layout = set_margins(QVBoxLayout(card), 18, 16, 18, 16, 8)
         layout.addWidget(label("优化进度", "cardKicker"))
         hypothesis, _ = dominant_hypothesis(self.evidence)
-        hypothesis_name = {"cpu": "CPU 侧限制", "gpu": "GPU 侧限制", "frametime": "帧时间稳定性", "platform": "笔记本平台设置", "insufficient": "待补充证据"}.get(hypothesis, "待补充证据")
+        hypothesis_name = {"cpu": "CPU 侧限制", "cpu_or_other": "CPU 侧或其他限制待区分", "gpu": "GPU 侧限制", "frametime": "帧时间稳定性", "platform": "笔记本平台状态待核对", "insufficient": "待补充证据"}.get(hypothesis, "待补充证据")
         items = [
             ("✓", "任务信息", "硬件和目标已保存", True),
             ("✓", "基线数据", "测试数据已检查", True),
@@ -426,19 +454,27 @@ class DashboardPage(QScrollArea):
         card.setObjectName("card")
         layout = set_margins(QVBoxLayout(card), 20, 17, 20, 17, 8)
         plan = self.plan
-        layout.addWidget(label(f"诊断实验 {plan.round_number:02d}" if plan else "等待任务分析", "cardKicker"))
+        if plan:
+            purpose = "诊断测试" if plan.purpose == "diagnostic" else "优化验证"
+            source = "AI 按本轮证据选择" if plan.planning_source == "model" else "本地规则建议"
+            kicker = f"{purpose} {plan.round_number:02d} · {source}"
+        else:
+            kicker = "等待任务分析"
+        layout.addWidget(label(kicker, "cardKicker"))
         title_row = QHBoxLayout()
         title_row.addWidget(label("01", "actionNumber"))
         title_row.addWidget(label(plan.title if plan else "创建任务后生成下一步", "actionTitle"))
         title_row.addStretch()
         layout.addLayout(title_row)
         settings = QHBoxLayout()
-        settings.addWidget(label(plan.old_value if plan else "当前值", "settingOld"))
+        settings.addWidget(label(setting_value_label(plan.setting_id, plan.old_value) if plan else "当前值", "settingOld"))
         settings.addWidget(label("→", "sectionMeta"))
-        settings.addWidget(label(plan.new_value if plan else "待生成", "settingNew"))
+        settings.addWidget(label(setting_value_label(plan.setting_id, plan.new_value) if plan else "待生成", "settingNew"))
         settings.addStretch()
         layout.addLayout(settings)
         rows = [("为什么做", plan.hypothesis), ("怎么测试", plan.method), ("什么算有效", plan.success_criteria)] if plan else [("说明", "创建任务后，这里会显示下一步。")]
+        if plan and plan.selection_reason:
+            rows.insert(0, ("AI 选择理由", plan.selection_reason))
         for name, text in rows:
             layout.addWidget(hline())
             layout.addWidget(RuleRow(name, text))
@@ -495,14 +531,16 @@ class NewTaskPage(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
-        root.addWidget(PageHeader("任务设置", "创建优化任务", "填写硬件、目标和基线数据。基线先完成 2 次；两次差异超过 5% 时再补第 3 次。"))
+        root.addWidget(PageHeader("任务设置", "准备优化任务", "先记录设备与测试条件；完成实际基线测试后，再录入结果并开始分析。"))
+        self.setup_stage = QWidget()
+        setup_layout = set_margins(QVBoxLayout(self.setup_stage), spacing=18)
         columns = QHBoxLayout()
         columns.setSpacing(15)
         basic_card, basic_form = self._form_card("设备与测试环境")
-        goal_card, goal_form = self._form_card("目标与基线数据")
+        goal_card, goal_form = self._form_card("优化目标")
         columns.addWidget(basic_card, 1)
         columns.addWidget(goal_card, 1)
-        root.addLayout(columns)
+        setup_layout.addLayout(columns)
         self.name_input = QLineEdit(state.name)
         self.game_input = QComboBox()
         # Keep unsupported titles out of the selectable task domain until a
@@ -559,14 +597,7 @@ class NewTaskPage(QScrollArea):
         self.target_low = self._spin(30, 1000, state.target_low, 10)
         self.mode_input = QComboBox()
         self.mode_input.addItems(["竞技模式 · 流畅优先", "平衡模式", "视觉模式 · 画质优先"])
-        self.avg_input = self._spin(1, 1000, state.avg_fps)
-        self.low_input = self._spin(1, 1000, state.low_fps)
-        self.gpu_usage_input = self._spin(0, 100, state.gpu_usage)
-        self.baseline_repeats_input = self._spin(1, 20, state.baseline_repeats)
-        self.baseline_duration_input = self._spin(10, 3600, state.baseline_duration_seconds)
-        self.baseline_confirmed_input = QCheckBox("我已在相同场景下完成至少 2 次基线测试，并核对测试条件")
-        self.baseline_confirmed_input.setChecked(state.baseline_confirmed)
-        for name, widget in [("平均 FPS 目标", self.target_avg), ("1% Low 目标", self.target_low), ("优化模式", self.mode_input), ("当前平均 FPS", self.avg_input), ("当前 1% Low", self.low_input), ("当前 GPU 占用", self.gpu_usage_input), ("测试次数", self.baseline_repeats_input), ("每次时长（秒）", self.baseline_duration_input), ("确认基线", self.baseline_confirmed_input)]:
+        for name, widget in [("平均 FPS 目标", self.target_avg), ("1% Low 目标", self.target_low), ("优化模式", self.mode_input)]:
             goal_form.addRow(name, widget)
         self.laptop_card, laptop_form = self._form_card("笔记本运行状态")
         self.gpu_power_input = self._spin(0, 250, state.gpu_power_w or 0, 5)
@@ -592,7 +623,7 @@ class NewTaskPage(QScrollArea):
         laptop_form.addRow("显卡输出方式", self.graphics_mode_input)
         laptop_form.addRow("供电模式", self.power_mode_input)
         laptop_form.addRow("风扇 / 散热模式", self.cooling_mode_input)
-        root.addWidget(self.laptop_card)
+        setup_layout.addWidget(self.laptop_card)
         self._update_laptop_fields()
         advanced_card, advanced_form = self._form_card("CS2 高级视频设置")
         self.advanced_video_inputs: dict[str, QComboBox] = {}
@@ -625,16 +656,71 @@ class NewTaskPage(QScrollArea):
         advanced_form.addRow("V-Sync", self.vsync_input)
         advanced_form.addRow("全局阴影效果", self.shadow_quality_input)
         advanced_form.addRow("动态阴影", self.dynamic_shadows_input)
-        root.insertWidget(2, advanced_card)
-        root.addWidget(label("硬件型号只用于识别设备，性能判断以实测数据为准。不清楚笔记本选项时可以选择“不确定”。", "metricNote", True))
+        setup_layout.addWidget(advanced_card)
+        setup_layout.addWidget(label("硬件型号只用于识别设备，性能判断以实测数据为准。不清楚笔记本选项时可以选择“不确定”。", "metricNote", True))
         buttons = QHBoxLayout()
         buttons.addStretch()
-        submit = QPushButton("保存任务并分析")
-        submit.setObjectName("primaryButton")
-        submit.setMinimumWidth(190)
-        submit.clicked.connect(self._submit)
-        buttons.addWidget(submit)
-        root.addLayout(buttons)
+        self.begin_baseline_button = QPushButton("记录环境并进入基线测试")
+        self.begin_baseline_button.setObjectName("primaryButton")
+        self.begin_baseline_button.setMinimumWidth(230)
+        self.begin_baseline_button.clicked.connect(self._begin_baseline)
+        buttons.addWidget(self.begin_baseline_button)
+        setup_layout.addLayout(buttons)
+        root.addWidget(self.setup_stage)
+        self.baseline_stage = QWidget()
+        baseline_layout = set_margins(QVBoxLayout(self.baseline_stage), spacing=16)
+        baseline_layout.addWidget(PageHeader(
+            "基线采集",
+            "先测试，再录入结果",
+            "请按上一步记录的相同场景与设置完成测试。每次至少 60 秒，先做 2 次；数据波动较大时再增加第 3 次。",
+        ))
+        baseline_card, baseline_form = self._form_card("逐次测试结果")
+        self.baseline_run_inputs: list[dict[str, QSpinBox]] = []
+        self.baseline_run_rows: list[QWidget] = []
+        for index in range(3):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(10)
+            avg_input = self._spin(0, 2000, 0)
+            avg_input.setSpecialValueText("未填写")
+            low_input = self._spin(0, 2000, 0)
+            low_input.setSpecialValueText("未填写")
+            gpu_input = self._spin(0, 100, 0)
+            gpu_input.setSpecialValueText("未记录")
+            row_layout.addWidget(QLabel("平均 FPS"))
+            row_layout.addWidget(avg_input, 1)
+            row_layout.addWidget(QLabel("1% Low"))
+            row_layout.addWidget(low_input, 1)
+            row_layout.addWidget(QLabel("GPU 占用 %"))
+            row_layout.addWidget(gpu_input, 1)
+            baseline_form.addRow(f"第 {index + 1} 次", row)
+            self.baseline_run_inputs.append({"avg_fps": avg_input, "low_fps": low_input, "gpu_usage": gpu_input})
+            self.baseline_run_rows.append(row)
+            for widget in (avg_input, low_input, gpu_input):
+                widget.valueChanged.connect(self._refresh_baseline_guidance)
+            if index == 2:
+                row.hide()
+        self.baseline_duration_input = self._spin(60, 3600, max(60, state.baseline_duration_seconds))
+        baseline_form.addRow("每次测试时长（秒）", self.baseline_duration_input)
+        self.baseline_guidance = label("先录入前两次结果。", "metricNote", True)
+        baseline_layout.addWidget(baseline_card)
+        baseline_layout.addWidget(self.baseline_guidance)
+        self.baseline_confirmed_input = QCheckBox("以上数据来自实际测试；测试期间场景、分辨率和其他设置保持一致")
+        baseline_layout.addWidget(self.baseline_confirmed_input)
+        baseline_buttons = QHBoxLayout()
+        back_button = QPushButton("返回检查环境设置")
+        back_button.clicked.connect(self._return_to_setup)
+        baseline_buttons.addWidget(back_button)
+        baseline_buttons.addStretch()
+        finish_baseline_button = QPushButton("录入基线并开始分析")
+        finish_baseline_button.setObjectName("primaryButton")
+        finish_baseline_button.setMinimumWidth(210)
+        finish_baseline_button.clicked.connect(self._finish_baseline)
+        baseline_buttons.addWidget(finish_baseline_button)
+        baseline_layout.addLayout(baseline_buttons)
+        root.addWidget(self.baseline_stage)
+        self.baseline_stage.hide()
         root.addStretch()
 
     @staticmethod
@@ -708,7 +794,7 @@ class NewTaskPage(QScrollArea):
         )
         self.laptop_card.setVisible(is_laptop)
 
-    def _submit(self):
+    def _begin_baseline(self):
         if not self.name_input.text().strip():
             QMessageBox.warning(self, "信息不完整", "请填写任务名称。")
             return
@@ -753,19 +839,6 @@ class NewTaskPage(QScrollArea):
         self.state.test_scene = self.scene_input.text().strip()
         self.state.target_avg = self.target_avg.value()
         self.state.target_low = self.target_low.value()
-        self.state.avg_fps = self.avg_input.value()
-        self.state.low_fps = self.low_input.value()
-        self.state.gpu_usage = self.gpu_usage_input.value()
-        self.state.baseline_repeats = self.baseline_repeats_input.value()
-        self.state.baseline_duration_seconds = self.baseline_duration_input.value()
-        self.state.baseline_confirmed = self.baseline_confirmed_input.isChecked()
-        if self.state.baseline_repeats < 2 or not self.state.baseline_confirmed:
-            QMessageBox.warning(
-                self,
-                "基线测试不足",
-                "请在相同场景下至少测试 2 次，然后勾选基线确认；如果两次结果差异超过 5%，再补第 3 次。",
-            )
-            return
         self.state.mode = ("competitive", "balanced", "visual")[self.mode_input.currentIndex()]
         self.state.fps_cap = None if self.cap_input.value() < 0 else self.cap_input.value()
         self.state.fps_cap_checked = self.state.fps_cap is not None
@@ -780,6 +853,97 @@ class NewTaskPage(QScrollArea):
             key: str(combo.currentData()) for key, combo in self.advanced_video_inputs.items()
         }
         self.state.video_settings["menu_fps_cap"] = str(self.menu_cap_input.value())
+        self.setup_stage.hide()
+        self.baseline_stage.show()
+        self._refresh_baseline_guidance()
+
+    def _return_to_setup(self):
+        self.baseline_stage.hide()
+        self.setup_stage.show()
+
+    def _refresh_baseline_guidance(self, *_args):
+        first_two = self.baseline_run_inputs[:2]
+        complete = all(
+            run["avg_fps"].value() > 0 and run["low_fps"].value() > 0
+            for run in first_two
+        )
+        if not complete:
+            self.baseline_run_rows[2].hide()
+            self.baseline_guidance.setText("先录入前两次实际结果；GPU 占用可不填。")
+            return
+        averages = [run["avg_fps"].value() for run in first_two]
+        lows = [run["low_fps"].value() for run in first_two]
+
+        def spread(values: list[int]) -> float:
+            centre = median(values)
+            return (max(values) - min(values)) / centre * 100 if centre else float("inf")
+
+        needs_third = max(spread(averages), spread(lows)) > 5.0
+        self.baseline_run_rows[2].setVisible(needs_third)
+        if needs_third:
+            third_complete = (
+                self.baseline_run_inputs[2]["avg_fps"].value() > 0
+                and self.baseline_run_inputs[2]["low_fps"].value() > 0
+            )
+            status = "第 1、2 次结果相差超过 5%，请补做第 3 次。"
+            if third_complete:
+                status += "汇总时将采用 3 次结果的中位数。"
+            self.baseline_guidance.setText(status)
+        else:
+            self.baseline_guidance.setText("前两次结果波动在 5% 以内，可以使用这两次结果的中位数作为基线。")
+
+    def _finish_baseline(self):
+        if not self.baseline_confirmed_input.isChecked():
+            QMessageBox.warning(self, "请确认测试条件", "请确认以上数据来自实际测试，且测试条件保持一致。")
+            return
+        runs: list[dict[str, float]] = []
+        for widgets in self.baseline_run_inputs[:2]:
+            avg = widgets["avg_fps"].value()
+            low = widgets["low_fps"].value()
+            if avg <= 0 or low <= 0:
+                QMessageBox.warning(self, "基线数据不完整", "请先填写前两次测试的平均 FPS 和 1% Low。")
+                return
+            if low > avg * 1.05:
+                QMessageBox.warning(self, "基线数据无效", "1% Low 不应高于平均 FPS，请检查逐次录入的数据。")
+                return
+            run = {"avg_fps": float(avg), "low_fps": float(low)}
+            gpu = widgets["gpu_usage"].value()
+            if gpu > 0:
+                run["gpu_usage"] = float(gpu)
+            runs.append(run)
+
+        def spread(values: list[float]) -> float:
+            centre = median(values)
+            return (max(values) - min(values)) / centre * 100 if centre else float("inf")
+
+        needs_third = max(
+            spread([run["avg_fps"] for run in runs]),
+            spread([run["low_fps"] for run in runs]),
+        ) > 5.0
+        if needs_third:
+            widgets = self.baseline_run_inputs[2]
+            avg = widgets["avg_fps"].value()
+            low = widgets["low_fps"].value()
+            if avg <= 0 or low <= 0:
+                QMessageBox.warning(self, "需要第 3 次基线测试", "前两次结果相差超过 5%，请完成并录入第 3 次测试。")
+                return
+            if low > avg * 1.05:
+                QMessageBox.warning(self, "基线数据无效", "第 3 次测试的 1% Low 不应高于平均 FPS，请检查录入数据。")
+                return
+            run = {"avg_fps": float(avg), "low_fps": float(low)}
+            gpu = widgets["gpu_usage"].value()
+            if gpu > 0:
+                run["gpu_usage"] = float(gpu)
+            runs.append(run)
+
+        self.state.baseline_runs = runs
+        self.state.avg_fps = round(median(run["avg_fps"] for run in runs))
+        self.state.low_fps = round(median(run["low_fps"] for run in runs))
+        gpu_values = [run["gpu_usage"] for run in runs if "gpu_usage" in run]
+        self.state.gpu_usage = round(median(gpu_values)) if gpu_values else 0
+        self.state.baseline_repeats = len(runs)
+        self.state.baseline_duration_seconds = self.baseline_duration_input.value()
+        self.state.baseline_confirmed = True
         self.state.has_task = True
         self.state.step = "分析完成"
         self.task_created.emit(self.state)
@@ -794,6 +958,8 @@ class ExperimentPage(QScrollArea):
         self.state = state
         self.plan = plan
         self.completed = False
+        self.planning = False
+        self.rollback_pending = False
         self._csv_metrics: dict | None = None
         self._csv_values: tuple[int, int, int, int] | None = None
         self.setWidgetResizable(True)
@@ -805,9 +971,12 @@ class ExperimentPage(QScrollArea):
             subtitle = "这一步只记录实际设置，不需要测试帧率；条件有变化时，请如实选择“有变化”。"
         elif plan and plan.action == AgentAction.FINISH:
             subtitle = "当前没有新的测试要求；如需继续，请先补充可验证的设置规则。"
+        elif plan and plan.purpose == "diagnostic":
+            subtitle = "本轮只用于排查性能限制，不会直接作为最佳配置；测试后按提示恢复或补测。"
         else:
             subtitle = "先测试 1 次筛选明显退步；没有明显下降时，再补测到累计 3 次。条件有变化时，请如实选择“有变化”。"
-        root.addWidget(PageHeader("实验结果", f"录入第 {round_number} 轮结果", subtitle, "等待录入"))
+        entry_type = "诊断测试" if plan and plan.purpose == "diagnostic" else "优化验证"
+        root.addWidget(PageHeader(entry_type, f"录入第 {round_number} 轮结果", subtitle, "等待录入"))
         columns = QHBoxLayout()
         columns.setSpacing(15)
         input_card = QFrame()
@@ -818,6 +987,7 @@ class ExperimentPage(QScrollArea):
         self.file_input = QLineEdit()
         self.file_input.setPlaceholderText("导入 PresentMon CSV（可选）")
         browse = QPushButton("浏览文件")
+        self.browse_button = browse
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self._choose_file)
         file_row.addWidget(self.file_input, 1)
@@ -841,6 +1011,17 @@ class ExperimentPage(QScrollArea):
             self._setting_value_from_state(),
             self._setting_options(),
         )
+        self.is_user_adjustment_request = bool(self.plan and self.plan.setting_id == "user_adjustment")
+        self.adjustment_direction = QComboBox()
+        self.adjustment_direction.addItems(["请选择优化方向", *GENERIC_OPTIMIZATION_DIRECTIONS])
+        self.adjustment_setting_name = QLineEdit()
+        self.adjustment_setting_name.setPlaceholderText("例如：全局阴影效果")
+        self.adjustment_current_value = QLineEdit()
+        self.adjustment_current_value.setPlaceholderText("例如：高")
+        self.adjustment_new_value = QLineEdit()
+        self.adjustment_new_value.setPlaceholderText("例如：中")
+        if self.plan and self.plan.setting_id == "user_defined" and self.actual_setting.lineEdit():
+            self.actual_setting.lineEdit().setPlaceholderText(f"调整后应为：{self.plan.new_value}")
         self._actual_fields = {
             "cpu": self.actual_cpu,
             "gpu": self.actual_gpu,
@@ -851,7 +1032,13 @@ class ExperimentPage(QScrollArea):
         for field in self._actual_fields.values():
             field.textChanged.connect(self._clear_csv_if_manual_edit)
         self.actual_setting.currentTextChanged.connect(self._clear_csv_if_manual_edit)
-        self.configuration_confirmed = QCheckBox("我已完成本轮调整，并核对上述实际配置")
+        if plan and plan.action == AgentAction.REQUEST_DATA:
+            confirmation_label = "我已核对并记录当前实际状态"
+        elif plan and plan.purpose == "diagnostic":
+            confirmation_label = "我已完成本轮诊断测试，并核对实际配置"
+        else:
+            confirmation_label = "我已完成本轮调整，并核对上述实际配置"
+        self.configuration_confirmed = QCheckBox(confirmation_label)
         # A proposed value is not evidence that the user executed it.
         self.configuration_confirmed.setChecked(False)
         for name, widget in [("平均 FPS", self.avg), ("1% Low", self.low), ("GPU 占用", self.gpu), ("测试次数", self.repeats), ("每次时长（秒）", self.duration), ("测试条件", self.condition)]:
@@ -862,7 +1049,15 @@ class ExperimentPage(QScrollArea):
         form.addRow("刷新率", self.actual_refresh_rate)
         form.addRow("测试场景", self.actual_scene)
         setting_label = getattr(self.plan, "setting", "本轮设置") if self.plan else "本轮设置"
-        form.addRow(f"本轮{setting_label}", self.actual_setting)
+        if self.is_user_adjustment_request:
+            form.addRow("优化方向", self.adjustment_direction)
+            form.addRow("设置名称", self.adjustment_setting_name)
+            form.addRow("当前值", self.adjustment_current_value)
+            form.addRow("调整后值", self.adjustment_new_value)
+            for field in (self.adjustment_setting_name, self.adjustment_current_value, self.adjustment_new_value):
+                field.textChanged.connect(self._clear_csv_if_manual_edit)
+        else:
+            form.addRow(f"本轮{setting_label}", self.actual_setting)
         input_layout.addLayout(form)
         input_layout.addWidget(self.configuration_confirmed)
         self.notes = QTextEdit()
@@ -883,7 +1078,7 @@ class ExperimentPage(QScrollArea):
         guide_box.setObjectName("card")
         guide_layout = set_margins(QVBoxLayout(guide_box), 20, 18, 20, 20, 7)
         guide_layout.addWidget(label("本轮只改这一项", "cardKicker"))
-        change_title = f"{plan.setting}：{plan.old_value} → {plan.new_value}" if plan else "等待生成实验计划"
+        change_title = f"{plan.setting}：{setting_value_label(plan.setting_id, plan.old_value)} → {setting_value_label(plan.setting_id, plan.new_value)}" if plan else "等待生成实验计划"
         guide_layout.addWidget(label(change_title, "actionTitle", True))
         guide_layout.addWidget(label("其他设置保持不变", "metricNote"))
         if plan and plan.action == AgentAction.REQUEST_DATA:
@@ -895,6 +1090,12 @@ class ExperimentPage(QScrollArea):
         for name, value in [("测试场景", state.test_scene), ("测试要求", test_requirement), ("基线数据", f"{state.avg_fps} / {state.low_fps} FPS"), ("有效变化", "平均帧率变化超过 5%")]:
             guide_layout.addWidget(hline())
             guide_layout.addWidget(RuleRow(name, value))
+        if plan:
+            guide_layout.addWidget(hline())
+            guide_layout.addWidget(RuleRow("实验用途", "排查原因，结束后恢复原设置" if plan.purpose == "diagnostic" else "验证用户选定的优化调整"))
+            if plan.selection_reason:
+                guide_layout.addWidget(hline())
+                guide_layout.addWidget(RuleRow("AI 选择理由", plan.selection_reason))
         guide_layout.addSpacing(8)
         guide_label = label("提示：GPU 占用低不一定是 CPU 瓶颈，也可能是限帧或垂直同步造成的。", "warningBox", True)
         guide_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -911,6 +1112,8 @@ class ExperimentPage(QScrollArea):
         """Return the confirmed current value for the planned setting."""
         plan = self.plan
         setting_id = str(getattr(plan, "setting_id", "") or "") if plan else ""
+        if setting_id == "user_defined" and plan is not None:
+            return plan.new_value
         setting = str(getattr(plan, "setting", "") or "") if plan else ""
         display_values = {
             "graphics_mode": {"dgpu": "独显直连", "hybrid": "混合输出", "advanced_optimus": "自动切换", "unknown": "不确定"},
@@ -930,7 +1133,11 @@ class ExperimentPage(QScrollArea):
             "dynamic_shadows": {"all": "全部", "sun_only": "仅限日光", "unknown": ""}.get(self.state.dynamic_shadows, ""),
             "fps_cap": "" if self.state.fps_cap is None else str(self.state.fps_cap),
             "display_mode": {"fullscreen": "全屏", "borderless": "全屏窗口模式", "windowed": "窗口模式"}.get(self.state.display_mode, self.state.display_mode),
+            "vsync": {"disabled": "已禁用", "enabled": "已启用", "unknown": ""}.get(self.state.vsync, self.state.vsync),
         }
+        if setting_id in ADVANCED_SETTING_LABELS:
+            value = str((self.state.video_settings or {}).get(setting_id, ""))
+            return setting_value_label(setting_id, value)
         if setting_id in values:
             return values[setting_id]
         labels = {
@@ -960,10 +1167,22 @@ class ExperimentPage(QScrollArea):
             "shadow_quality": ["低", "中", "高", "非常高", "未确认"],
             "dynamic_shadows": ["全部", "仅限日光", "未确认"],
             "display_mode": ["全屏", "全屏窗口模式", "窗口模式"],
+            "vsync": ["已禁用", "已启用", "未确认"],
+            **{
+                key: [labels.get(value, value) for value in ADVANCED_SETTING_OPTIONS[key]]
+                for key, labels in ADVANCED_SETTING_LABELS.items()
+            },
         }.get(setting_id, [])
 
     def _supplement_value(self) -> str:
         """Convert friendly UI labels back to stable domain values."""
+        if self.is_user_adjustment_request:
+            return " | ".join((
+                self.adjustment_direction.currentText().strip(),
+                self.adjustment_setting_name.text().strip(),
+                self.adjustment_current_value.text().strip(),
+                self.adjustment_new_value.text().strip(),
+            ))
         value = self.actual_setting.text().strip()
         setting_id = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
         aliases = {
@@ -972,7 +1191,13 @@ class ExperimentPage(QScrollArea):
             "cooling_mode": {"性能 / 狂暴模式": "performance", "平衡模式": "balanced", "安静模式": "quiet", "不确定": "unknown"},
             "dynamic_shadows": {"全部": "all", "仅限日光": "sun_only", "仅太阳": "sun_only", "未确认": "unknown"},
             "display_mode": {"全屏": "fullscreen", "全屏窗口模式": "borderless", "无边框窗口": "borderless", "窗口模式": "windowed", "窗口化": "windowed"},
+            "vsync": {"已禁用": "disabled", "已启用": "enabled", "未确认": "unknown"},
         }
+        advanced_aliases = {
+            key: {label: value for value, label in labels.items()}
+            for key, labels in ADVANCED_SETTING_LABELS.items()
+        }
+        aliases.update(advanced_aliases)
         return aliases.get(setting_id, {}).get(value, value)
 
     def _clear_csv_if_manual_edit(self, *_args):
@@ -982,16 +1207,34 @@ class ExperimentPage(QScrollArea):
 
     def set_completed(self, completed: bool = True):
         self.completed = completed
-        self.save_button.setEnabled(not completed)
+        self._sync_input_enabled()
         for widget in [self.file_input, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition,
                         self.actual_cpu, self.actual_gpu, self.actual_resolution, self.actual_refresh_rate,
-                        self.actual_scene, self.actual_setting, self.configuration_confirmed, self.notes]:
-            widget.setEnabled(not completed)
-        self.rollback_button.setEnabled(not completed)
+                        self.actual_scene, self.actual_setting, self.configuration_confirmed, self.notes,
+                        self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
+                        self.adjustment_new_value]:
+            widget.setEnabled(not completed and not self.planning)
+        self.browse_button.setEnabled(not completed and not self.planning)
 
     def set_rollback_pending(self, pending: bool = True):
+        self.rollback_pending = pending
         self.rollback_button.setVisible(pending)
-        self.save_button.setEnabled(not pending and not self.completed)
+        self._sync_input_enabled()
+
+    def set_planning(self, planning: bool = True):
+        self.planning = planning
+        self._sync_input_enabled()
+        for widget in [self.file_input, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition,
+                       self.actual_cpu, self.actual_gpu, self.actual_resolution, self.actual_refresh_rate,
+                       self.actual_scene, self.actual_setting, self.configuration_confirmed, self.notes,
+                       self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
+                       self.adjustment_new_value]:
+            widget.setEnabled(not planning and not self.completed)
+        self.browse_button.setEnabled(not planning and not self.completed)
+
+    def _sync_input_enabled(self):
+        self.save_button.setEnabled(not self.completed and not self.rollback_pending and not self.planning)
+        self.rollback_button.setEnabled(not self.completed and self.rollback_pending and not self.planning)
 
     def _actual_configuration(self) -> dict[str, str]:
         config = {key: field.text().strip() for key, field in self._actual_fields.items()}
@@ -1005,7 +1248,7 @@ class ExperimentPage(QScrollArea):
         config.update(self.state.video_settings or {})
         config["planned_setting"] = str(getattr(self.plan, "setting", "") or "") if self.plan else ""
         config["planned_setting_id"] = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
-        config["actual_setting_value"] = self.actual_setting.text().strip()
+        config["actual_setting_value"] = self._supplement_value() if self.is_user_adjustment_request else self.actual_setting.text().strip()
         setting_id = config["planned_setting_id"]
         if setting_id and config["actual_setting_value"]:
             config[setting_id] = self._supplement_value()
@@ -1032,7 +1275,19 @@ class ExperimentPage(QScrollArea):
     def _save(self):
         if self.completed:
             return
-        if self.is_data_request and not self.actual_setting.text().strip():
+        if self.is_data_request and self.is_user_adjustment_request:
+            direction = self.adjustment_direction.currentText().strip()
+            setting_name = self.adjustment_setting_name.text().strip()
+            old_value = self.adjustment_current_value.text().strip()
+            new_value = self.adjustment_new_value.text().strip()
+            if direction == "请选择优化方向" or not setting_name or not old_value or not new_value:
+                QMessageBox.warning(self, "需要补充信息", "请选择优化方向，并填写设置名称、当前值和调整后值。")
+                return
+            if old_value == new_value:
+                QMessageBox.warning(self, "设置没有变化", "当前值与调整后值相同，请填写一个实际可执行的单项变化。")
+                self.adjustment_new_value.setFocus()
+                return
+        elif self.is_data_request and not self.actual_setting.text().strip():
             QMessageBox.warning(self, "需要补充信息", "请填写实际设置值后再提交。")
             self.actual_setting.setFocus()
             return
@@ -1631,6 +1886,8 @@ class MainWindow(QMainWindow):
         self._explanation_jobs: dict[int, tuple[QThread, ModelWorker, dict]] = {}
         self._explanation_thread: QThread | None = None
         self._explanation_worker: ModelWorker | None = None
+        self._planning_generation = 0
+        self._planning_jobs: dict[int, tuple[QThread, ModelWorker, dict]] = {}
         self._pending_rollback: dict | None = None
         preview_task, preview_baseline = self._core_objects()
         self.current_evidence = analyze_evidence(preview_task, preview_baseline, fps_cap_known=True, vsync_known=True)
@@ -1673,6 +1930,8 @@ class MainWindow(QMainWindow):
         self.controller.model_provider = provider
         mode = provider.config.reasoning_effort or "关闭"
         self.statusBar().showMessage(f"模型配置已应用 · {provider.config.model} · 思考模式 {mode}", 5000)
+        if self.core_task and self.current_plan and self.current_plan.action != AgentAction.FINISH:
+            self._start_plan_selection()
 
     def set_page(self, index: int):
         self.stack.setCurrentIndex(index)
@@ -1709,6 +1968,12 @@ class MainWindow(QMainWindow):
             self.core_task, self.baseline_record = task, baseline
             self._task_generation += 1
             self._load_state_from_task(task, current)
+            self._apply_record_to_state(current)
+            current_configuration = current.configuration or {}
+            cap_value = current_configuration.get("fps_cap", task.fps_cap)
+            vsync_value = current_configuration.get("vsync", task.vsync)
+            self.state.fps_cap_checked = cap_value not in (None, "", "unknown", "未确认")
+            self.state.vsync_checked = vsync_value not in (None, "", "unknown", "未确认")
             self.state.baseline_repeats = baseline.repeats
             self.state.baseline_duration_seconds = baseline.duration_seconds or 60
             self.state.baseline_confirmed = baseline.configuration_confirmed
@@ -1716,8 +1981,9 @@ class MainWindow(QMainWindow):
                 task,
                 current,
                 baseline,
-                fps_cap_known=True,
-                vsync_known=True,
+                fps_cap_known=self.state.fps_cap_checked,
+                vsync_known=self.state.vsync_checked,
+                diagnostic_results=self.controller.diagnostic_results(task_id),
             )
             self.current_plan = self._restored_plan(task, current, baseline, runtime)
             self._rebuild_task_pages(reset_results=True)
@@ -1745,6 +2011,14 @@ class MainWindow(QMainWindow):
             # A pending rollback is an actionable workflow state; open the
             # experiment page so the recovery button is immediately visible.
             self.set_page(2 if runtime_state == "awaiting_rollback" else 0)
+            last_decision = self.controller.last_decisions.get(task_id)
+            if (
+                runtime_state == "awaiting_test"
+                and self.current_plan is not None
+                and self.current_plan.planning_source == "local"
+                and not (last_decision and last_decision.retry_same_experiment)
+            ):
+                self._start_plan_selection()
         except (ValueError, TypeError, KeyError) as error:
             QMessageBox.warning(self, "恢复任务失败", str(error))
 
@@ -1775,7 +2049,8 @@ class MainWindow(QMainWindow):
         try:
             _evidence, plan = self.controller.plan_after_result(
                 task, current, baseline, round_number,
-                fps_cap_known=True, vsync_known=True,
+                fps_cap_known=self.state.fps_cap_checked,
+                vsync_known=self.state.vsync_checked,
             )
             return plan
         except (ValueError, TypeError):
@@ -1795,6 +2070,7 @@ class MainWindow(QMainWindow):
             return
         self._task_generation += 1
         self._explanation_generation += 1
+        self._planning_generation += 1
         self.current_evidence, self.current_plan = evidence, plan
         self._rebuild_task_pages(reset_results=True)
         if plan.action == AgentAction.FINISH:
@@ -1803,6 +2079,8 @@ class MainWindow(QMainWindow):
         self._refresh_task_selector()
         self.sidebar.update_task()
         self.statusBar().showMessage(f"任务已保存 · 已生成 {len(evidence)} 条证据", 5000)
+        if plan.action != AgentAction.FINISH:
+            self._start_plan_selection()
         QMessageBox.information(self, "任务已保存", f"任务和基线数据已保存。\n\n下一步：{plan.title}")
         self.set_page(0)
 
@@ -1886,10 +2164,17 @@ class MainWindow(QMainWindow):
             return
         context = {"result": result, "candidate": candidate, "decision": decision, "round": evaluated_round}
         if decision.action == AgentAction.REVERT_CHANGE:
+            diagnostic = bool(decision.diagnostic_summary)
+            title = "恢复诊断前的配置" if diagnostic else "确认撤销调整"
+            message = (
+                f"{decision.diagnostic_summary}\n\n这轮只用于排查原因，不会作为优化结果保留。是否已经恢复原配置？"
+                if diagnostic
+                else "本轮设置使性能下降。是否恢复上一组更好的配置？"
+            )
             answer = QMessageBox.question(
                 self,
-                "确认撤销调整",
-                "本轮设置使性能下降。是否恢复上一组更好的配置？",
+                title,
+                message,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1941,6 +2226,8 @@ class MainWindow(QMainWindow):
         self.sidebar.update_task()
         self._rebuild_task_pages()
         self.statusBar().showMessage(f"已记录 {self.current_plan.setting} · 已生成下一步计划", 5000)
+        if plan.action != AgentAction.FINISH:
+            self._start_plan_selection()
         self.set_page(0)
 
     def _sync_state_from_core_task(self):
@@ -1948,12 +2235,15 @@ class MainWindow(QMainWindow):
             return
         for field_name in (
             "name", "game", "cpu", "gpu", "resolution", "refresh_rate", "test_scene",
-            "target_avg_fps", "target_low_fps", "mode", "is_laptop", "gpu_power_w",
-            "graphics_mode", "power_mode", "cooling_mode",
+            "target_avg_fps", "target_low_fps", "mode", "is_laptop", "gpu_power_w", "fps_cap",
+            "graphics_mode", "power_mode", "cooling_mode", "vsync", "display_mode",
+            "shadow_quality", "dynamic_shadows", "video_settings",
         ):
             state_name = {"target_avg_fps": "target_avg", "target_low_fps": "target_low"}.get(field_name, field_name)
             if hasattr(self.core_task, field_name) and hasattr(self.state, state_name):
                 setattr(self.state, state_name, getattr(self.core_task, field_name))
+        self.state.fps_cap_checked = self.core_task.fps_cap is not None
+        self.state.vsync_checked = self.core_task.vsync != "unknown"
 
     def _confirm_pending_rollback(self):
         context = self._pending_rollback
@@ -2000,6 +2290,8 @@ class MainWindow(QMainWindow):
                 self.experiment.set_rollback_pending(False)
                 if workflow_state in {"complete", "completed", "finished"} or self.current_plan is None:
                     self.experiment.set_completed(True)
+                elif self.current_plan.planning_source == "local":
+                    self._start_plan_selection()
                 self._replace_report(best_record=self.controller.best_record(self.core_task.task_id))
                 self.statusBar().showMessage("已确认恢复配置 · 已生成下一轮计划", 5000)
             except (ValueError, TypeError, KeyError) as error:
@@ -2091,7 +2383,7 @@ class MainWindow(QMainWindow):
             self.state.step = "等待同配置复测"
         else:
             self.state.round_number = evaluated_round + 1
-            self.state.step = "复测评估完成"
+            self.state.step = "诊断实验完成" if decision.diagnostic_summary else "复测评估完成"
         self.sidebar.update_task()
         self.history.add_result(result, decision, evaluated_round)
         if decision.action == AgentAction.RETEST:
@@ -2119,7 +2411,140 @@ class MainWindow(QMainWindow):
             self.experiment.set_completed(True)
         else:
             self.experiment.set_rollback_pending(False)
-        self._start_explanation(context)
+        if not task_complete and self.current_plan is not None:
+            self._start_plan_selection(explanation_context=context)
+        else:
+            self._start_explanation(context)
+
+    def _start_plan_selection(self, explanation_context: dict | None = None):
+        """Choose among safe local plans without blocking the desktop UI."""
+        self._planning_generation += 1
+        self.experiment.set_planning(False)
+        provider = getattr(self.controller, "model_provider", None)
+        if provider is None or self.core_task is None or self.current_plan is None:
+            if explanation_context is not None:
+                self._start_explanation(explanation_context)
+            return
+        workflow = self.controller.workflows.get(self.core_task.task_id)
+        if workflow is None or workflow.state.value != "awaiting_test":
+            if explanation_context is not None:
+                self._start_explanation(explanation_context)
+            return
+        current = self.controller.current_record(self.core_task.task_id) or self.baseline_record
+        if current is None:
+            if explanation_context is not None:
+                self._start_explanation(explanation_context)
+            return
+        try:
+            candidates = self.controller.next_step_candidates(
+                self.core_task, current, self.current_evidence, workflow.round_number,
+            )
+        except (ValueError, TypeError):
+            candidates = []
+        if len(candidates) < 2:
+            if explanation_context is not None:
+                self._start_explanation(explanation_context)
+            return
+
+        job_id = self._planning_generation
+        task_snapshot = deepcopy(self.core_task)
+        current_snapshot = deepcopy(current)
+        evidence_snapshot = deepcopy(self.current_evidence)
+        candidate_snapshot = deepcopy(candidates)
+        history_snapshot = deepcopy(self.controller.repository.task_history(task_snapshot.task_id))
+        expected_plan_id = plan_candidate_id(self.current_plan)
+        allowed_ids = {plan_candidate_id(plan) for plan in candidate_snapshot}
+        job_context = {
+            "task_generation": self._task_generation,
+            "task_id": task_snapshot.task_id,
+            "expected_plan_id": expected_plan_id,
+            "allowed_candidate_ids": allowed_ids,
+            "candidates": candidate_snapshot,
+            "explanation_context": explanation_context,
+        }
+        thread = QThread(self)
+        worker = ModelWorker(
+            lambda: self.controller.choose_next_step(
+                task_snapshot,
+                current_snapshot,
+                evidence_snapshot,
+                candidate_snapshot,
+                history_snapshot,
+            ),
+            job_id,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished_with_id.connect(self._planning_finished)
+        worker.failed_with_id.connect(self._planning_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda token=job_id, running_thread=thread: self._planning_thread_finished(token, running_thread))
+        self._planning_jobs[job_id] = (thread, worker, job_context)
+        self.experiment.set_planning(True)
+        self.statusBar().showMessage("AI 正在比较可执行的下一步，当前计划已暂时锁定……", 0)
+        thread.start()
+
+    def _planning_context(self, job_id: int) -> dict | None:
+        entry = self._planning_jobs.get(job_id)
+        if not entry or job_id != self._planning_generation:
+            return None
+        context = entry[2]
+        if context.get("task_generation") != self._task_generation:
+            return None
+        if not self.core_task or context.get("task_id") != self.core_task.task_id:
+            return None
+        return context
+
+    @Slot(int, object)
+    def _planning_finished(self, job_id: int, selection):
+        context = self._planning_context(job_id)
+        if context is None:
+            return
+        applied = False
+        try:
+            applied = self.controller.accept_model_plan(
+                self.core_task,
+                context["expected_plan_id"],
+                selection.plan,
+                context["allowed_candidate_ids"],
+            )
+        except (ValueError, TypeError, KeyError):
+            applied = False
+        if applied:
+            page_index = self.stack.currentIndex()
+            self.current_plan = selection.plan
+            self._rebuild_task_pages()
+            self.experiment.set_planning(False)
+            self.set_page(page_index)
+            if selection.source == "model":
+                message = f"AI 已选择下一步：{selection.plan.title}"
+                if selection.plan.selection_reason:
+                    message += f" · {selection.plan.selection_reason}"
+            else:
+                message = selection.warning or "AI 规划暂不可用，已保留本地规则建议。"
+            self.statusBar().showMessage(message, 7000)
+        else:
+            self.experiment.set_planning(False)
+            self.statusBar().showMessage("计划状态已变化，保留当前有效计划。", 5000)
+        explanation_context = context.get("explanation_context")
+        if explanation_context is not None:
+            self._start_explanation(explanation_context)
+
+    @Slot(int, object)
+    def _planning_failed(self, job_id: int, error: Exception):
+        context = self._planning_context(job_id)
+        if context is None:
+            return
+        self.experiment.set_planning(False)
+        self.statusBar().showMessage("AI 规划暂不可用，继续使用本地规则建议。", 6000)
+        explanation_context = context.get("explanation_context")
+        if explanation_context is not None:
+            self._start_explanation(explanation_context)
+
+    def _planning_thread_finished(self, job_id: int, thread: QThread):
+        self._planning_jobs.pop(job_id, None)
 
     def _start_explanation(self, context: dict):
         self._explanation_generation += 1
@@ -2292,21 +2717,25 @@ class MainWindow(QMainWindow):
                 "dynamic_shadows": self.state.dynamic_shadows,
                 **(self.state.video_settings or {}),
             },
+            runs=[dict(run) for run in (self.state.baseline_runs or [])],
         )
         return task, baseline
 
     def closeEvent(self, event):
-        # Stop both the explanation workers and the API settings workers.  A
+        # Stop the planning, explanation, and API settings workers.  A
         # provider call may be blocking in urllib, so use a bounded wait and
         # terminate only as a last resort during application shutdown.
         self.api_settings.stop_workers()
         self._explanation_generation += 1
-        for thread, _worker, _context in list(self._explanation_jobs.values()):
+        self._planning_generation += 1
+        active_jobs = list(self._planning_jobs.values()) + list(self._explanation_jobs.values())
+        for thread, _worker, _context in active_jobs:
             thread.requestInterruption()
             thread.quit()
             if thread.isRunning() and not thread.wait(1000):
                 thread.terminate()
                 thread.wait(1000)
+        self._planning_jobs.clear()
         self._explanation_jobs.clear()
         super().closeEvent(event)
 

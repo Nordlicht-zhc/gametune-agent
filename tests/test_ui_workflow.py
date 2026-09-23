@@ -121,8 +121,10 @@ class UiWorkflowTests(unittest.TestCase):
 
     def test_baseline_and_experiment_copy_explain_adaptive_test_count(self):
         new_task = NewTaskPage(TaskState())
-        self.assertEqual(new_task.baseline_repeats_input.value(), 2)
-        self.assertIn("至少 2 次", new_task.baseline_confirmed_input.text())
+        self.assertTrue(new_task.baseline_stage.isHidden())
+        self.assertEqual(len(new_task.baseline_run_inputs), 3)
+        self.assertEqual(new_task.baseline_run_inputs[0]["avg_fps"].value(), 0)
+        self.assertIn("实际测试", new_task.baseline_confirmed_input.text())
         new_task.deleteLater()
 
         plan = ExperimentPlan(
@@ -204,6 +206,28 @@ class UiWorkflowTests(unittest.TestCase):
         configuration = page._actual_configuration()
         self.assertEqual(configuration["actual_setting_value"], "接通电源 · 性能模式")
         self.assertEqual(configuration["power_mode"], "ac_performance")
+        page.deleteLater()
+
+    def test_generic_optimization_request_has_direction_and_single_setting_fields(self):
+        plan = ExperimentPlan(
+            AgentAction.REQUEST_DATA,
+            "选择通用优化方向并指定一项设置",
+            "方向与单项设置",
+            "由你填写当前值",
+            "由你填写调整值",
+            "原因", "假设", "方法", "标准", "不修改设置", 1,
+            setting_id="user_adjustment",
+        )
+        page = ExperimentPage(TaskState(), plan)
+        self.assertEqual(
+            [page.adjustment_direction.itemText(index) for index in range(page.adjustment_direction.count())],
+            ["请选择优化方向", "GPU 画面负载", "CPU 后台负载", "供电与散热", "画面稳定性", "游戏内画面质量"],
+        )
+        page.adjustment_direction.setCurrentText("GPU 画面负载")
+        page.adjustment_setting_name.setText("全局阴影效果")
+        page.adjustment_current_value.setText("高")
+        page.adjustment_new_value.setText("中")
+        self.assertEqual(page._supplement_value(), "GPU 画面负载 | 全局阴影效果 | 高 | 中")
         page.deleteLater()
 
     def test_cs2_choices_match_installed_simplified_chinese_menu(self):
