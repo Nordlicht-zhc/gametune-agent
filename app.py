@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
+from PySide6.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QBrush
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
     QWidget, QAbstractSpinBox, QDoubleSpinBox,
     QCheckBox,
+    QGraphicsOpacityEffect,
 )
 
 from agent.controller import GameTuneController
@@ -128,7 +129,9 @@ QLabel#brandName { color: #f6f7f3; font-size: 17px; font-weight: 800; }
 QLabel#brandSub, QLabel#sidebarLabel { color: #909791; font-size: 10px; font-weight: 700; }
 QPushButton#navButton { color: #c8cdc8; background: transparent; border: none; border-radius: 9px; text-align: left; padding: 10px 13px; font-size: 13px; }
 QPushButton#navButton:hover { background: #2b302c; color: #ffffff; }
-QPushButton#navButton:checked { color: #ffffff; background: #343a35; font-weight: 700; border-left: 3px solid #d7ff62; }
+QPushButton#navButton:checked { color: #ffffff; background: #343a35; font-weight: 700; }
+QPushButton#navButton:pressed { background: #414842; }
+QFrame#navIndicator { background: #d7ff62; border-radius: 2px; }
 QFrame#sideTask { background: #292e2a; border: 1px solid #3b413c; border-radius: 11px; }
 QLabel#sideTaskTitle { color: #f1f3ef; font-weight: 700; font-size: 12px; }
 QLabel#sideTaskText { color: #959c96; font-size: 10px; }
@@ -164,8 +167,15 @@ QLabel#ruleText { color: #686f6a; font-size: 11px; }
 QFrame#ruleLine { background: #eceeeb; max-height: 1px; }
 QPushButton#primaryButton { color: #ffffff; background: #222723; border: none; border-radius: 9px; padding: 9px 15px; font-weight: 700; }
 QPushButton#primaryButton:hover { background: #343a35; }
+QPushButton#primaryButton:pressed { background: #151916; }
 QPushButton#secondaryButton { color: #333834; background: #ffffff; border: 1px solid #d9ddd8; border-radius: 9px; padding: 8px 14px; font-weight: 700; }
 QPushButton#secondaryButton:hover { background: #f1f3ef; }
+QPushButton#secondaryButton:pressed { background: #e5e9e2; border-color: #aeb7ae; }
+QFrame#toastNotice { background: #202421; border: 1px solid #3b413c; border-radius: 10px; }
+QFrame#toastNotice[variant="success"] { border-left: 3px solid #b6eb32; }
+QFrame#toastNotice[variant="info"] { border-left: 3px solid #85b6ee; }
+QFrame#toastNotice[variant="error"] { border-left: 3px solid #f29a73; }
+QLabel#toastText { color: #f6f7f3; font-size: 12px; font-weight: 700; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
     background-color: #ffffff;
     color: #202422;
@@ -212,6 +222,235 @@ def set_margins(layout, left=0, top=0, right=0, bottom=0, spacing=0):
     layout.setContentsMargins(left, top, right, bottom)
     layout.setSpacing(spacing)
     return layout
+
+
+class TransitionOverlay(QWidget):
+    def __init__(self, snapshot: QPixmap, parent: QWidget):
+        super().__init__(parent)
+        self._snapshot = snapshot
+        self._opacity = 1.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def _set_opacity(self, value: float):
+        self._opacity = value
+        self.update()
+
+    opacity = Property(float, lambda self: self._opacity, _set_opacity)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setOpacity(self._opacity)
+        painter.drawPixmap(self.rect(), self._snapshot)
+
+
+def fade_stack_to(stack: QStackedWidget, index: int, parent: QObject, duration: int = 165) -> None:
+    if not 0 <= index < stack.count() or stack.currentIndex() == index:
+        return
+    # Capture the currently composited frame before cancelling an interrupted fade.
+    snapshot = stack.grab() if stack.isVisible() else None
+    current = getattr(stack, "_fade_animation", None)
+    if current is not None:
+        current.stop()
+        current.deleteLater()
+    old_overlay = getattr(stack, "_fade_overlay", None)
+    if old_overlay is not None:
+        old_overlay.hide()
+        old_overlay.deleteLater()
+    stack._fade_animation = None
+    stack._fade_overlay = None
+    # Animate a snapshot, not the live scroll areas and their child effects.
+    stack.setCurrentIndex(index)
+    if snapshot is None:
+        return
+    overlay = TransitionOverlay(snapshot, stack)
+    overlay.setGeometry(stack.rect())
+    overlay.show()
+    overlay.raise_()
+    animation = QPropertyAnimation(overlay, b"opacity", parent)
+    animation.setDuration(duration)
+    animation.setStartValue(1.0)
+    animation.setEndValue(0.0)
+    animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+    stack._fade_animation = animation
+    stack._fade_overlay = overlay
+
+    def finish():
+        if stack._fade_animation is animation:
+            stack._fade_animation = None
+            stack._fade_overlay = None
+        overlay.hide()
+        overlay.deleteLater()
+        animation.deleteLater()
+
+    animation.finished.connect(finish)
+    animation.start()
+
+
+class CurrentPageStack(QStackedWidget):
+    """Let a scrollable form size itself to the visible step only."""
+
+    def __init__(self):
+        super().__init__()
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def sizeHint(self):
+        widget = self.currentWidget()
+        return widget.sizeHint() if widget is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        widget = self.currentWidget()
+        return widget.minimumSizeHint() if widget is not None else super().minimumSizeHint()
+
+
+def animate_visibility(widget: QWidget, visible: bool, duration: int = 180) -> None:
+    target = bool(visible)
+    current_target = getattr(widget, "_visibility_target", not widget.isHidden())
+    if target == current_target and (target == (not widget.isHidden()) or getattr(widget, "_visibility_animation", None)):
+        return
+    previous = getattr(widget, "_visibility_animation", None)
+    if previous is not None:
+        previous.stop()
+        previous.deleteLater()
+    widget._visibility_animation = None
+
+    widget._visibility_target = target
+    if not widget.parentWidget() or not widget.parentWidget().isVisible():
+        limits = getattr(widget, "_visibility_limits", None)
+        if limits is not None:
+            widget.setMinimumHeight(limits[0])
+            widget.setMaximumHeight(limits[1])
+        widget.setVisible(target)
+        widget._visibility_animation = None
+        return
+    limits = getattr(widget, "_visibility_limits", (widget.minimumHeight(), widget.maximumHeight()))
+    widget._visibility_limits = limits
+    widget.setMinimumHeight(0)
+    if target:
+        if widget.isHidden():
+            widget.setMaximumHeight(0)
+            widget.show()
+        layout = widget.layout()
+        if layout is not None:
+            layout.activate()
+        start = min(widget.maximumHeight(), max(0, widget.height()))
+        end = min(limits[1], max(limits[0], widget.sizeHint().height(), widget.minimumSizeHint().height(), 1))
+    else:
+        if widget.isHidden():
+            widget.setMinimumHeight(limits[0])
+            widget.setMaximumHeight(limits[1])
+            return
+        start = min(widget.maximumHeight(), widget.height())
+        end = 0
+
+    animation = QPropertyAnimation(widget, b"maximumHeight", widget)
+    animation.setDuration(duration)
+    animation.setStartValue(start)
+    animation.setEndValue(end)
+    animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def finish():
+        if getattr(widget, "_visibility_animation", None) is not animation:
+            return
+        if not target:
+            widget.hide()
+        widget.setMinimumHeight(limits[0])
+        widget.setMaximumHeight(limits[1])
+        widget._visibility_animation = None
+        animation.deleteLater()
+
+    widget._visibility_animation = animation
+    animation.finished.connect(finish)
+    animation.start()
+
+
+class BusyIndicator(QWidget):
+    def __init__(self, color: str = "#b6eb32", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._color = QColor(color)
+        self._angle = 0
+        self.setFixedSize(18, 18)
+        self._timer = QTimer(self)
+        self._timer.setInterval(55)
+        self._timer.timeout.connect(self._advance)
+        self.hide()
+
+    def set_running(self, running: bool):
+        if running:
+            self._angle = 0
+            self._timer.start()
+            self.show()
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def _advance(self):
+        self._angle = (self._angle + 24) % 360
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self._color, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRectF(3, 3, 12, 12), self._angle * 16, 255 * 16)
+
+
+class ToastNotice(QFrame):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("toastNotice")
+        self.setProperty("variant", "success")
+        row = set_margins(QHBoxLayout(self), 15, 11, 16, 11, 8)
+        self.message = label("", "toastText", True)
+        row.addWidget(self.message)
+        self.setMinimumWidth(270)
+        self.setMaximumWidth(430)
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity)
+        self._animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.finished.connect(self._opacity_finished)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._fade_out)
+        self.hide()
+
+    def show_message(self, message: str, variant: str = "success"):
+        self._hide_timer.stop()
+        self._animation.stop()
+        self.setProperty("variant", variant if variant in {"success", "info", "error"} else "info")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.message.setText(message)
+        self.adjustSize()
+        self._position()
+        if self.isHidden():
+            self._opacity.setOpacity(0.0)
+        self.show()
+        self.raise_()
+        self._animate_opacity(1.0, 160)
+        self._hide_timer.start(2400)
+
+    def _position(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.move(max(16, parent.width() - self.width() - 24), 20)
+
+    def _animate_opacity(self, target: float, duration: int):
+        self._animation.stop()
+        self._animation.setDuration(duration)
+        self._animation.setStartValue(self._opacity.opacity())
+        self._animation.setEndValue(target)
+        self._animation.start()
+
+    def _opacity_finished(self):
+        if self._opacity.opacity() == 0.0:
+            self.hide()
+
+    def _fade_out(self):
+        self._animate_opacity(0.0, 180)
 
 
 def label(text: str, object_name: str | None = None, wrap: bool = False) -> QLabel:
@@ -328,15 +567,28 @@ class MetricCard(QFrame):
         super().__init__()
         self.setObjectName("metricCard")
         self.setMinimumHeight(125)
+        self._progress_value = max(0, min(progress, 100))
         layout = set_margins(QVBoxLayout(self), 15, 13, 15, 13, 7)
         layout.addWidget(label(title.upper(), "cardKicker"))
         layout.addWidget(label(value, "metricValue"))
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setValue(max(0, min(progress, 100)))
-        bar.setTextVisible(False)
-        layout.addWidget(bar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(label(note, "metricNote"))
+        self._progress_animation = QPropertyAnimation(self.progress_bar, b"value", self)
+        self._progress_animation.setDuration(330)
+        self._progress_animation.setStartValue(0)
+        self._progress_animation.setEndValue(self._progress_value)
+        self._progress_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._progress_started = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._progress_started:
+            self._progress_started = True
+            self._progress_animation.start()
 
 
 class RuleRow(QWidget):
@@ -523,6 +775,7 @@ class DashboardPage(QScrollArea):
 
 class NewTaskPage(QScrollArea):
     task_created = Signal(object)
+    notice_requested = Signal(str, str)
 
     def __init__(self, state: TaskState):
         super().__init__()
@@ -533,6 +786,9 @@ class NewTaskPage(QScrollArea):
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
         root.addWidget(PageHeader("任务设置", "准备优化任务", "先记录设备与测试条件；完成实际基线测试后，再录入结果并开始分析。"))
         self.setup_stage = QWidget()
+        self.stage_stack = CurrentPageStack()
+        self.stage_stack.addWidget(self.setup_stage)
+        root.addWidget(self.stage_stack)
         setup_layout = set_margins(QVBoxLayout(self.setup_stage), spacing=18)
         columns = QHBoxLayout()
         columns.setSpacing(15)
@@ -624,7 +880,7 @@ class NewTaskPage(QScrollArea):
         laptop_form.addRow("供电模式", self.power_mode_input)
         laptop_form.addRow("风扇 / 散热模式", self.cooling_mode_input)
         setup_layout.addWidget(self.laptop_card)
-        self._update_laptop_fields()
+        self._update_laptop_fields(animate=False)
         advanced_card, advanced_form = self._form_card("CS2 高级视频设置")
         self.advanced_video_inputs: dict[str, QComboBox] = {}
         advanced_definitions = [
@@ -666,7 +922,6 @@ class NewTaskPage(QScrollArea):
         self.begin_baseline_button.clicked.connect(self._begin_baseline)
         buttons.addWidget(self.begin_baseline_button)
         setup_layout.addLayout(buttons)
-        root.addWidget(self.setup_stage)
         self.baseline_stage = QWidget()
         baseline_layout = set_margins(QVBoxLayout(self.baseline_stage), spacing=16)
         baseline_layout.addWidget(PageHeader(
@@ -719,8 +974,7 @@ class NewTaskPage(QScrollArea):
         finish_baseline_button.clicked.connect(self._finish_baseline)
         baseline_buttons.addWidget(finish_baseline_button)
         baseline_layout.addLayout(baseline_buttons)
-        root.addWidget(self.baseline_stage)
-        self.baseline_stage.hide()
+        self.stage_stack.addWidget(self.baseline_stage)
         root.addStretch()
 
     @staticmethod
@@ -749,7 +1003,7 @@ class NewTaskPage(QScrollArea):
 
     def _resolution_mode_changed(self, index: int):
         custom = index == self.resolution_input.count() - 1
-        self.custom_resolution_input.setVisible(custom)
+        animate_visibility(self.custom_resolution_input, custom)
         if custom:
             self.custom_resolution_input.setFocus()
 
@@ -780,19 +1034,23 @@ class NewTaskPage(QScrollArea):
 
     def _hardware_mode_changed(self, combo: QComboBox, custom_input: QLineEdit, index: int):
         custom = isinstance(combo.itemData(index), str) and combo.itemData(index).startswith("custom_")
-        custom_input.setVisible(custom)
+        animate_visibility(custom_input, custom)
         if custom:
             custom_input.setFocus()
         if hasattr(self, "laptop_card"):
             self._update_laptop_fields()
 
-    def _update_laptop_fields(self):
+    def _update_laptop_fields(self, animate: bool = True):
         entries = (self.cpu_input.currentData(), self.gpu_input.currentData())
         is_laptop = any(
             (isinstance(entry, HardwareEntry) and entry.segment == "Laptop") or entry == "custom_laptop"
             for entry in entries
         )
-        self.laptop_card.setVisible(is_laptop)
+        if animate:
+            animate_visibility(self.laptop_card, is_laptop)
+        else:
+            self.laptop_card.setVisible(is_laptop)
+            self.laptop_card._visibility_target = is_laptop
 
     def _begin_baseline(self):
         if not self.name_input.text().strip():
@@ -853,13 +1111,17 @@ class NewTaskPage(QScrollArea):
             key: str(combo.currentData()) for key, combo in self.advanced_video_inputs.items()
         }
         self.state.video_settings["menu_fps_cap"] = str(self.menu_cap_input.value())
-        self.setup_stage.hide()
-        self.baseline_stage.show()
+        self._switch_stage(1)
         self._refresh_baseline_guidance()
 
     def _return_to_setup(self):
-        self.baseline_stage.hide()
-        self.setup_stage.show()
+        self._switch_stage(0)
+
+    def _switch_stage(self, index: int):
+        if self.stage_stack.currentIndex() == index:
+            return
+        fade_stack_to(self.stage_stack, index, self)
+        QTimer.singleShot(0, lambda: self.verticalScrollBar().setValue(0))
 
     def _refresh_baseline_guidance(self, *_args):
         first_two = self.baseline_run_inputs[:2]
@@ -868,7 +1130,7 @@ class NewTaskPage(QScrollArea):
             for run in first_two
         )
         if not complete:
-            self.baseline_run_rows[2].hide()
+            animate_visibility(self.baseline_run_rows[2], False)
             self.baseline_guidance.setText("先录入前两次实际结果；GPU 占用可不填。")
             return
         averages = [run["avg_fps"].value() for run in first_two]
@@ -879,7 +1141,7 @@ class NewTaskPage(QScrollArea):
             return (max(values) - min(values)) / centre * 100 if centre else float("inf")
 
         needs_third = max(spread(averages), spread(lows)) > 5.0
-        self.baseline_run_rows[2].setVisible(needs_third)
+        animate_visibility(self.baseline_run_rows[2], needs_third)
         if needs_third:
             third_complete = (
                 self.baseline_run_inputs[2]["avg_fps"].value() > 0
@@ -952,6 +1214,7 @@ class NewTaskPage(QScrollArea):
 class ExperimentPage(QScrollArea):
     result_saved = Signal(dict)
     rollback_requested = Signal()
+    notice_requested = Signal(str, str)
 
     def __init__(self, state: TaskState, plan: ExperimentPlan | None = None):
         super().__init__()
@@ -1271,6 +1534,7 @@ class ExperimentPage(QScrollArea):
             self._csv_metrics = metrics
             self._csv_values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
             self.notes.setPlainText(f"已导入 CSV（{metrics['format']}）。保存前请核对测试条件。")
+            self.notice_requested.emit("测试数据已导入，请核对测试条件", "success")
 
     def _save(self):
         if self.completed:
@@ -1324,6 +1588,7 @@ class HistoryPage(QWidget):
     def __init__(self, state: TaskState, tasks: list[dict] | None = None):
         super().__init__()
         self.state = state
+        self._highlight_generation = 0
         root = set_margins(QVBoxLayout(self), 34, 27, 34, 36, 16)
         root.addWidget(PageHeader("实验记录", "查看每轮测试结果", "只有已经执行、且测试条件一致的记录才会用于比较。"))
         restore_row = QHBoxLayout()
@@ -1384,8 +1649,25 @@ class HistoryPage(QWidget):
         for col, value in enumerate(values):
             item = QTableWidgetItem(value)
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setBackground(QColor("#eff7dc"))
+            if col == 0:
+                self._highlight_generation += 1
+                item.setData(Qt.ItemDataRole.UserRole, self._highlight_generation)
             self.table.setItem(row, col, item)
         self.table.setRowHeight(row, 46)
+        generation = self._highlight_generation
+        QTimer.singleShot(1200, lambda target_row=row, token=generation: self._clear_row_highlight(target_row, token))
+
+    def _clear_row_highlight(self, row: int, generation: int):
+        if row >= self.table.rowCount():
+            return
+        first = self.table.item(row, 0)
+        if first is None or first.data(Qt.ItemDataRole.UserRole) != generation:
+            return
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setBackground(QBrush())
 
     def load_history(self, records: list[dict]):
         """Render persisted benchmark records after a task is restored."""
@@ -1431,6 +1713,7 @@ class ReportPage(QScrollArea):
         page_body = QWidget()
         self.setWidget(page_body)
         root = set_margins(QVBoxLayout(page_body), 34, 27, 34, 36, 16)
+        reveal_targets: list[QWidget] = []
         root.addWidget(PageHeader("优化结果", "已验证的最佳配置", "这里只汇总实际测试过、且测试条件一致的结果。"))
         empty = QFrame()
         empty.setObjectName("card")
@@ -1453,6 +1736,7 @@ class ReportPage(QScrollArea):
         summary_text.setMinimumHeight(42)
         empty_layout.addWidget(summary_text, 0, Qt.AlignmentFlag.AlignHCenter)
         root.addWidget(empty)
+        reveal_targets.append(empty)
         if explanation:
             summary_card = QFrame()
             summary_card.setObjectName("card")
@@ -1478,6 +1762,7 @@ class ReportPage(QScrollArea):
                 warning.setMinimumHeight(max(30, warning.sizeHint().height()))
                 summary_layout.addWidget(warning)
             root.addWidget(summary_card)
+            reveal_targets.append(summary_card)
         if best_record:
             snapshot = QFrame()
             snapshot.setObjectName("card")
@@ -1489,6 +1774,7 @@ class ReportPage(QScrollArea):
                     snapshot_layout.addWidget(RuleRow(key, value))
             snapshot_layout.addWidget(RuleRow("验证结果", f"{best_record.avg_fps:.0f} FPS / {best_record.low_fps:.0f} 1% Low"))
             root.addWidget(snapshot)
+            reveal_targets.append(snapshot)
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
         completed = max(0, int(completed_count if completed_count is not None else 0))
@@ -1503,15 +1789,61 @@ class ReportPage(QScrollArea):
             low_delta = 0.0
         status = "已评估" if decision else "等待实验"
         denominator = max(1, int(max_rounds))
-        metrics.addWidget(MetricCard("已完成实验", f"{completed} / {denominator}", "实验进度", min(100, round(completed / denominator * 100))))
-        metrics.addWidget(MetricCard("平均 FPS 改善", f"{avg_delta:+.1f}%", status, min(100, max(0, 50 + round(avg_delta * 5)))))
-        metrics.addWidget(MetricCard("1% LOW 改善", f"{low_delta:+.1f}%", status, min(100, max(0, 50 + round(low_delta * 5)))))
+        metric_cards = [
+            MetricCard("已完成实验", f"{completed} / {denominator}", "实验进度", min(100, round(completed / denominator * 100))),
+            MetricCard("平均 FPS 改善", f"{avg_delta:+.1f}%", status, min(100, max(0, 50 + round(avg_delta * 5)))),
+            MetricCard("1% LOW 改善", f"{low_delta:+.1f}%", status, min(100, max(0, 50 + round(low_delta * 5)))),
+        ]
+        for card in metric_cards:
+            metrics.addWidget(card)
         root.addLayout(metrics)
         root.addStretch()
+        if explanation or best_record or last_decision or result:
+            reveal_targets.extend(metric_cards)
+            for widget in reveal_targets:
+                effect = QGraphicsOpacityEffect(widget)
+                effect.setOpacity(0.0)
+                widget.setGraphicsEffect(effect)
+            self._reveal_targets = reveal_targets
+            self._reveal_animation: QParallelAnimationGroup | None = None
+            self._reveal_started = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "_reveal_targets") and not self._reveal_started:
+            self._reveal_started = True
+            self._start_reveal()
+
+    def _start_reveal(self):
+        group = QParallelAnimationGroup(self)
+        for index, widget in enumerate(self._reveal_targets):
+            effect = widget.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                continue
+            sequence = QSequentialAnimationGroup(group)
+            if index:
+                sequence.addAnimation(QPauseAnimation(min(index * 32, 160), sequence))
+            animation = QPropertyAnimation(effect, b"opacity", sequence)
+            animation.setDuration(160)
+            animation.setStartValue(0.0)
+            animation.setEndValue(1.0)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            sequence.addAnimation(animation)
+            group.addAnimation(sequence)
+        self._reveal_animation = group
+        group.finished.connect(self._finish_reveal)
+        group.start()
+
+    def _finish_reveal(self):
+        for widget in self._reveal_targets:
+            widget.setGraphicsEffect(None)
+        self._reveal_animation.deleteLater()
+        self._reveal_animation = None
 
 
 class APISettingsPage(QScrollArea):
     provider_applied = Signal(object)
+    notice_requested = Signal(str, str)
 
     THINKING_OPTIONS = [
         ("关闭（兼容性最好）", None),
@@ -1593,7 +1925,15 @@ class APISettingsPage(QScrollArea):
         buttons.addStretch()
         root.addLayout(buttons)
         self.status = label("尚未启用模型；当前使用本地说明", "sectionMeta", True)
-        root.addWidget(self.status)
+        status_row = QWidget()
+        status_layout = QHBoxLayout(status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(8)
+        self.request_indicator = BusyIndicator()
+        self.status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        status_layout.addWidget(self.status, 1)
+        status_layout.addWidget(self.request_indicator)
+        root.addWidget(status_row)
         root.addStretch()
         self.apply_button.clicked.connect(self._apply)
         self.test_button.clicked.connect(self._test)
@@ -1643,6 +1983,7 @@ class APISettingsPage(QScrollArea):
         self.model.setCurrentText(current or values[0])
         self.model.blockSignals(False)
         self.status.setText(f"已获取 {len(models)} 个模型，可从下拉框选择或继续手动输入。")
+        self.notice_requested.emit(f"已获取 {len(models)} 个可用模型", "success")
 
     def _models_failed(self, generation: int, error: Exception):
         if generation != self._request_generation:
@@ -1677,6 +2018,7 @@ class APISettingsPage(QScrollArea):
             return
         self.remember_config.setChecked(False)
         self.status.setText("已清除本机保存的 API 配置；当前输入仍保留在页面中。")
+        self.notice_requested.emit("已清除本机保存的 API 配置", "success")
 
     def _apply(self):
         try:
@@ -1687,6 +2029,7 @@ class APISettingsPage(QScrollArea):
         self.provider_applied.emit(provider)
         persistence = self._persist_config(provider.config)
         self.status.setText(f"已启用 {provider.config.model} · 思考模式：{self.reasoning.currentText()}{persistence}")
+        self.notice_requested.emit("模型配置已应用", "success")
 
     def _test(self):
         try:
@@ -1718,7 +2061,7 @@ class APISettingsPage(QScrollArea):
         preview = response.content.strip().replace("\n", " ")[:120]
         persistence = self._persist_config(provider.config)
         self.status.setText(f"连接成功 · {response.model} · {preview}{persistence}")
-        QMessageBox.information(self, "连接测试", f"连接成功\n模型：{response.model}\n响应：{preview}")
+        self.notice_requested.emit(f"模型连接成功 · {response.model}", "success")
 
     def _test_failed(self, generation: int, error: Exception):
         if generation != self._request_generation:
@@ -1730,6 +2073,7 @@ class APISettingsPage(QScrollArea):
         QMessageBox.warning(self, "连接测试失败", message)
 
     def _start_model_worker(self, operation, on_success, on_failure):
+        self.request_indicator.set_running(True)
         self._model_generation += 1
         job_id = self._model_generation
         thread = QThread(self)
@@ -1763,6 +2107,7 @@ class APISettingsPage(QScrollArea):
     def _model_call_finished(self, job_id: int, thread: QThread):
         self._model_jobs.pop(job_id, None)
         self._model_callbacks.pop(job_id, None)
+        self.request_indicator.set_running(bool(self._model_jobs))
         if self._model_thread is thread:
             self._model_worker = None
             self._model_thread = None
@@ -1831,8 +2176,18 @@ class Sidebar(QFrame):
             button.setMinimumHeight(39)
             self.group.addButton(button, index)
             root.addWidget(button)
+        self.nav_indicator = QFrame(self)
+        self.nav_indicator.setObjectName("navIndicator")
+        self.nav_indicator.setFixedWidth(3)
+        self.nav_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        # Reuse one animation for the lifetime of the sidebar.  A cancelled
+        # animation must never leave a Python reference to a deleted Qt object.
+        self._indicator_animation = QPropertyAnimation(self.nav_indicator, b"geometry", self)
+        self._indicator_animation.setDuration(180)
+        self._indicator_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.group.button(0).setChecked(True)
         self.group.idClicked.connect(self.navigate)
+        QTimer.singleShot(0, self._sync_indicator)
         root.addSpacing(16)
         root.addWidget(hline())
         root.addSpacing(12)
@@ -1851,6 +2206,35 @@ class Sidebar(QFrame):
     def update_task(self):
         self.task_title.setText(f"●  {self.state.name}")
         self.task_text.setText(f"第 {self.state.round_number} 轮 · {self.state.step}\n{self.state.game}")
+
+    def set_active(self, index: int, animated: bool = True):
+        button = self.group.button(index)
+        if button is None:
+            return
+        button.setChecked(True)
+        position = button.mapTo(self, button.rect().topLeft())
+        target = button.geometry().translated(position - button.geometry().topLeft())
+        target.setWidth(3)
+        self._indicator_animation.stop()
+        if not self.nav_indicator.isVisible() or not animated:
+            self.nav_indicator.setGeometry(target)
+            self.nav_indicator.show()
+            self.nav_indicator.raise_()
+            return
+        self._indicator_animation.setStartValue(self.nav_indicator.geometry())
+        self._indicator_animation.setEndValue(target)
+        self._indicator_animation.start()
+
+    def _sync_indicator(self):
+        self.set_active(self.group.checkedId(), animated=False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._sync_indicator)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._sync_indicator)
 
 
 class MainWindow(QMainWindow):
@@ -1899,8 +2283,12 @@ class MainWindow(QMainWindow):
         root.setObjectName("root")
         self.setCentralWidget(root)
         layout = set_margins(QHBoxLayout(root), spacing=0)
+        self.toast_notice = ToastNotice(root)
         self.sidebar = Sidebar(self.state)
         self.stack = QStackedWidget()
+        self._busy_operations: set[tuple[str, int]] = set()
+        self.busy_indicator = BusyIndicator(parent=self)
+        self.statusBar().addPermanentWidget(self.busy_indicator)
         self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan)
         self.new_task = NewTaskPage(self.state)
         self.experiment = ExperimentPage(self.state, self.current_plan)
@@ -1914,10 +2302,13 @@ class MainWindow(QMainWindow):
         self.sidebar.navigate.connect(self.set_page)
         self.dashboard.experiment_requested.connect(lambda: self.set_page(2))
         self.new_task.task_created.connect(self._task_created)
+        self.new_task.notice_requested.connect(self._show_toast)
         self.experiment.result_saved.connect(self._result_saved)
+        self.experiment.notice_requested.connect(self._show_toast)
         self.experiment.rollback_requested.connect(self._confirm_pending_rollback)
         self.history.task_restore_requested.connect(self._restore_task)
         self.api_settings.provider_applied.connect(self._apply_model_provider)
+        self.api_settings.notice_requested.connect(self._show_toast)
         if self.api_config_error:
             self.statusBar().showMessage(f"模型未启用 · {self.api_config_error}", 0)
         elif model_provider:
@@ -1934,10 +2325,26 @@ class MainWindow(QMainWindow):
             self._start_plan_selection()
 
     def set_page(self, index: int):
-        self.stack.setCurrentIndex(index)
-        button = self.sidebar.group.button(index)
-        if button:
-            button.setChecked(True)
+        if not 0 <= index < self.stack.count():
+            return
+        fade_stack_to(self.stack, index, self)
+        self.sidebar.set_active(index)
+
+    def _show_toast(self, message: str, variant: str = "success"):
+        self.toast_notice.show_message(message, variant)
+
+    def _set_busy_operation(self, category: str, job_id: int, active: bool):
+        key = (category, job_id)
+        if active:
+            self._busy_operations.add(key)
+        else:
+            self._busy_operations.discard(key)
+        self.busy_indicator.set_running(bool(self._busy_operations))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "toast_notice") and self.toast_notice.isVisible():
+            self.toast_notice._position()
 
     def _available_tasks(self) -> list[dict]:
         """Read task summaries when the repository exposes the list API."""
@@ -2081,8 +2488,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"任务已保存 · 已生成 {len(evidence)} 条证据", 5000)
         if plan.action != AgentAction.FINISH:
             self._start_plan_selection()
-        QMessageBox.information(self, "任务已保存", f"任务和基线数据已保存。\n\n下一步：{plan.title}")
         self.set_page(0)
+        self._show_toast(f"任务已保存 · 下一步：{plan.title}")
 
     def _rebuild_task_pages(self, reset_results: bool = False):
         """Rebuild pages whose labels are derived from the newly saved task."""
@@ -2098,6 +2505,7 @@ class MainWindow(QMainWindow):
         old_experiment.deleteLater()
         self.experiment = ExperimentPage(self.state, self.current_plan)
         self.experiment.result_saved.connect(self._result_saved)
+        self.experiment.notice_requested.connect(self._show_toast)
         self.experiment.rollback_requested.connect(self._confirm_pending_rollback)
         self.stack.insertWidget(2, self.experiment)
 
@@ -2229,6 +2637,7 @@ class MainWindow(QMainWindow):
         if plan.action != AgentAction.FINISH:
             self._start_plan_selection()
         self.set_page(0)
+        self._show_toast("已记录补充信息，并更新下一步计划")
 
     def _sync_state_from_core_task(self):
         if not self.core_task:
@@ -2386,6 +2795,7 @@ class MainWindow(QMainWindow):
             self.state.step = "诊断实验完成" if decision.diagnostic_summary else "复测评估完成"
         self.sidebar.update_task()
         self.history.add_result(result, decision, evaluated_round)
+        self._show_toast("复测结果已保存，正在整理分析")
         if decision.action == AgentAction.RETEST:
             current = self.controller.current_record(self.core_task.task_id) if self.core_task else candidate
             if current:
@@ -2482,6 +2892,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda token=job_id, running_thread=thread: self._planning_thread_finished(token, running_thread))
         self._planning_jobs[job_id] = (thread, worker, job_context)
+        self._set_busy_operation("planning", job_id, True)
         self.experiment.set_planning(True)
         self.statusBar().showMessage("AI 正在比较可执行的下一步，当前计划已暂时锁定……", 0)
         thread.start()
@@ -2545,6 +2956,8 @@ class MainWindow(QMainWindow):
 
     def _planning_thread_finished(self, job_id: int, thread: QThread):
         self._planning_jobs.pop(job_id, None)
+        self._set_busy_operation("planning", job_id, False)
+        thread.deleteLater()
 
     def _start_explanation(self, context: dict):
         self._explanation_generation += 1
@@ -2581,6 +2994,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda token=job_id, running_thread=thread: self._explanation_thread_finished(token, running_thread))
         self._explanation_jobs[job_id] = (thread, worker, job_context)
+        self._set_busy_operation("explanation", job_id, True)
         self._explanation_thread, self._explanation_worker = thread, worker
         self.statusBar().showMessage("正在整理结果，界面仍可操作……", 0)
         thread.start()
@@ -2640,6 +3054,7 @@ class MainWindow(QMainWindow):
 
     def _explanation_thread_finished(self, job_id: int, thread: QThread):
         self._explanation_jobs.pop(job_id, None)
+        self._set_busy_operation("explanation", job_id, False)
         if self._explanation_thread is thread:
             self._explanation_worker = None
             self._explanation_thread = None
