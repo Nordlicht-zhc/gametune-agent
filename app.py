@@ -7,14 +7,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
-from PySide6.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QBrush
+from PySide6.QtCore import QObject, QEvent, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
+from PySide6.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QBrush, QPainterPath, QRegion
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
     QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget, QAbstractSpinBox, QDoubleSpinBox,
+    QWidget, QAbstractSpinBox, QDoubleSpinBox, QStyle, QStyleOptionComboBox,
     QCheckBox,
     QGraphicsOpacityEffect,
 )
@@ -95,7 +95,58 @@ class TaskState:
             }
 
 
-class ActualSettingInput(QComboBox):
+class RoundedComboBox(QComboBox):
+    """Clip the popup window as well as painting a rounded list border."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        arrow_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, option,
+            QStyle.SubControl.SC_ComboBoxArrow, self,
+        )
+        center = QRectF(arrow_rect).center()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor("#505752" if self.isEnabled() else "#a5aca6")
+        painter.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        path = QPainterPath()
+        path.moveTo(center.x() - 4, center.y() - 2)
+        path.lineTo(center.x(), center.y() + 2)
+        path.lineTo(center.x() + 4, center.y() - 2)
+        painter.drawPath(path)
+
+    def showPopup(self):
+        view = self.view()
+        popup = view.window()
+        # The native popup frame/shadow sits outside the rounded list border.
+        popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        popup.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
+        if isinstance(popup, QFrame):
+            popup.setFrameShape(QFrame.Shape.NoFrame)
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        popup.setObjectName("comboPopup")
+        popup.setStyleSheet("QWidget#comboPopup { background: #ffffff; border: none; border-radius: 10px; }")
+        popup.installEventFilter(self)
+        super().showPopup()
+        self._round_popup(popup)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            if watched is self.view().window():
+                self._round_popup(watched)
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _round_popup(popup: QWidget):
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(popup.rect()), 10, 10)
+        popup.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+class ActualSettingInput(RoundedComboBox):
     """A selectable setting editor with QLineEdit-compatible text helpers."""
 
     def __init__(self, value: str, options: list[str]):
@@ -192,7 +243,11 @@ QLineEdit[readOnly="true"], QTextEdit[readOnly="true"] {
     color: #737a75;
     border-color: #e0e3df;
 }
-QComboBox QAbstractItemView { background: #ffffff; color: #202422; border: 1px solid #cfd5cf; outline: none; selection-background-color: #b8e64a; selection-color: #172018; }
+QComboBox { border-radius: 10px; padding-right: 30px; }
+QComboBox QLineEdit { border: none; border-radius: 0; padding: 0; background: transparent; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 24px; border: none; border-top-right-radius: 10px; border-bottom-right-radius: 10px; background: transparent; }
+QComboBox::down-arrow { image: none; width: 0; height: 0; }
+QComboBox QAbstractItemView { border-radius: 10px; padding: 5px; background: #ffffff; color: #202422; border: 1px solid #cfd5cf; outline: none; selection-background-color: #b8e64a; selection-color: #172018; }
 QComboBox QAbstractItemView::item { min-height: 30px; padding: 4px 9px; }
 QMessageBox { background-color: #ffffff; }
 QMessageBox QLabel { background: transparent; color: #202422; min-width: 300px; }
@@ -622,26 +677,26 @@ class DashboardPage(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 16)
-        root.addWidget(PageHeader("性能概览", "当前性能与下一步", "查看当前表现，并按建议完成一项对照测试。每轮只改一个变量。", "可以开始"))
-        root.addWidget(SectionHeader("当前表现", "基线测试中位数"))
+        root.addWidget(PageHeader("性能概览", "当前性能与下一步", "看看游戏现在跑得怎么样，以及接下来该做什么。", "可以开始"))
+        root.addWidget(SectionHeader("当前表现", "优化前的测试结果（中位数）"))
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(12)
         cards = [
             MetricCard("平均帧率", f"{state.avg_fps} FPS", f"目标 {state.target_avg} FPS", round(state.avg_fps / state.target_avg * 100)),
             MetricCard("1% LOW", f"{state.low_fps} FPS", "当前重点", round(state.low_fps / state.target_low * 100)),
-            MetricCard("GPU 占用", f"{state.gpu_usage}%", "用于辅助判断瓶颈", state.gpu_usage),
+            MetricCard("GPU 占用", f"{state.gpu_usage}%", "帮助分析性能受限的原因", state.gpu_usage),
             MetricCard("目标完成度", f"{self._score():.0f} / 100", self._mode_name(), round(self._score())),
         ]
         for index, card in enumerate(cards):
             metrics.addWidget(card, 0, index)
         root.addLayout(metrics)
-        root.addWidget(SectionHeader("当前判断", "仅根据已记录数据"))
+        root.addWidget(SectionHeader("当前判断", "根据你提供的测试结果分析"))
         diagnosis = QHBoxLayout()
         diagnosis.setSpacing(14)
         diagnosis.addWidget(self._hero(), 3)
         diagnosis.addWidget(self._timeline(), 2)
         root.addLayout(diagnosis)
-        root.addWidget(SectionHeader("下一步", "只改一个变量"))
+        root.addWidget(SectionHeader("下一步", "每次只改一项设置"))
         bottom = QHBoxLayout()
         bottom.setSpacing(14)
         bottom.addWidget(self._action_card(), 3)
@@ -784,7 +839,7 @@ class NewTaskPage(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
-        root.addWidget(PageHeader("任务设置", "准备优化任务", "先记录设备与测试条件；完成实际基线测试后，再录入结果并开始分析。"))
+        root.addWidget(PageHeader("任务设置", "准备优化任务", "先填电脑配置和游戏设置，再测一下优化前的帧率。"))
         self.setup_stage = QWidget()
         self.stage_stack = CurrentPageStack()
         self.stage_stack.addWidget(self.setup_stage)
@@ -798,13 +853,13 @@ class NewTaskPage(QScrollArea):
         columns.addWidget(goal_card, 1)
         setup_layout.addLayout(columns)
         self.name_input = QLineEdit(state.name)
-        self.game_input = QComboBox()
+        self.game_input = RoundedComboBox()
         # Keep unsupported titles out of the selectable task domain until a
         # corresponding rule set and validator are shipped.
         self.game_input.addItem("Counter-Strike 2")
         cpu_field, self.cpu_input, self.custom_cpu_input = self._hardware_field("cpu", state.cpu, state.is_laptop)
         gpu_field, self.gpu_input, self.custom_gpu_input = self._hardware_field("gpu", state.gpu, state.is_laptop)
-        self.resolution_input = QComboBox()
+        self.resolution_input = RoundedComboBox()
         for preset in RESOLUTION_PRESETS:
             self.resolution_input.addItem(f"{aspect_ratio_name(preset)}  ·  {preset}", preset)
         self.resolution_input.addItem("自定义分辨率…", None)
@@ -823,10 +878,10 @@ class NewTaskPage(QScrollArea):
             self.custom_resolution_input.setText(state.resolution)
             self.custom_resolution_input.setVisible(True)
         self.resolution_input.currentIndexChanged.connect(self._resolution_mode_changed)
-        self.refresh_input = QComboBox()
+        self.refresh_input = RoundedComboBox()
         self.refresh_input.addItems(["300 Hz", "240 Hz", "165 Hz", "144 Hz"])
         self.scene_input = QLineEdit(state.test_scene)
-        self.display_mode_input = QComboBox()
+        self.display_mode_input = RoundedComboBox()
         self.display_mode_input.addItem("全屏", "fullscreen")
         self.display_mode_input.addItem("全屏窗口模式", "borderless")
         self.display_mode_input.addItem("窗口模式", "windowed")
@@ -834,15 +889,15 @@ class NewTaskPage(QScrollArea):
         self.cap_input = self._spin(-1, 1000, state.fps_cap if state.fps_cap is not None else -1, 10)
         self.cap_input.setSpecialValueText("未确认")
         self.cap_input.setToolTip("填写游戏内“最大 FPS”；0 表示不限制")
-        self.vsync_input = QComboBox()
+        self.vsync_input = RoundedComboBox()
         self.vsync_input.addItem("已禁用", "disabled")
         self.vsync_input.addItem("已启用", "enabled")
         self.vsync_input.addItem("未确认", "unknown")
         self.vsync_input.setCurrentIndex(max(0, self.vsync_input.findData(state.vsync)))
-        self.shadow_quality_input = QComboBox()
+        self.shadow_quality_input = RoundedComboBox()
         self.shadow_quality_input.addItems(["低", "中", "高", "非常高", "未确认"])
         self.shadow_quality_input.setCurrentText(state.shadow_quality if state.shadow_quality != "unknown" else "未确认")
-        self.dynamic_shadows_input = QComboBox()
+        self.dynamic_shadows_input = RoundedComboBox()
         self.dynamic_shadows_input.addItem("全部", "all")
         self.dynamic_shadows_input.addItem("仅限日光", "sun_only")
         self.dynamic_shadows_input.addItem("未确认", "unknown")
@@ -851,24 +906,24 @@ class NewTaskPage(QScrollArea):
             basic_form.addRow(name, widget)
         self.target_avg = self._spin(30, 1000, state.target_avg, 10)
         self.target_low = self._spin(30, 1000, state.target_low, 10)
-        self.mode_input = QComboBox()
+        self.mode_input = RoundedComboBox()
         self.mode_input.addItems(["竞技模式 · 流畅优先", "平衡模式", "视觉模式 · 画质优先"])
         for name, widget in [("平均 FPS 目标", self.target_avg), ("1% Low 目标", self.target_low), ("优化模式", self.mode_input)]:
             goal_form.addRow(name, widget)
         self.laptop_card, laptop_form = self._form_card("笔记本运行状态")
         self.gpu_power_input = self._spin(0, 250, state.gpu_power_w or 0, 5)
         self.gpu_power_input.setSpecialValueText("未知")
-        self.graphics_mode_input = QComboBox()
+        self.graphics_mode_input = RoundedComboBox()
         self.graphics_mode_input.addItem("独显直连 / dGPU only", "dgpu")
         self.graphics_mode_input.addItem("混合输出 / Optimus", "hybrid")
         self.graphics_mode_input.addItem("Advanced Optimus / 自动切换", "advanced_optimus")
         self.graphics_mode_input.addItem("不确定", "unknown")
-        self.power_mode_input = QComboBox()
+        self.power_mode_input = RoundedComboBox()
         self.power_mode_input.addItem("接通电源 · 性能模式", "ac_performance")
         self.power_mode_input.addItem("接通电源 · 平衡模式", "ac_balanced")
         self.power_mode_input.addItem("电池供电", "battery")
         self.power_mode_input.addItem("不确定", "unknown")
-        self.cooling_mode_input = QComboBox()
+        self.cooling_mode_input = RoundedComboBox()
         self.cooling_mode_input.addItem("性能 / 狂暴模式", "performance")
         self.cooling_mode_input.addItem("平衡模式", "balanced")
         self.cooling_mode_input.addItem("安静模式", "quiet")
@@ -899,7 +954,7 @@ class NewTaskPage(QScrollArea):
             ("fsr", "Fidelity FX 超级分辨率", [("已禁用（最高品质）", "disabled"), ("超高品质", "ultra_quality"), ("品质", "quality"), ("均衡", "balanced"), ("性能", "performance")]),
         ]
         for key, name, options in advanced_definitions:
-            combo = QComboBox()
+            combo = RoundedComboBox()
             for text, value in options:
                 combo.addItem(text, value)
             current = (state.video_settings or {}).get(key, options[0][1])
@@ -913,7 +968,7 @@ class NewTaskPage(QScrollArea):
         advanced_form.addRow("全局阴影效果", self.shadow_quality_input)
         advanced_form.addRow("动态阴影", self.dynamic_shadows_input)
         setup_layout.addWidget(advanced_card)
-        setup_layout.addWidget(label("硬件型号只用于识别设备，性能判断以实测数据为准。不清楚笔记本选项时可以选择“不确定”。", "metricNote", True))
+        setup_layout.addWidget(label("电脑性能要测过才知道；不清楚的设备选项可以选“不确定”。", "metricNote", True))
         buttons = QHBoxLayout()
         buttons.addStretch()
         self.begin_baseline_button = QPushButton("记录环境并进入基线测试")
@@ -927,7 +982,7 @@ class NewTaskPage(QScrollArea):
         baseline_layout.addWidget(PageHeader(
             "基线采集",
             "先测试，再录入结果",
-            "请按上一步记录的相同场景与设置完成测试。每次至少 60 秒，先做 2 次；数据波动较大时再增加第 3 次。",
+            "用相同的场景和设置测 2 次，每次至少 60 秒。两次结果差得多，就再测一次。",
         ))
         baseline_card, baseline_form = self._form_card("逐次测试结果")
         self.baseline_run_inputs: list[dict[str, QSpinBox]] = []
@@ -958,7 +1013,7 @@ class NewTaskPage(QScrollArea):
                 row.hide()
         self.baseline_duration_input = self._spin(60, 3600, max(60, state.baseline_duration_seconds))
         baseline_form.addRow("每次测试时长（秒）", self.baseline_duration_input)
-        self.baseline_guidance = label("先录入前两次结果。", "metricNote", True)
+        self.baseline_guidance = label("先填前两次的测试结果。", "metricNote", True)
         baseline_layout.addWidget(baseline_card)
         baseline_layout.addWidget(self.baseline_guidance)
         self.baseline_confirmed_input = QCheckBox("以上数据来自实际测试；测试期间场景、分辨率和其他设置保持一致")
@@ -1008,7 +1063,7 @@ class NewTaskPage(QScrollArea):
             self.custom_resolution_input.setFocus()
 
     def _hardware_field(self, kind: str, current: str, current_is_laptop: bool):
-        combo = QComboBox()
+        combo = RoundedComboBox()
         entries = HARDWARE_CATALOG.entries(kind)
         for entry in entries:
             combo.addItem(entry.display_name, entry)
@@ -1231,13 +1286,13 @@ class ExperimentPage(QScrollArea):
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
         round_number = plan.round_number if plan else state.round_number
         if plan and plan.action == AgentAction.REQUEST_DATA:
-            subtitle = "这一步只记录实际设置，不需要测试帧率；条件有变化时，请如实选择“有变化”。"
+            subtitle = "填一下你现在使用的设置，这一步不用测帧率。测试环境变了也请注明。"
         elif plan and plan.action == AgentAction.FINISH:
-            subtitle = "当前没有新的测试要求；如需继续，请先补充可验证的设置规则。"
+            subtitle = "暂时没有新的测试建议；补充程序支持的游戏设置后，可以继续优化。"
         elif plan and plan.purpose == "diagnostic":
-            subtitle = "本轮只用于排查性能限制，不会直接作为最佳配置；测试后按提示恢复或补测。"
+            subtitle = "这次测试是为了找出性能受限的原因。测完后，按提示改回原设置或再测一次。"
         else:
-            subtitle = "先测试 1 次筛选明显退步；没有明显下降时，再补测到累计 3 次。条件有变化时，请如实选择“有变化”。"
+            subtitle = "先测一次，帧率没明显变差就继续测满三次。测试环境变了请注明。"
         entry_type = "诊断测试" if plan and plan.purpose == "diagnostic" else "优化验证"
         root.addWidget(PageHeader(entry_type, f"录入第 {round_number} 轮结果", subtitle, "等待录入"))
         columns = QHBoxLayout()
@@ -1263,7 +1318,7 @@ class ExperimentPage(QScrollArea):
         self.gpu = NewTaskPage._spin(0, 100, 59)
         self.repeats = NewTaskPage._spin(1, 10, 1)
         self.duration = NewTaskPage._spin(10, 3600, 60)
-        self.condition = QComboBox()
+        self.condition = RoundedComboBox()
         self.condition.addItems(["与基线一致", "有变化，需要说明"])
         self.actual_cpu = QLineEdit(state.cpu)
         self.actual_gpu = QLineEdit(state.gpu)
@@ -1275,7 +1330,7 @@ class ExperimentPage(QScrollArea):
             self._setting_options(),
         )
         self.is_user_adjustment_request = bool(self.plan and self.plan.setting_id == "user_adjustment")
-        self.adjustment_direction = QComboBox()
+        self.adjustment_direction = RoundedComboBox()
         self.adjustment_direction.addItems(["请选择优化方向", *GENERIC_OPTIMIZATION_DIRECTIONS])
         self.adjustment_setting_name = QLineEdit()
         self.adjustment_setting_name.setPlaceholderText("例如：全局阴影效果")
@@ -1349,7 +1404,7 @@ class ExperimentPage(QScrollArea):
         elif plan and plan.action == AgentAction.FINISH:
             test_requirement = "当前不需要新测试"
         else:
-            test_requirement = "先测 1 次；无明显下降再补到累计 3 次"
+            test_requirement = "先测一次，帧率没明显变差就继续测满三次"
         for name, value in [("测试场景", state.test_scene), ("测试要求", test_requirement), ("基线数据", f"{state.avg_fps} / {state.low_fps} FPS"), ("有效变化", "平均帧率变化超过 5%")]:
             guide_layout.addWidget(hline())
             guide_layout.addWidget(RuleRow(name, value))
@@ -1590,10 +1645,10 @@ class HistoryPage(QWidget):
         self.state = state
         self._highlight_generation = 0
         root = set_margins(QVBoxLayout(self), 34, 27, 34, 36, 16)
-        root.addWidget(PageHeader("实验记录", "查看每轮测试结果", "只有已经执行、且测试条件一致的记录才会用于比较。"))
+        root.addWidget(PageHeader("实验记录", "查看每轮测试结果", "查看每次测试的结果；测试环境相同，结果才能放在一起比较。"))
         restore_row = QHBoxLayout()
         restore_row.addWidget(label("打开以前的任务", "ruleName"))
-        self.task_selector = QComboBox()
+        self.task_selector = RoundedComboBox()
         self.task_selector.setMinimumWidth(320)
         self.task_selector.addItem("当前会话任务", "")
         restore_row.addWidget(self.task_selector, 1)
@@ -1602,7 +1657,7 @@ class HistoryPage(QWidget):
         self.restore_button.clicked.connect(self._restore_selected)
         restore_row.addWidget(self.restore_button)
         root.addLayout(restore_row)
-        root.addWidget(SectionHeader("测试记录", "最新记录在后"))
+        root.addWidget(SectionHeader("测试记录", "最近的测试在最下方"))
         self.table = QTableWidget(1, 7)
         self.table.setHorizontalHeaderLabels(["记录", "分辨率", "平均 FPS", "1% Low", "GPU 占用", "执行状态", "评估"])
         self.table.verticalHeader().setVisible(False)
@@ -1714,7 +1769,7 @@ class ReportPage(QScrollArea):
         self.setWidget(page_body)
         root = set_margins(QVBoxLayout(page_body), 34, 27, 34, 36, 16)
         reveal_targets: list[QWidget] = []
-        root.addWidget(PageHeader("优化结果", "已验证的最佳配置", "这里只汇总实际测试过、且测试条件一致的结果。"))
+        root.addWidget(PageHeader("优化结果", "已验证的最佳配置", "查看测试后可以保留的设置，以及它们的实际表现。"))
         empty = QFrame()
         empty.setObjectName("card")
         empty_layout = set_margins(QVBoxLayout(empty), 30, 35, 30, 35, 8)
@@ -1745,7 +1800,7 @@ class ReportPage(QScrollArea):
             source = f"AI 说明 · {model_name}" if explanation.get("source") == "model" and model_name else (
                 "AI 说明" if explanation.get("source") == "model" else "本地说明"
             )
-            summary_layout.addWidget(SectionHeader(source, "不会修改测试结论"))
+            summary_layout.addWidget(SectionHeader(source, "帮你理解结果，结论以测试为准"))
             for reason in explanation.get("reasoning", []):
                 reason_label = label(f"• {reason}", "ruleText", True)
                 reason_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -1767,7 +1822,7 @@ class ReportPage(QScrollArea):
             snapshot = QFrame()
             snapshot.setObjectName("card")
             snapshot_layout = set_margins(QVBoxLayout(snapshot), 22, 18, 22, 18, 7)
-            snapshot_layout.addWidget(SectionHeader("当前最佳配置", "已经实际测试并通过比较"))
+            snapshot_layout.addWidget(SectionHeader("当前最佳配置", "已经测过并完成比较"))
             configuration = best_record.configuration or {"resolution": best_record.resolution, "test_scene": best_record.test_scene}
             for key, value in configuration.items():
                 if value:
@@ -1864,7 +1919,7 @@ class APISettingsPage(QScrollArea):
         content = QWidget()
         self.setWidget(content)
         root = set_margins(QVBoxLayout(content), 34, 27, 34, 36, 16)
-        root.addWidget(PageHeader("模型设置", "模型说明设置", "模型只负责把分析结果写得更易懂。未配置模型时，核心功能仍可使用。"))
+        root.addWidget(PageHeader("模型设置", "模型说明设置", "连接 AI，帮你选择测试建议、解释结果。不连接也能使用。"))
         card = QFrame()
         card.setObjectName("formCard")
         form = QFormLayout(card)
@@ -1875,7 +1930,7 @@ class APISettingsPage(QScrollArea):
         self.api_key = QLineEdit(config.api_key if config else "")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("密钥只在本次运行中使用；记住时使用 Windows 账户保护")
-        self.model = QComboBox()
+        self.model = RoundedComboBox()
         self.model.setEditable(True)
         self.model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.model.setPlaceholderText("模型名称，例如 your-model-name")
@@ -1891,7 +1946,7 @@ class APISettingsPage(QScrollArea):
         self.timeout.setSuffix(" 秒")
         self.timeout.setValue(config.timeout_seconds if config else 30)
         self.timeout.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.reasoning = QComboBox()
+        self.reasoning = RoundedComboBox()
         for title, value in self.THINKING_OPTIONS:
             self.reasoning.addItem(title, value)
         current_reasoning = config.reasoning_effort if config else None
@@ -1911,7 +1966,7 @@ class APISettingsPage(QScrollArea):
         self.remember_config = QCheckBox("记住本机 API 配置（密钥使用 Windows 账户保护）")
         self.remember_config.setChecked(True)
         root.addWidget(self.remember_config)
-        root.addWidget(label("使用兼容 OpenAI Chat Completions 的接口。如果服务不支持思考模式，请选择“关闭”。密钥不会保存到数据库。", "ruleText", True))
+        root.addWidget(label("请使用支持 OpenAI Chat Completions 的服务。不支持“思考模式”时，选“关闭”。密钥不会存入数据库。", "ruleText", True))
         buttons = QHBoxLayout()
         self.apply_button = QPushButton("应用配置")
         self.apply_button.setObjectName("primaryButton")
