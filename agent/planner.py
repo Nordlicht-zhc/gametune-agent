@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 from models.schemas import AgentAction, BenchmarkRecord, Evidence, ExperimentPlan, OptimizationTask
 from tools.resolution import aspect_ratio_name, lower_resolution_same_aspect
@@ -93,6 +94,30 @@ def plan_next_experiment(
             "本步骤不修改配置。",
             round_number,
             setting_id="fps_cap",
+        )
+    if "cap_active" in codes:
+        config = current.configuration or {}
+        setting_id = "frame_limits"
+        sync_label = {"enabled": "已开启", "disabled": "已关闭", "unknown": "未确认"}.get(str(config.get("vsync", task.vsync)), "未确认")
+        old_value = f"最高 FPS：{config.get('fps_cap', task.fps_cap)}；垂直同步：{sync_label}"
+        new_value = "不限帧且关闭垂直同步"
+        if available(setting_id):
+            return ExperimentPlan(
+                AgentAction.PROPOSE_EXPERIMENT, "临时排除帧率限制", "帧率限制",
+                old_value, new_value, "设置已知不代表限帧影响已排除。",
+                "临时解除限帧并关闭垂直同步，观察同场景帧率变化。",
+                "将游戏最高 FPS 设为 0，并关闭垂直同步；其他设置与测试条件不变。先测 1 次，结论不明确时补测；结束后恢复这两项原值。若驱动或外部工具仍有限帧，请注明测试条件变化，不用于判断瓶颈。",
+                "实际配置已确认，测试有效且可比；记录帧率变化，不将诊断结果作为最佳配置。",
+                f"恢复本项原值：{old_value}。", round_number, setting_id=setting_id, purpose="diagnostic",
+                required_configuration={"fps_cap": "0", "vsync": "disabled"},
+            )
+        return ExperimentPlan(
+            AgentAction.FINISH, "限帧条件下暂不判断硬件瓶颈", "帧率限制", old_value, old_value,
+            "已完成临时排除测试并恢复原配置，当前测量仍处于可能限帧的条件。",
+            "恢复原限制后的数据不能直接用于分辨率瓶颈对比。",
+            "查看诊断结论；如需继续硬件诊断，请用关闭垂直同步、解除限帧的配置建立新的有效基线任务。",
+            "不把低 GPU 占用认定为 CPU 瓶颈，不报告未经正式验证的收益。",
+            "原配置已恢复，无需继续修改。", round_number, setting_id="frame_limit_result", purpose="diagnostic",
         )
     if "laptop_power_unknown" in codes and available("gpu_power_w"):
         return ExperimentPlan(
@@ -481,5 +506,8 @@ def plan_candidate_id(plan: ExperimentPlan) -> str:
         plan.new_value,
         plan.purpose,
         str(plan.round_number),
+        plan.reference_record_id,
+        plan.diagnostic_record_id,
+        json.dumps(plan.required_configuration, sort_keys=True),
     ))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]

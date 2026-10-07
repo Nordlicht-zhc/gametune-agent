@@ -11,7 +11,7 @@ class ThemeRegressionTests(unittest.TestCase):
     def test_combo_popup_has_high_contrast_text_and_selection(self):
         self.assertIn("QComboBox QAbstractItemView", STYLESHEET)
         self.assertIn("color: #202422", STYLESHEET)
-        self.assertIn("selection-color: #172018", STYLESHEET)
+        self.assertIn("selection-color: #163c85", STYLESHEET)
 
     def test_message_boxes_override_system_dark_content_area(self):
         self.assertIn("QMessageBox { background-color: #ffffff; }", STYLESHEET)

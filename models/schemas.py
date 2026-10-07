@@ -177,6 +177,11 @@ class ExperimentPlan:
     purpose: str = "auto"
     planning_source: str = "local"
     selection_reason: str = ""
+    reference_record_id: str = ""
+    reference_avg_fps: float | None = None
+    reference_low_fps: float | None = None
+    diagnostic_record_id: str = ""
+    required_configuration: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.purpose == "auto":
@@ -209,6 +214,7 @@ class Decision:
     retry_same_experiment: bool = False
     rollback_required: bool = False
     diagnostic_summary: str = ""
+    measurement_valid: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

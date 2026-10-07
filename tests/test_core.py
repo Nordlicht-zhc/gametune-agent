@@ -201,7 +201,7 @@ class EvaluationTests(unittest.TestCase):
             300, 220, 95, visual_task.resolution, visual_task.test_scene, repeats=3,
             configuration={"shadow_quality": "中"},
         )
-        decision = evaluate_result(visual_task, baseline, candidate, round_number=1)
+        decision = evaluate_result(visual_task, baseline, candidate, round_number=1, setting_id="shadow_quality")
         self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
         self.assertIn("画质下降", decision.reasons[0])
 

@@ -21,11 +21,24 @@ def analyze_evidence(
     }
     if not current.comparable:
         evidence.append(Evidence("conditions_changed", "测试条件有变化", "这组结果不能和基线直接比较，请按原测试条件重测。", 1.0, "insufficient"))
+    configuration = current.configuration or {}
+    cap = configuration.get("fps_cap", task.fps_cap)
+    sync = configuration.get("vsync", task.vsync)
+    try:
+        cap_number = float(cap)
+    except (TypeError, ValueError):
+        cap_number = 0.0
+    cap_suspected = cap_number > 0 and current.avg_fps >= cap_number * 0.95
+    sync_suspected = sync in {"enabled", "启用", "开启"}
+    limit_suspected = cap_suspected or sync_suspected
+    if limit_suspected:
+        evidence.append(Evidence("cap_active", "限帧影响尚未排除",
+            "帧率接近已设上限或垂直同步仍启用；先临时排除限制，不能据此判断硬件瓶颈。", 1.0, "insufficient"))
     if not fps_cap_known or not vsync_known:
         evidence.append(Evidence("cap_unknown", "请先检查限帧", "限帧或垂直同步也会让 GPU 占用偏低。", 0.85, "insufficient"))
     if current.gpu_usage is not None:
         if current.gpu_usage < 75:
-            cause = "cpu_or_other" if fps_cap_known and vsync_known else "insufficient"
+            cause = "cpu_or_other" if fps_cap_known and vsync_known and not limit_suspected else "insufficient"
             detail = (
                 f"GPU 平均占用 {current.gpu_usage:.0f}%；限帧和垂直同步已确认，但仍需更多证据区分 CPU 侧与其他限制。"
                 if cause == "cpu_or_other"
@@ -33,7 +46,7 @@ def analyze_evidence(
             )
             evidence.append(Evidence("low_gpu", "GPU 占用偏低", detail, 0.5, cause))
         elif current.gpu_usage >= 95:
-            evidence.append(Evidence("high_gpu", "GPU 接近满载", f"GPU 平均占用 {current.gpu_usage:.0f}%，更可能受显卡性能限制。", 0.8, "gpu"))
+            evidence.append(Evidence("high_gpu", "GPU 接近满载", f"GPU 平均占用 {current.gpu_usage:.0f}%。" + ("限帧影响尚未排除，暂不判断硬件瓶颈。" if limit_suspected else "更可能受显卡性能限制。"), 0.8, "insufficient" if limit_suspected else "gpu"))
     if current.low_fps < task.target_low_fps:
         ratio = current.low_fps / task.target_low_fps
         evidence.append(Evidence("low_target_miss", "1% Low 未达标", f"当前只达到目标的 {ratio:.0%}，画面稳定性仍需改善。", min(1.0, 1.0 - ratio + 0.45), "frametime"))
@@ -55,7 +68,7 @@ def analyze_evidence(
             known_mode = cooling_mode == "quiet"
             detail = "已记录为安静模式；是否影响性能仍需结合温度和频率数据。" if known_mode else "测试时的风扇或散热模式尚未确认。"
             evidence.append(Evidence("laptop_cooling", "散热模式", detail, 0.45 if known_mode else 0.35, "platform" if known_mode else "insufficient"))
-    if baseline and _is_resolution_comparison(baseline, current):
+    if not limit_suspected and baseline and _is_resolution_comparison(baseline, current):
         delta = (current.avg_fps - baseline.avg_fps) / baseline.avg_fps * 100
         if abs(delta) <= 5:
             evidence.append(Evidence("resolution_flat", "降低分辨率效果不大", f"平均 FPS 只变化 {delta:+.1f}%，瓶颈可能不在显卡。", 0.9, "cpu"))
@@ -72,6 +85,8 @@ def analyze_evidence(
             # but it must never influence the next hypothesis or model prompt.
             continue
         kind = str(result.get("kind", ""))
+        if kind == "resolution" and limit_suspected:
+            continue
         if kind != "resolution":
             supports = str(result.get("supports", "insufficient"))
             if not summary:

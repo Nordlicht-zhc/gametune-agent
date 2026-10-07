@@ -11,6 +11,8 @@ from .planner import plan_candidate_id
 
 SYSTEM_PROMPT = """你是 GameTune 的下一步实验规划助手。你的任务是根据本轮数据、诊断证据和玩家偏好，从程序提供的候选计划中选择最值得做的一项。
 
+无效或不可比的历史只用于理解重测原因，不能作为收益证据。诊断后的恢复不等于优化失败；程序的评估结论不可改写。
+
 先判断当前是在排查原因还是验证优化效果。原因不清、关键设置未知或证据相互矛盾时，优先选择能排除干扰或区分原因的候选；只有现有证据足以支持某个优化方向时，才选择优化验证。GPU 占用偏低本身不能证明 CPU 瓶颈；没有温度、频率等数据时不能断言存在过热或降频。
 
 候选计划中的设置、数值、操作方式、成功条件和恢复方法已经由程序生成。你只能选择一个候选编号并解释选择理由，不得改写或创造设置、测试次数、数值、游戏菜单或实验动作。若所有候选都不理想，也必须选择最安全、最能补充信息的一项，并在理由中说明限制。
@@ -77,7 +79,10 @@ def next_step_request(
     safe_configuration_keys = {
         "resolution", "display_mode", "fps_cap", "vsync", "shadow_quality",
         "dynamic_shadows", "graphics_mode", "power_mode", "cooling_mode",
-        "gpu_power_w", "refresh_rate", "test_scene",
+        "gpu_power_w", "refresh_rate", "test_scene", "user_defined", "cpu_background_tasks", "frame_limits",
+        "player_contrast", "nvidia_gsync", "nvidia_reflex", "amd_anti_lag", "menu_fps_cap",
+        "msaa_mode", "texture_detail", "model_texture_detail", "texture_filtering", "shader_detail",
+        "particle_detail", "ambient_occlusion", "hdr", "fsr",
     }
     payload = {
         "task": {
@@ -110,24 +115,27 @@ def next_step_request(
         ],
         "completed_experiments": [
             {
-                "round_number": item.get("round_number"),
-                "role": item.get("role"),
-                "avg_fps": item.get("avg_fps"),
-                "low_fps": item.get("low_fps"),
-                "gpu_usage": item.get("gpu_usage"),
-                "planned_setting_id": (item.get("configuration") or {}).get("planned_setting_id"),
-                "actual_setting_value": (item.get("configuration") or {}).get("actual_setting_value"),
-                "confirmed": item.get("configuration_confirmed"),
-                "comparable": item.get("comparable"),
+                **{key: value for key, value in item.items() if key in {
+                    "record_id", "round_number", "purpose", "setting_id", "reference_record_id",
+                    "reference_avg_fps", "reference_low_fps", "reference_gpu_usage", "gpu_usage", "avg_fps", "low_fps",
+                    "avg_delta_pct", "low_delta_pct", "repeats", "configuration_confirmed",
+                    "comparable", "valid", "test_scene", "reference_test_scene", "decision", "restoration_confirmed",
+                }},
+                "before_configuration": {key: value for key, value in item.get("before_configuration", {}).items() if key in safe_configuration_keys},
+                "after_configuration": {key: value for key, value in item.get("after_configuration", item.get("configuration", {})).items() if key in safe_configuration_keys},
             }
-            for item in (history or [])[-8:]
-            if isinstance(item, dict)
+            for item in (history or []) if isinstance(item, dict)
         ],
         "candidates": [
             {
                 "candidate_id": plan_candidate_id(plan),
                 "round_number": plan.round_number,
                 "purpose": "diagnostic" if plan.purpose == "diagnostic" else "optimization",
+                "reference_record_id": plan.reference_record_id,
+                "reference_avg_fps": plan.reference_avg_fps,
+                "reference_low_fps": plan.reference_low_fps,
+                "diagnostic_record_id": plan.diagnostic_record_id,
+                "required_configuration": plan.required_configuration,
                 "title": plan.title,
                 "setting": plan.setting,
                 "rationale": plan.rationale,

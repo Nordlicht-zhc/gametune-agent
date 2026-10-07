@@ -42,6 +42,13 @@ def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: Knowl
     if plan.old_value == plan.new_value and plan.action not in {AgentAction.REQUEST_DATA, AgentAction.FINISH}:
         raise PlanValidationError("实验计划没有产生可验证的变化")
 
+    if plan.setting_id == "frame_limits" and (
+        plan.purpose != "diagnostic"
+        or plan.new_value != "不限帧且关闭垂直同步"
+        or plan.required_configuration != {"fps_cap": "0", "vsync": "disabled"}
+    ):
+        raise PlanValidationError("限帧诊断必须明确不限帧与关闭垂直同步的实际测试条件")
+
     try:
         rules = knowledge.game_rules(task.game)
     except PlanValidationError:
@@ -50,13 +57,13 @@ def validate_plan(task: OptimizationTask, plan: ExperimentPlan, knowledge: Knowl
             return
         if plan.action == AgentAction.REQUEST_DATA and setting_id in {
             "fps_cap", "vsync", "gpu_power_w", "graphics_mode", "power_mode",
-            "cooling_mode", "cpu_metrics", "test_conditions", "user_adjustment",
+            "cooling_mode", "cpu_metrics", "test_conditions", "user_adjustment", "uncapped_validation",
         }:
             return
         if (
             plan.action == AgentAction.PROPOSE_EXPERIMENT
-            and plan.purpose == "diagnostic"
-            and setting_id in {"resolution", "power_mode", "cooling_mode", "graphics_mode"}
+            and ((plan.purpose == "diagnostic" and setting_id in {"resolution", "power_mode", "cooling_mode", "graphics_mode", "fps_cap", "vsync", "frame_limits"})
+                 or (plan.purpose == "optimization" and plan.diagnostic_record_id and setting_id in {"power_mode", "cooling_mode", "graphics_mode"}))
         ):
             return
         if plan.action == AgentAction.RECOMMEND_CHANGE and setting_id == "user_defined":

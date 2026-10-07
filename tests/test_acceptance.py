@@ -120,7 +120,7 @@ class OptimizationAcceptanceTests(unittest.TestCase):
             self.assertEqual(missing.action, AgentAction.REQUEST_DATA)
             _, first = controller.supplement_data(task, {"shadow_quality": "高"})
             self.assertEqual(first.new_value, "中")
-            candidate = BenchmarkRecord(220, 150, 99, task.resolution, task.test_scene, repeats=3, configuration={"shadow_quality": "中", "dynamic_shadows": "all"})
+            candidate = BenchmarkRecord(220, 150, 99, task.resolution, task.test_scene, repeats=3, configuration={"shadow_quality": "中", "dynamic_shadows": "all", "fps_cap": "0", "vsync": "disabled"})
             self.assertTrue(controller.evaluate(task, baseline, candidate, 1).accepted)
             _, second = controller.plan_after_result(task, controller.current_record(task.task_id), baseline, 2)
             self.assertEqual((second.old_value, second.new_value), ("中", "低"))

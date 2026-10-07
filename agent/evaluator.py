@@ -6,6 +6,7 @@ from statistics import median
 from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
 from tools.calculate_metrics import normalized_score, weighted_relative_change
 from tools.resolution import parse_resolution
+from tools.configuration import CONFIGURATION_LABELS, unexpected_configuration_changes
 
 
 _DISPERSION_LIMIT_PCT = 5.0
@@ -112,6 +113,7 @@ def _decision(
     retry_same_experiment: bool = False,
     rollback_required: bool = False,
     diagnostic_summary: str = "",
+    measurement_valid: bool | None = None,
 ) -> Decision:
     return Decision(
         action=action,
@@ -128,6 +130,7 @@ def _decision(
         retry_same_experiment=retry_same_experiment,
         rollback_required=rollback_required,
         diagnostic_summary=diagnostic_summary,
+        measurement_valid=measurement_valid,
     )
 
 
@@ -145,6 +148,7 @@ def evaluate_result(
     retry_count: int = 0,
     max_retries: int = 2,
     accept_neutral_change: bool = False,
+    setting_id: str = "",
 ) -> Decision:
     """Evaluate one candidate against the currently accepted configuration.
 
@@ -176,7 +180,7 @@ def evaluate_result(
         summary: str,
         reasons: list[str],
         *,
-        rollback_on_limit: bool = False,
+        measurement_valid: bool = True,
     ) -> Decision:
         """Return a RETEST while it is useful, then stop safely.
 
@@ -185,49 +189,43 @@ def evaluate_result(
         same plan, so a noisy or unchanged experiment cannot keep a task in
         ``AWAITING_TEST`` forever.
         """
-        if rollback_on_limit and round_number >= task.max_rounds:
+        if retry_count >= max_retries:
             return _decision(
                 AgentAction.REVERT_CHANGE,
-                f"{summary} 已达到实验轮数上限，建议恢复上一组配置并结束本轮。",
-                reasons=reasons + ["当前结果尚未达到确认门槛。"],
-                task_complete=True,
-                stop_reason="max_rounds",
+                f"{summary} 已达到本轮复测上限，请恢复上一组配置。",
+                reasons=reasons + ["当前方案未确认可靠收益；复测上限与开始新方案的轮数上限分开判断。"],
+                task_complete=round_number >= task.max_rounds,
+                stop_reason="max_rounds" if round_number >= task.max_rounds else "retry_limit",
                 rollback_required=True,
-            )
-        if retry_count >= max_retries:
-            if rollback_on_limit:
-                return _decision(
-                    AgentAction.REVERT_CHANGE,
-                    f"{summary} 已达到本轮复测上限，建议恢复上一组配置并尝试下一项设置。",
-                    reasons=reasons + ["同一方案复测次数已达到上限，未确认可靠收益。"],
-                    task_complete=round_number >= task.max_rounds,
-                    stop_reason="max_rounds" if round_number >= task.max_rounds else "retry_limit",
-                    rollback_required=True,
-                )
-            return _decision(
-                AgentAction.RETEST,
-                f"{summary} 已达到本轮复测上限，保留最后一组已验证配置并停止。",
-                reasons=reasons + ["同一方案复测次数已达到上限。"],
-                task_complete=True,
-                stop_reason="retry_limit",
-                retry_same_experiment=False,
+                measurement_valid=measurement_valid,
             )
         return _decision(
             AgentAction.RETEST,
             summary,
             reasons=reasons,
             retry_same_experiment=True,
+            measurement_valid=measurement_valid,
         )
 
     if not candidate.configuration_confirmed:
         return bounded_retest(
             "还没有确认本轮设置已经执行，因此暂不评估结果。",
             ["请先确认已经完成调整，并填写实际使用的配置。"],
+            measurement_valid=False,
         )
-    if not candidate.comparable or candidate.test_scene.strip() != baseline.test_scene.strip():
+    comparison = reference or baseline
+    unexpected = unexpected_configuration_changes(comparison, candidate, setting_id or str(candidate.configuration.get("planned_setting_id", "")))
+    if unexpected:
+        return bounded_retest(
+            "计划之外的配置发生变化或缺少记录，暂不把收益归因于本项调整。",
+            [f"需要核对的设置：{'、'.join(CONFIGURATION_LABELS.get(key, key) for key in unexpected)}", "请恢复比较基准的其他设置；如果要保留这些变化，请重新建立比较基准。"],
+            measurement_valid=False,
+        )
+    if not candidate.comparable or not comparison.comparable or not comparison.configuration_confirmed or candidate.test_scene.strip() != comparison.test_scene.strip():
         return bounded_retest(
             "测试条件与基线不同，当前结果不能直接比较。",
             ["请使用与基线相同的场景、路线、供电模式和采集方法重新测试。"],
+            measurement_valid=False,
         )
 
     actual_runs, avg_spread, low_spread = _run_dispersion(candidate)
@@ -246,7 +244,7 @@ def evaluate_result(
                 f"1% Low 波动 {low_spread:.1f}%",
                 "请保持测试条件一致，再测试几次。",
             ],
-            rollback_on_limit=adaptive_screening,
+            measurement_valid=False,
         )
 
     comparison = reference or baseline
@@ -302,7 +300,6 @@ def evaluate_result(
                 f"1% Low 变化 {low_delta:+.1f}%",
                 "先保留当前设置继续补测，明显下降时会立即回滚。",
             ],
-            rollback_on_limit=True,
         )
     elif target_met:
         # FINISH is retained for callers using the historical action enum;
@@ -317,6 +314,7 @@ def evaluate_result(
             accepted=True,
             task_complete=True,
             stop_reason="target_reached",
+            measurement_valid=True,
             reasons=[
                 f"平均 FPS 变化 {avg_delta:+.1f}%",
                 f"1% Low 变化 {low_delta:+.1f}%",
@@ -354,10 +352,9 @@ def evaluate_result(
     # neutral result should not start an unbounded fourth/fifth run.  Manual
     # summaries remain on the historical path until their retry limit, because
     # ``repeats`` alone does not prove that individual runs were observed.
-    if adaptive_screening and action == AgentAction.RETEST and (
-        (candidate.runs and actual_runs >= acceptance_repeats)
+    if action == AgentAction.RETEST and (
+        (adaptive_screening and candidate.runs and actual_runs >= acceptance_repeats)
         or retry_count >= max_retries
-        or round_number >= task.max_rounds
     ):
         action = AgentAction.REVERT_CHANGE
         summary = "累计测试仍未显示可靠收益，建议恢复上一组配置并尝试下一项设置。"
@@ -376,7 +373,7 @@ def evaluate_result(
     # A round cap ends the task but never changes a RETEST into acceptance.
     # A useful KEEP may be accepted as the final verified result; a regression
     # still requires rollback confirmation before the task is frozen.
-    task_complete = round_number >= task.max_rounds
+    task_complete = round_number >= task.max_rounds and action != AgentAction.RETEST
     stop_reason = "max_rounds" if task_complete else ""
     if task_complete:
         if action == AgentAction.RETEST:
@@ -399,6 +396,7 @@ def evaluate_result(
         stop_reason=stop_reason,
         retry_same_experiment=action == AgentAction.RETEST and not task_complete,
         rollback_required=rollback_required,
+        measurement_valid=True,
     )
 
 
@@ -434,13 +432,17 @@ def evaluate_diagnostic_result(
             "本轮没有确认实际配置，未据此判断瓶颈。",
             0.0,
             0.0,
+            valid=False,
         )
-    if not candidate.comparable or candidate.test_scene.strip() != reference.test_scene.strip():
+    unexpected = unexpected_configuration_changes(reference, candidate, setting_id)
+    if (not candidate.comparable or not reference.comparable or not reference.configuration_confirmed
+            or unexpected or candidate.test_scene.strip() != reference.test_scene.strip()):
         if retry_count < max_retries:
             return _decision(
                 AgentAction.RETEST,
                 "诊断测试条件与原设置不一致，请按相同场景和条件重测。",
-                reasons=["不同场景或采集条件会让分辨率对比失去解释价值。"],
+                reasons=[f"计划之外的配置变化或缺少记录：{'、'.join(CONFIGURATION_LABELS.get(key, key) for key in unexpected)}" if unexpected else "测试条件与比较基准不一致。", "请恢复其他设置或重新建立比较基准，暂不把收益归因于本项调整。"],
+                measurement_valid=False,
                 retry_same_experiment=True,
             )
         return _diagnostic_restore(
@@ -449,9 +451,15 @@ def evaluate_diagnostic_result(
             "测试条件不一致，未据此判断瓶颈。",
             0.0,
             0.0,
+            valid=False,
         )
 
     actual_runs, avg_spread, low_spread = _run_dispersion(candidate)
+    if setting_id == "frame_limits" and actual_runs < 2:
+        if retry_count < max_retries:
+            return _decision(AgentAction.RETEST, "不限帧参考至少需要两次有效测试，请保持条件不变补测。",
+                reasons=["后续画面调整需要独立、稳定的不限帧比较基准。"], retry_same_experiment=True)
+        return _diagnostic_restore(round_number, "诊断结果无效", "不限帧参考测试次数不足，未用于生成优化候选。", 0.0, 0.0, valid=False)
     if actual_runs < 1 or (
         avg_spread is not None
         and low_spread is not None
@@ -468,7 +476,7 @@ def evaluate_diagnostic_result(
                 retry_same_experiment=True,
             )
         summary = "诊断结果仍有明显波动，暂时无法区分主要限制。"
-        return _diagnostic_restore(round_number, summary, summary, 0.0, 0.0)
+        return _diagnostic_restore(round_number, summary, summary, 0.0, 0.0, valid=False)
 
     avg_delta = (candidate.avg_fps - reference.avg_fps) / reference.avg_fps * 100
     low_delta = (candidate.low_fps - reference.low_fps) / reference.low_fps * 100
@@ -482,7 +490,12 @@ def evaluate_diagnostic_result(
             retry_same_experiment=True,
         )
 
-    if setting_id == "resolution":
+    if setting_id in {"fps_cap", "vsync", "frame_limits"}:
+        if avg_delta >= 5 or low_delta >= 5:
+            summary = f"临时排除限制后平均 FPS {avg_delta:+.1f}%，1% Low {low_delta:+.1f}%；原限制可能影响表现，不能据此判断硬件瓶颈。"
+        else:
+            summary = f"临时排除限制后平均 FPS {avg_delta:+.1f}%，1% Low {low_delta:+.1f}%；尚未证明所有限制都已排除。"
+    elif setting_id == "resolution":
         if avg_delta >= 10.0:
             summary = f"降低分辨率后平均 FPS 提高 {avg_delta:.1f}%，更支持 GPU 渲染负担是重要限制。"
         elif abs(avg_delta) <= 5.0:
@@ -516,6 +529,8 @@ def _diagnostic_restore(
     finding: str,
     avg_delta: float,
     low_delta: float,
+    *,
+    valid: bool = True,
 ) -> Decision:
     return _decision(
         AgentAction.REVERT_CHANGE,
@@ -525,5 +540,6 @@ def _diagnostic_restore(
         reasons=[finding, "本轮只用于判断原因，不作为长期优化配置。"],
         rollback_required=True,
         diagnostic_summary=finding,
+        measurement_valid=valid,
         task_complete=False,
     )
