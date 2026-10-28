@@ -154,6 +154,8 @@ class Victoria3Quick(QWidget):
                                              phase="applied", backup=str(backup), mode=mode)
             if previous and previous["phase"] == "assessment" and previous["before"] == before:
                 self.current_report["observations"]["baseline"] = previous["observations"]["baseline"]
+                if previous.get('captures', {}).get('baseline'):
+                    self.current_report['captures'] = {'baseline': previous['captures']['baseline']}
                 self.current_report["sources"] = {key: value for key, value in previous["sources"].items() if key.startswith("baseline_")}
             self.reports.save(self.current_report)
             self.show_report()
