@@ -1279,7 +1279,7 @@ class Sidebar(QFrame):
         root.addWidget(label("工作区", "sidebarLabel"))
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
-        for text, index in [("概览", 0), ("新建任务", 1), ("当前实验", 2), ("历史记录", 3), ("最终报告", 4), ("模型设置", 5), ("Victoria 3 优化", 6)]:
+        for text, index in [("概览", 0), ("新建任务", 1), ("当前实验", 2), ("历史记录", 3), ("最终报告", 4), ("模型设置", 5)]:
             button = QPushButton(text)
             button.setObjectName("navButton")
             button.setCheckable(True)

@@ -8,6 +8,10 @@ GameTune Agent 是一个使用 PySide6 构建的 Windows 桌面界面原型，�
 
 ### Victoria 3 模块
 
+Victoria 3 现在提供独立窗口，运行 `python victoria3_app.py`，不与 CS2 工作区一起显示。侧栏分为「概览、一键优化、性能测试、历史记录、最终报告、模型设置」，沿用 CS2 桌面程序的视觉组件。原 `app.py` 保留 CS2 入口，Victoria 3 导航不再展示在该入口。
+
+独立窗口「模型设置」复用现有 `ModelProvider` 协议和兼容 Chat Completions 适配器，可填写地址、密钥、模型名及思考模式，也支持已有 `GAMETUNE_API_*` 环境变量。报告页明确同意后才将硬件型号、图形设置与实测摘要发送到所配置 API，不包含存档内容、文件路径或密钥。`agent/victoria3_model.py` 的 `explain_victoria3(provider, report)` 接受任意符合协议的 Provider，失败或未配置时返回本地建议。模型结果独立标记，不修改实测指标、不执行设置、不决定实测是否有效。密钥仅驻留当前进程。
+
 侧栏选择「Victoria 3 优化」（截图索引 6）。默认进入简化模式，无需填写测试表格：
 
 - 自动读取 Windows 文档目录中的游戏设置、最近一次启动日志中的版本/硬件及本地存档列表，支持重定向的文档目录。日志信息可能滞后，不作为实时遥测或瓶颈结论。
