@@ -29,6 +29,7 @@ from tools.calculate_metrics import normalized_score
 from tools.resolution import RESOLUTION_PRESETS, aspect_ratio_name, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog, HardwareEntry
 from agent.planner import plan_next_experiment
+from victoria3_page import Victoria3Page
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1278,7 +1279,7 @@ class Sidebar(QFrame):
         root.addWidget(label("工作区", "sidebarLabel"))
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
-        for text, index in [("概览", 0), ("新建任务", 1), ("当前实验", 2), ("历史记录", 3), ("最终报告", 4), ("模型设置", 5)]:
+        for text, index in [("概览", 0), ("新建任务", 1), ("当前实验", 2), ("历史记录", 3), ("最终报告", 4), ("模型设置", 5), ("Victoria 3 优化", 6)]:
             button = QPushButton(text)
             button.setObjectName("navButton")
             button.setCheckable(True)
@@ -1355,6 +1356,8 @@ class MainWindow(QMainWindow):
         self.api_settings = APISettingsPage(initial_api_config)
         for page in [self.dashboard, self.new_task, self.experiment, self.history, self.report, self.api_settings]:
             self.stack.addWidget(page)
+        self.victoria3 = Victoria3Page(database_path or APP_DIR / ".data" / "gametune.db")
+        self.stack.addWidget(self.victoria3)
         layout.addWidget(self.sidebar)
         layout.addWidget(self.stack, 1)
         self.sidebar.navigate.connect(self.set_page)
@@ -2013,7 +2016,7 @@ def run_app(screenshot: Path | None = None, page_index: int = 0) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="GameTune Agent desktop UI")
     parser.add_argument("--screenshot", type=Path, help="Render the dashboard to a PNG and exit")
-    parser.add_argument("--page", type=int, choices=range(6), default=0, help="Page index used by screenshot mode (0-5)")
+    parser.add_argument("--page", type=int, choices=range(7), default=0, help="Page index used by screenshot mode (0-6)")
     args = parser.parse_args()
     return run_app(args.screenshot, args.page)
 
