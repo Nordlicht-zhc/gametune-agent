@@ -92,6 +92,25 @@ class PresentMonTests(unittest.TestCase):
             quick.reports.save(report)
             quick.current_report = report
             page = CapturePage(quick)
+            page.status.setText('测试错误：可以直接复制')
+            page.copy_button.click()
+            self.assertEqual(app.clipboard().text(), '测试错误：可以直接复制')
+            class Clock:
+                milliseconds = 0
+                def isValid(self):
+                    return True
+                def elapsed(self):
+                    return self.milliseconds
+            clock = Clock()
+            page.clock = clock
+            page.tick()
+            self.assertIn('8 秒后', page.countdown.text())
+            clock.milliseconds = 7000
+            page.tick()
+            self.assertIn('1 秒后', page.countdown.text())
+            clock.milliseconds = 8000
+            page.tick()
+            self.assertIn('正在采集', page.countdown.text())
             result = {'metrics': {'avg_fps': 60, 'low_fps': 40}, 'seconds': 60, 'csv': 'fixture'}
             page.save_capture(report, 'baseline', settings, result)
             quick.preview()

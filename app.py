@@ -167,6 +167,7 @@ def set_margins(layout, left=0, top=0, right=0, bottom=0, spacing=0):
 
 def label(text: str, object_name: str | None = None, wrap: bool = False) -> QLabel:
     widget = QLabel(text)
+    widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
     if object_name:
         widget.setObjectName(object_name)
     widget.setWordWrap(wrap)
