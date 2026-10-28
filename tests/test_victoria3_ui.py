@@ -48,3 +48,22 @@ class Victoria3UiTests(unittest.TestCase):
                 self.assertTrue(warning.called)
             self.assertEqual(page.repository.history(), [])
             page.close()
+
+    def test_report_is_embedded_and_apply_switches_tab(self):
+        import json
+        from tools.victoria3_local import LocalVictoria3
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "pdx_settings.json").write_text(json.dumps({"Graphics": {"resolution": "3200x2000"}}), encoding="utf-8")
+            page = Victoria3Page(root / "ui.db")
+            page.quick.service = LocalVictoria3(root, running_check=lambda: False)
+            page.quick.scan()
+            self.assertFalse(page.quick.report_view.isWindow())
+            page.quick.apply()
+            self.assertEqual(page.tabs.currentIndex(), 1)
+            self.assertIs(page.tabs.widget(1), page.quick.report_view)
+            self.assertIn("设置已应用", page.quick.report_view.browser.toPlainText())
+            page.tabs.setCurrentIndex(0)
+            page.quick.show_report()
+            self.assertEqual(page.tabs.currentIndex(), 1)
+            page.close()

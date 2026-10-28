@@ -3,10 +3,11 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import sqlite3
+from PySide6.QtCore import Qt
 
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
                               QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-                              QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+                              QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QTabWidget)
 from tools.victoria3 import (SimulationConditions, SimulationRepository, compare_runs,
                              experiment_guidance, import_simulation_csv, save_fingerprint, summarize_runs)
 from victoria3_quick import Victoria3Quick
@@ -23,7 +24,14 @@ class Victoria3Page(QScrollArea):
         self.setWidget(body)
         layout = QVBoxLayout(body)
         self.quick = Victoria3Quick(database_path=database_path)
-        layout.addWidget(self.quick)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.quick, "一键优化")
+        self.quick.report_embedded = True
+        self.quick.report_view.setWindowFlags(Qt.WindowType.Widget)
+        self.tabs.addTab(self.quick.report_view, "优化报告")
+        self.quick.report_requested.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.tabs.currentChanged.connect(self.report_tab_changed)
+        layout.addWidget(self.tabs)
         self.advanced_toggle = QCheckBox("展开高级性能测试（可选）")
         layout.addWidget(self.advanced_toggle)
         self.advanced = QWidget()
@@ -99,6 +107,10 @@ class Victoria3Page(QScrollArea):
         self.fields["version"].setText(data["version"])
         self.fields["configuration"].setText(json.dumps(data["settings"]["Graphics"], ensure_ascii=False))
         # Only actual observations are copied; speed, date range and mods remain explicit.
+
+    def report_tab_changed(self, index):
+        if index == 1:
+            self.quick.show_report()
 
     def add_row(self):
         self.table.insertRow(self.table.rowCount())

@@ -21,12 +21,14 @@ LABELS = {"resolution": "分辨率", "quality": "画质模式", "multi_sampling"
 class Victoria3Quick(QWidget):
     discovered = Signal(dict)
     save_selected = Signal(str)
+    report_requested = Signal()
 
     def __init__(self, service=None, database_path=None):
         super().__init__()
         self.service = service or LocalVictoria3()
         self.reports = ReportRepository(database_path or self.service.directory / "gametune-reports.sqlite")
         self.report_view = Victoria3ReportView(self.reports, self)
+        self.report_embedded = False
         self.machine = {}
         self.current_report = None
         self.plan = None
@@ -195,8 +197,11 @@ class Victoria3Quick(QWidget):
                 self.current_report = new_report(data, data["settings"])
                 self.reports.save(self.current_report)
             self.report_view.load(self.current_report)
-            self.report_view.show()
-            self.report_view.raise_()
+            if self.report_embedded:
+                self.report_requested.emit()
+            else:
+                self.report_view.show()
+                self.report_view.raise_()
         except (OSError, ValueError, sqlite3.Error) as error:
             self.status.setText(f"报告生成失败：{error}")
 
