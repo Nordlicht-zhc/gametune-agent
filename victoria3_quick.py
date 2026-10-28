@@ -68,6 +68,12 @@ class Victoria3Quick(QWidget):
         self.status = QLabel("方案尚未应用；未进行性能测试。")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.original_note = QLabel('优化前的设置会自动备份，不需要手动记忆。电脑硬件不会被修改。')
+        self.original_note.setWordWrap(True)
+        layout.addWidget(self.original_note)
+        self.restore_latest_button = QPushButton('一键恢复优化前（自动使用最近一次优化备份）')
+        self.restore_latest_button.clicked.connect(self.restore_latest)
+        layout.addWidget(self.restore_latest_button)
         report_button = QPushButton("查看优化报告 / 性能对比 / 历史报告")
         report_button.clicked.connect(self.show_report)
         layout.addWidget(report_button)
@@ -135,6 +141,26 @@ class Victoria3Quick(QWidget):
         self.backups.clear()
         for path in self.service.backup_list():
             self.backups.addItem(path.stem, str(path))
+        pending = next((r for r in self.reports.list() if r.get('backup') and r['phase'] in ('applied', 'external_change')), None)
+        self.restore_latest_button.setEnabled(pending is not None)
+        if pending:
+            original = pending['before']['Graphics']
+            self.original_note.setText('最近一次优化前的游戏设置：' + json.dumps(original, ensure_ascii=False)
+                                      + '\n这些原值已保存；恢复只处理本次修改的图形设置，不改变电脑硬件。')
+
+    def restore_latest(self):
+        try:
+            report = next((r for r in self.reports.list() if r.get('backup') and r['phase'] in ('applied', 'external_change')), None)
+            if report is None:
+                raise ValueError('没有待恢复的优化，当前无需恢复。')
+            self.refresh_backups()
+            index = self.backups.findData(report['backup'])
+            if index < 0:
+                raise ValueError('未找到该次优化的备份文件，无法自动恢复；请不要手动猜测原值。')
+            self.backups.setCurrentIndex(index)
+            self.restore()
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.status.setText(str(error))
 
     def apply(self):
         try:
@@ -158,6 +184,7 @@ class Victoria3Quick(QWidget):
                     self.current_report['captures'] = {'baseline': previous['captures']['baseline']}
                 self.current_report["sources"] = {key: value for key, value in previous["sources"].items() if key.startswith("baseline_")}
             self.reports.save(self.current_report)
+            self.refresh_backups()
             self.show_report()
         except (OSError, ValueError, sqlite3.Error) as error:
             self.status.setText(str(error))
@@ -177,6 +204,7 @@ class Victoria3Quick(QWidget):
                     report["events"].append({"phase": "restored", "at": datetime.now(timezone.utc).isoformat()})
                     self.reports.save(report)
                     self.current_report = report
+                    self.refresh_backups()
                     self.show_report()
                     break
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:

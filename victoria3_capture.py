@@ -118,6 +118,10 @@ class CapturePage(QWidget):
         try:
             reports = self.quick.reports.list()
             report = next((r for r in reports if self.quick.current_report and r['id'] == self.quick.current_report['id']), None)
+            if report and report['phase'] in ('assessment', 'restored'):
+                self.side.setCurrentIndex(0)
+                self.confirm.setChecked(False)
+                self.status.setText('当前尚未优化或已恢复原设置，已选择“采集优化前”。')
             if report and report['phase'] == 'applied':
                 settings = self.quick.service.read_settings()['Graphics']
                 if not graphics_differences(settings, report['after']['Graphics']):
