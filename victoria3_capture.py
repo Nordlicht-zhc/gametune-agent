@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushB
 from tools.presentmon import PresentMon, summarize_captures
 from tools.victoria3_report import attach_benchmark, new_report
 from tools.resolution import normalize_resolution
+from tools.windows_launch import is_admin, restart_as_admin
 
 
 def graphics_differences(actual, expected):
@@ -53,6 +54,13 @@ class CapturePage(QWidget):
                       '此处采集平均 FPS 和 1% Low，不采集跑日速度、温度或功耗。')
         note.setWordWrap(True)
         root.addWidget(note)
+        self.permission = QLabel('当前权限：' + ('管理员，可尝试启动 ETW 采集' if is_admin() else '普通用户；ETW 权限不足时需管理员启动'))
+        self.permission.setWordWrap(True)
+        root.addWidget(self.permission)
+        self.admin_button = QPushButton('以管理员权限打开采集页（需要确认 Windows 弹窗）')
+        self.admin_button.clicked.connect(self.open_admin)
+        self.admin_button.setVisible(not is_admin())
+        root.addWidget(self.admin_button)
         self.prepare_button = QPushButton('一键准备开源采集工具（官方 PresentMon 2.6.0，SHA-256 校验）')
         self.prepare_button.clicked.connect(self.prepare)
         root.addWidget(self.prepare_button)
@@ -121,6 +129,16 @@ class CapturePage(QWidget):
             self.overlay.hide()
             remaining = max(0, ceil((self.seconds.value() * 1000 - (milliseconds - 8000)) / 1000))
             self.countdown.setText(f'正在采集 · 剩余约 {remaining} 秒' if remaining else '采集结束 · 正在计算并保存报告…')
+
+    def open_admin(self):
+        if self.job:
+            self.status.setText('请先等待当前任务结束或取消，再打开管理员窗口。')
+            return
+        try:
+            restart_as_admin()
+            self.status.setText('已请求管理员启动。请完成 Windows 权限确认，然后切到带“管理员”标记的新窗口。原窗口保留。')
+        except (OSError, ValueError) as error:
+            self.status.setText(str(error))
 
     def run_job(self, operation, callback, timed=False):
         if self.job:

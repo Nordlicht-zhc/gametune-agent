@@ -83,7 +83,10 @@ class PresentMon:
                     if time.monotonic() > deadline:
                         raise ValueError('采集超时，本次数据未写入报告')
                 if process.returncode:
-                    raise ValueError('PresentMon 采集失败；可能缺少 ETW 采集权限。未写入报告，未自动提权。请尝试以管理员身份运行优化程序。')
+                    detail = log_path.read_text(encoding='utf-8', errors='replace')[-6000:]
+                    if 'failed to start trace session: access denied' in detail.lower():
+                        raise ValueError('Windows 拒绝启动 ETW 采集会话（权限不足）。\n请点击“以管理员权限打开采集页”，在 Windows 弹窗中确认，然后在带“管理员”标记的新窗口重新采集。\n本次未写入报告。')
+                    raise ValueError(f'PresentMon 退出码 {process.returncode}，本次未写入报告。\n采集日志：{detail.strip() or "工具未输出错误详情"}')
             finally:
                 if process.poll() is None:
                     process.terminate()

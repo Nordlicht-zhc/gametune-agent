@@ -13,6 +13,7 @@ from agent.api import OpenAICompatibleProvider, provider_from_env
 from agent.victoria3_model import explain_victoria3
 from victoria3_page import Victoria3Page
 from tools.victoria3_report import metric_rows
+from tools.windows_launch import is_admin
 
 
 class CopyableLabels(QObject):
@@ -26,6 +27,8 @@ class Victoria3Window(QMainWindow):
     def __init__(self, database_path=None, provider=None):
         super().__init__()
         self.setWindowTitle("Victoria 3 Optimizer · 维多利亚3性能优化")
+        if is_admin():
+            self.setWindowTitle(self.windowTitle() + '（管理员）')
         self.resize(1280, 860)
         self.setMinimumSize(1050, 720)
         self.copyable_labels = CopyableLabels(self)
