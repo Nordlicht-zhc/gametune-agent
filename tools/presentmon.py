@@ -107,17 +107,18 @@ def load_capture(output: Path, pid: int):
     """Keep the dominant swap chain; don't concatenate independent frame streams."""
     with output.open(encoding='utf-8-sig', newline='') as stream:
         reader = csv.DictReader(stream)
-        fields = reader.fieldnames
-        if not fields or 'MsBetweenPresents' not in fields:
+        fields = [name.strip().lower() for name in (reader.fieldnames or [])]
+        if not fields or 'msbetweenpresents' not in fields:
             raise ValueError('PresentMon 未输出兼容帧时间列')
         groups = {}
         for row in reader:
-            if row.get('ProcessID') != str(pid):
+            row = {key.strip().lower(): value for key, value in row.items() if key is not None}
+            if row.get('processid') != str(pid):
                 continue
-            chain = row.get('SwapChainAddress', 'default')
+            chain = row.get('swapchainaddress', 'default')
             frames = groups.setdefault(chain, [])
             try:
-                value = float(row['MsBetweenPresents'])
+                value = float(row['msbetweenpresents'])
             except (ValueError, TypeError):
                 raise ValueError('采集包含无效帧时间')
             if value == 0 and not frames:
