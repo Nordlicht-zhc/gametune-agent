@@ -3,10 +3,10 @@ import argparse
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, QObject, QEvent
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QHBoxLayout,
     QMainWindow, QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget, QTabWidget)
+    QTextEdit, QVBoxLayout, QWidget, QTabWidget, QLabel)
 from victoria3_capture import CapturePage
 from app import STYLESHEET, APISettingsPage, ModelWorker, PageHeader, SectionHeader, label, set_margins
 from agent.api import OpenAICompatibleProvider, provider_from_env
@@ -15,12 +15,21 @@ from victoria3_page import Victoria3Page
 from tools.victoria3_report import metric_rows
 
 
+class CopyableLabels(QObject):
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show and isinstance(watched, QLabel):
+            watched.setTextInteractionFlags(watched.textInteractionFlags() | Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        return False
+
+
 class Victoria3Window(QMainWindow):
     def __init__(self, database_path=None, provider=None):
         super().__init__()
         self.setWindowTitle("Victoria 3 Optimizer · 维多利亚3性能优化")
         self.resize(1280, 860)
         self.setMinimumSize(1050, 720)
+        self.copyable_labels = CopyableLabels(self)
+        QApplication.instance().installEventFilter(self.copyable_labels)
         self.provider = provider
         self.job = None
         self.worker = None

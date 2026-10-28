@@ -63,7 +63,7 @@ class PresentMon:
                 '--v1_metrics', '--delay', '8', '--timed', str(seconds), '--terminate_after_timed',
                 '--session_name', 'Victoria3Optimizer-' + uuid4().hex, '--no_console_stats']
 
-    def capture(self, folder: Path, seconds: int, cancel):
+    def capture(self, folder: Path, seconds: int, cancel, on_started=None):
         if not self.ready():
             raise ValueError('请先准备并校验采集工具')
         pid = self.game_pid()
@@ -74,6 +74,8 @@ class PresentMon:
             process = subprocess.Popen(self.command(pid, output, seconds), stdout=log, stderr=log,
                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             try:
+                if on_started:
+                    on_started()
                 deadline = time.monotonic() + seconds + 45
                 while process.poll() is None:
                     if cancel.wait(.2):

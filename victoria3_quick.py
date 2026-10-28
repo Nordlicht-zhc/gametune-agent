@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPushButton, QTextEdit,
+from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QTextEdit,
                               QVBoxLayout, QWidget)
 from tools.victoria3_local import LocalVictoria3
 from tools.victoria3_report import ReportRepository, new_report, attach_simulation
@@ -68,6 +68,9 @@ class Victoria3Quick(QWidget):
         self.status = QLabel("方案尚未应用；未进行性能测试。")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        copy_status = QPushButton('复制当前提示 / 报错')
+        copy_status.clicked.connect(lambda: QApplication.clipboard().setText(self.status.text()))
+        layout.addWidget(copy_status)
         self.original_note = QLabel('优化前的设置会自动备份，不需要手动记忆。电脑硬件不会被修改。')
         self.original_note.setWordWrap(True)
         layout.addWidget(self.original_note)

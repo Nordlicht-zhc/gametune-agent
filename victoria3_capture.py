@@ -2,9 +2,10 @@ from copy import deepcopy
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Signal, QTimer
+from PySide6.QtCore import QThread, Signal, QTimer, QElapsedTimer, Qt
+from math import ceil
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton,
-                              QSpinBox, QVBoxLayout, QWidget)
+                              QSpinBox, QVBoxLayout, QWidget, QApplication)
 from tools.presentmon import PresentMon, summarize_captures
 from tools.victoria3_report import attach_benchmark, new_report
 from tools.resolution import normalize_resolution
@@ -37,6 +38,7 @@ class CaptureJob(QThread):
 
 
 class CapturePage(QWidget):
+    countdown_started = Signal()
     def __init__(self, quick):
         super().__init__()
         self.quick = quick
@@ -74,39 +76,75 @@ class CapturePage(QWidget):
         self.stop.clicked.connect(lambda: self.job.cancel.set() if self.job else None)
         row.addWidget(self.stop)
         root.addLayout(row)
+        self.countdown = QLabel('准备就绪 · 开始后显示 8 秒倒计时')
+        self.countdown.setObjectName('metricValue')
+        self.countdown.setWordWrap(True)
+        self.countdown.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        root.addWidget(self.countdown)
         self.status = QLabel('首次使用准备一次工具即可。不安装驱动，不修改系统权限，不上传采集文件。')
         self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         root.addWidget(self.status)
+        copy_button = QPushButton('复制当前提示 / 报错')
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self.status.text()))
+        root.addWidget(copy_button)
+        self.copy_button = copy_button
         root.addStretch()
         self.timer = QTimer(self)
-        self.timer.setInterval(1000)
+        self.timer.setInterval(100)
         self.timer.timeout.connect(self.tick)
-        self.elapsed = 0
+        self.clock = QElapsedTimer()
+        self.overlay = QLabel('', self.window(), Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.overlay.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.overlay.setStyleSheet('background:#202421;color:#d7ff62;padding:16px;border-radius:10px;font-size:24px;')
+        self.countdown_started.connect(self.begin_countdown)
+
+    def begin_countdown(self):
+        self.clock.start()
+        self.countdown.setText('8 秒后开始采集 · 请切回游戏')
+        self.overlay.setText('8 秒后开始采集')
+        self.overlay.adjustSize()
+        screen = self.screen().availableGeometry()
+        self.overlay.move(screen.center().x() - self.overlay.width() // 2, screen.top() + 24)
+        self.overlay.show()
+        self.timer.start()
 
     def tick(self):
-        self.elapsed += 1
-        self.status.setText(f'采集任务进行中 · {self.elapsed} 秒。请保持游戏场景不变，完成后自动保存。')
+        if not self.clock.isValid():
+            return
+        milliseconds = self.clock.elapsed()
+        if milliseconds < 8000:
+            self.countdown.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集 · 请切回游戏')
+            self.overlay.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集')
+        else:
+            self.overlay.hide()
+            remaining = max(0, ceil((self.seconds.value() * 1000 - (milliseconds - 8000)) / 1000))
+            self.countdown.setText(f'正在采集 · 剩余约 {remaining} 秒' if remaining else '采集结束 · 正在计算并保存报告…')
 
     def run_job(self, operation, callback, timed=False):
         if self.job:
             return
         self.start.setEnabled(False)
         self.prepare_button.setEnabled(False)
+        self.seconds.setEnabled(False)
+        self.side.setEnabled(False)
         self.job = CaptureJob(operation, self)
         self.job.completed.connect(callback)
         self.job.failed.connect(self.status.setText)
         self.job.finished.connect(self.finished)
-        if timed:
-            self.elapsed = 0
-            self.timer.start()
         self.job.start()
 
     def finished(self):
         self.timer.stop()
+        self.overlay.hide()
+        self.countdown.setText('本次任务已结束 · 结果或报错见下方（可复制）')
         self.job.deleteLater()
         self.job = None
         self.start.setEnabled(True)
         self.prepare_button.setEnabled(True)
+        self.seconds.setEnabled(True)
+        self.side.setEnabled(True)
 
     def prepare(self):
         self.status.setText('正在从官方 GitHub 下载并校验工具，请稍候…')
@@ -167,7 +205,9 @@ class CapturePage(QWidget):
             context = deepcopy(report)
             seconds = self.seconds.value()
             self.confirm.setChecked(False)
-            self.run_job(lambda cancel: self.tool.capture(self.quick.reports.path.parent / 'captures', seconds, cancel),
+            self.countdown.setText('正在启动采集工具…')
+            self.run_job(lambda cancel: self.tool.capture(self.quick.reports.path.parent / 'captures', seconds, cancel,
+                         on_started=self.countdown_started.emit),
                          lambda result: self.save_capture(context, side, settings, result), timed=True)
             self.status.setText(('当前已应用优化，自动切换为采集优化后。' if switched else '') + '采集将在 8 秒后开始，请切回 Victoria 3。')
         except (OSError, ValueError) as error:
