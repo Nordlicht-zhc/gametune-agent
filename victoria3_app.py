@@ -14,6 +14,7 @@ from agent.victoria3_model import explain_victoria3
 from victoria3_page import Victoria3Page
 from tools.victoria3_report import metric_rows
 from tools.windows_launch import is_admin
+from admin_handoff import signal_ready
 
 
 class CopyableLabels(QObject):
@@ -249,6 +250,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--page', type=int, choices=range(6), default=0)
     parser.add_argument('--screenshot', type=Path)
+    parser.add_argument('--handoff-port', type=int)
+    parser.add_argument('--handoff-token')
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setStyle('Fusion')
@@ -260,6 +263,11 @@ def main():
     window = Victoria3Window(provider=provider)
     window.show()
     QTimer.singleShot(200, lambda: window.navigate(args.page))
+    if args.handoff_port and args.handoff_token:
+        def confirm_ready():
+            if is_admin() and window.isVisible():
+                window.handoff_socket = signal_ready(window, args.handoff_port, args.handoff_token)
+        QTimer.singleShot(500, confirm_ready)
     if args.screenshot:
         def capture():
             args.screenshot.parent.mkdir(parents=True, exist_ok=True)

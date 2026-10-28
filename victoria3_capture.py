@@ -10,6 +10,7 @@ from tools.presentmon import PresentMon, summarize_captures
 from tools.victoria3_report import attach_benchmark, new_report
 from tools.resolution import normalize_resolution
 from tools.windows_launch import is_admin, restart_as_admin
+from admin_handoff import AdminHandoff
 
 
 def graphics_differences(actual, expected):
@@ -45,6 +46,7 @@ class CapturePage(QWidget):
         self.quick = quick
         self.tool = PresentMon(quick.reports.path.parent / 'presentmon')
         self.job = None
+        self.handoff = None
         root = QVBoxLayout(self)
         title = QLabel('自动性能采集')
         title.setObjectName('pageTitle')
@@ -134,11 +136,39 @@ class CapturePage(QWidget):
         if self.job:
             self.status.setText('请先等待当前任务结束或取消，再打开管理员窗口。')
             return
+        if getattr(self.window(), 'job', None):
+            self.status.setText('请先等待模型请求结束，再切换管理员窗口。')
+            return
         try:
-            restart_as_admin()
-            self.status.setText('已请求管理员启动。请完成 Windows 权限确认，然后切到带“管理员”标记的新窗口。原窗口保留。')
+            if self.handoff:
+                return
+            self.handoff = AdminHandoff(self)
+            self.handoff.ready.connect(self.admin_ready)
+            self.handoff.expired.connect(self.admin_timeout)
+            self.admin_button.setEnabled(False)
+            self.window().setEnabled(False)
+            restart_as_admin(self.handoff.port, self.handoff.token)
+            self.handoff.timer.start(60000)
+            self.status.setText('正在等待管理员窗口就绪；成功后本窗口会自动关闭。取消或启动失败时保留本窗口。')
         except (OSError, ValueError) as error:
+            self.clear_handoff()
             self.status.setText(str(error))
+
+    def clear_handoff(self):
+        if self.handoff:
+            self.handoff.stop()
+            self.handoff.deleteLater()
+            self.handoff = None
+        self.admin_button.setEnabled(True)
+        self.window().setEnabled(True)
+
+    def admin_ready(self):
+        self.clear_handoff()
+        self.window().close()
+
+    def admin_timeout(self):
+        self.clear_handoff()
+        self.status.setText('未收到管理员窗口就绪确认，当前窗口已保留。请检查 Windows 提示后重试。')
 
     def run_job(self, operation, callback, timed=False):
         if self.job:
