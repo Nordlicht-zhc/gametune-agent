@@ -117,6 +117,8 @@ class Victoria3Window(QMainWindow):
         self.group.button(index).setChecked(True)
         if index == 0:
             self.refresh_overview()
+        if index == 2:
+            self.capture_page.suggest_stage()
         if index == 3:
             self.history_rows = self.quick.reports.list()
             self.history.setRowCount(len(self.history_rows))

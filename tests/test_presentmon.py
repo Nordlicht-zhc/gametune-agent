@@ -7,6 +7,10 @@ from tools.presentmon import PresentMon, summarize_captures, load_capture
 
 
 class PresentMonTests(unittest.TestCase):
+    def test_settings_compare_normalizes_resolution_and_ignores_added_defaults(self):
+        from victoria3_capture import graphics_differences
+        self.assertEqual(graphics_differences({'resolution': '2560 × 1600', 'new_default': True}, {'resolution': '2560x1600'}), [])
+        self.assertIn('3200x2000', graphics_differences({'resolution': '2560x1600'}, {'resolution': '3200x2000'})[0])
     def test_command_is_bounded_and_targets_pid(self):
         tool = PresentMon(Path('tool'))
         command = tool.command(123, Path('path with spaces.csv'), 60)
@@ -93,6 +97,9 @@ class PresentMonTests(unittest.TestCase):
             quick.preview()
             quick.apply()
             current = quick.current_report
+            page.suggest_stage()
+            self.assertEqual(page.side.currentData(), 'candidate')
+            self.assertIn('优化后', page.status.text())
             self.assertEqual(len(current['captures']['baseline']), 1)
             after = quick.service.read_settings()
             page.save_capture(current, 'candidate', after, {**result, 'metrics': {'avg_fps': 70, 'low_fps': 45}})

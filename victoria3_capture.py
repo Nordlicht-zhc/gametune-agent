@@ -7,6 +7,19 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushB
                               QSpinBox, QVBoxLayout, QWidget)
 from tools.presentmon import PresentMon, summarize_captures
 from tools.victoria3_report import attach_benchmark, new_report
+from tools.resolution import normalize_resolution
+
+
+def graphics_differences(actual, expected):
+    def normalized(key, value):
+        if key == 'resolution' and isinstance(value, str):
+            try:
+                return normalize_resolution(value)
+            except ValueError:
+                pass
+        return value
+    return [f'{key}：报告 {value}，当前 {actual.get(key, "未显式保存")}'
+            for key, value in expected.items() if normalized(key, actual.get(key)) != normalized(key, value)]
 
 
 class CaptureJob(QThread):
@@ -99,10 +112,25 @@ class CapturePage(QWidget):
         self.status.setText('正在从官方 GitHub 下载并校验工具，请稍候…')
         self.run_job(lambda cancel: self.tool.prepare(cancel), lambda _: self.status.setText('采集工具已就绪。载入游戏后即可开始。'))
 
+    def suggest_stage(self):
+        if self.job:
+            return
+        try:
+            reports = self.quick.reports.list()
+            report = next((r for r in reports if self.quick.current_report and r['id'] == self.quick.current_report['id']), None)
+            if report and report['phase'] == 'applied':
+                settings = self.quick.service.read_settings()['Graphics']
+                if not graphics_differences(settings, report['after']['Graphics']):
+                    self.side.setCurrentIndex(1)
+                    self.confirm.setChecked(False)
+                    self.status.setText('已识别当前使用优化后的设置，已选择“采集优化后”。如需采集优化前，请先在一键优化页恢复备份。')
+        except (OSError, ValueError):
+            pass
+
     def capture(self):
         try:
             if not self.confirm.isChecked():
-                raise ValueError('请先确认游戏中的存档、场景和配置')
+                raise ValueError('请先载入游戏存档，再勾选开始按钮上方的确认框；无需查找文件')
             side = self.side.currentData()
             records = self.quick.reports.list()
             report = next((r for r in records if self.quick.current_report and r['id'] == self.quick.current_report['id']), None)
@@ -110,16 +138,26 @@ class CapturePage(QWidget):
                 machine = self.quick.service.discover()
                 report = new_report(machine, machine['settings'])
                 self.quick.reports.save(report)
-            if side == 'candidate' and report['phase'] != 'applied':
-                raise ValueError('请先应用优化方案，再采集优化后数据')
             settings = self.quick.service.read_settings()
+            switched = False
+            if side == 'baseline' and report['phase'] == 'applied' and not graphics_differences(settings['Graphics'], report['after']['Graphics']):
+                side = 'candidate'
+                switched = True
+                self.side.setCurrentIndex(1)
+            if side == 'candidate' and report['phase'] != 'applied':
+                raise ValueError('尚未应用优化方案，请先采集优化前，或应用方案后再采集优化后')
             if side == 'baseline' and report['phase'] == 'restored':
                 machine = self.quick.service.discover()
                 report = new_report(machine, settings)
                 self.quick.reports.save(report)
             expected = report['before'] if side == 'baseline' else report['after']
-            if settings['Graphics'] != expected['Graphics']:
-                raise ValueError('当前图形设置与所选报告不符，请选择正确阶段或恢复对应配置')
+            differences = graphics_differences(settings['Graphics'], expected['Graphics'])
+            if differences and side == 'baseline':
+                machine = self.quick.service.discover()
+                report = new_report(machine, settings)
+                self.quick.reports.save(report)
+            elif differences:
+                raise ValueError('当前设置还不是本报告的优化后配置：\n' + '\n'.join(differences) + '\n请先在一键优化页应用对应方案，再重启游戏。')
             self.tool.game_pid()
             self.quick.current_report = report
             context = deepcopy(report)
@@ -127,7 +165,7 @@ class CapturePage(QWidget):
             self.confirm.setChecked(False)
             self.run_job(lambda cancel: self.tool.capture(self.quick.reports.path.parent / 'captures', seconds, cancel),
                          lambda result: self.save_capture(context, side, settings, result), timed=True)
-            self.status.setText('采集将在 8 秒后开始，请切回 Victoria 3。')
+            self.status.setText(('当前已应用优化，自动切换为采集优化后。' if switched else '') + '采集将在 8 秒后开始，请切回 Victoria 3。')
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
 
