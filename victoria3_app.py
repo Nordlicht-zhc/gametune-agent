@@ -14,6 +14,7 @@ from agent.victoria3_model import explain_victoria3
 from victoria3_page import Victoria3Page
 from tools.victoria3_report import metric_rows
 from tools.windows_launch import is_admin
+from tools.app_version import APP_VERSION
 from admin_handoff import signal_ready
 
 
@@ -27,7 +28,7 @@ class CopyableLabels(QObject):
 class Victoria3Window(QMainWindow):
     def __init__(self, database_path=None, provider=None):
         super().__init__()
-        self.setWindowTitle("Victoria 3 Optimizer · 维多利亚3性能优化")
+        self.setWindowTitle(f"Victoria 3 Optimizer · 维多利亚3性能优化 · v{APP_VERSION}")
         if is_admin():
             self.setWindowTitle(self.windowTitle() + '（管理员）')
         self.resize(1280, 860)
