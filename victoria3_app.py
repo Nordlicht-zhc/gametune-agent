@@ -6,7 +6,8 @@ import sys
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QHBoxLayout,
     QMainWindow, QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget)
+    QTextEdit, QVBoxLayout, QWidget, QTabWidget)
+from victoria3_capture import CapturePage
 from app import STYLESHEET, APISettingsPage, ModelWorker, PageHeader, SectionHeader, label, set_margins
 from agent.api import OpenAICompatibleProvider, provider_from_env
 from agent.victoria3_model import explain_victoria3
@@ -62,7 +63,11 @@ class Victoria3Window(QMainWindow):
         self.stack.addWidget(self.overview)
         self.stack.addWidget(self.wrap(self.quick))
         self.source.advanced.setVisible(True)
-        self.stack.addWidget(self.wrap(self.source.advanced))
+        tests = QTabWidget()
+        self.capture_page = CapturePage(self.quick)
+        tests.addTab(self.capture_page, '自动采集 FPS')
+        tests.addTab(self.wrap(self.source.advanced), '高级跑日测试')
+        self.stack.addWidget(tests)
         history = QWidget()
         history_layout = set_margins(QVBoxLayout(history), 30, 26, 30, 26, 16)
         history_layout.addWidget(PageHeader('实验档案', '历史记录', '查看各次优化的配置与报告，性能数据保留来源和验证状态。'))
@@ -213,6 +218,11 @@ class Victoria3Window(QMainWindow):
         self.model_button.setEnabled(True)
 
     def closeEvent(self, event):
+        if self.capture_page.job:
+            self.capture_page.job.cancel.set()
+            self.capture_page.status.setText('正在取消采集，请等待任务结束后关闭。')
+            event.ignore()
+            return
         self.settings.stop_workers()
         if self.job and self.job.isRunning():
             event.ignore()
