@@ -101,7 +101,8 @@ class PresentMonTests(unittest.TestCase):
             page = CapturePage(quick)
             page.status.setText('测试错误：可以直接复制')
             page.copy_button.click()
-            self.assertEqual(app.clipboard().text(), '测试错误：可以直接复制')
+            self.assertIn('测试错误：可以直接复制', app.clipboard().text())
+            self.assertIn('Victoria 3 Optimizer v', app.clipboard().text())
             class Clock:
                 milliseconds = 0
                 def isValid(self):

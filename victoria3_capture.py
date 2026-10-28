@@ -11,6 +11,7 @@ from tools.victoria3_report import attach_benchmark, new_report
 from tools.resolution import normalize_resolution
 from tools.windows_launch import is_admin, restart_as_admin
 from admin_handoff import AdminHandoff
+from tools.app_version import APP_VERSION
 
 
 def graphics_differences(actual, expected):
@@ -56,7 +57,7 @@ class CapturePage(QWidget):
                       '此处采集平均 FPS 和 1% Low，不采集跑日速度、温度或功耗。')
         note.setWordWrap(True)
         root.addWidget(note)
-        self.permission = QLabel('当前权限：' + ('管理员，可尝试启动 ETW 采集' if is_admin() else '普通用户；ETW 权限不足时需管理员启动'))
+        self.permission = QLabel(f'程序版本：v{APP_VERSION}（已支持 msBetweenPresents 表头）\n当前权限：' + ('管理员，可尝试启动 ETW 采集' if is_admin() else '普通用户；ETW 权限不足时需管理员启动'))
         self.permission.setWordWrap(True)
         root.addWidget(self.permission)
         self.admin_button = QPushButton('以管理员权限打开采集页（需要确认 Windows 弹窗）')
@@ -96,7 +97,7 @@ class CapturePage(QWidget):
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         root.addWidget(self.status)
         copy_button = QPushButton('复制当前提示 / 报错')
-        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self.status.text()))
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(f'Victoria 3 Optimizer v{APP_VERSION}\n' + self.status.text()))
         root.addWidget(copy_button)
         self.copy_button = copy_button
         root.addStretch()
