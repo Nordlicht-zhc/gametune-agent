@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, Q
                               QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from tools.victoria3 import (SimulationConditions, SimulationRepository, compare_runs,
                              experiment_guidance, import_simulation_csv, save_fingerprint, summarize_runs)
+from victoria3_quick import Victoria3Quick
 
 
 class Victoria3Page(QScrollArea):
@@ -21,6 +22,16 @@ class Victoria3Page(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         layout = QVBoxLayout(body)
+        self.quick = Victoria3Quick()
+        layout.addWidget(self.quick)
+        self.advanced_toggle = QCheckBox("展开高级性能测试（可选）")
+        layout.addWidget(self.advanced_toggle)
+        self.advanced = QWidget()
+        self.advanced.setVisible(False)
+        self.advanced_toggle.toggled.connect(self.advanced.setVisible)
+        layout.addWidget(self.advanced)
+        layout.addStretch()
+        layout = QVBoxLayout(self.advanced)
         title = QLabel("Victoria 3 · 模拟速度与画面性能")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
@@ -79,6 +90,15 @@ class Victoria3Page(QScrollArea):
         export.clicked.connect(self.export)
         layout.addWidget(export)
         self.refresh_history()
+        self.quick.save_selected.connect(lambda path: self.fields["save"].setText(path))
+        self.quick.discovered.connect(self.populate_detected)
+
+    def populate_detected(self, data):
+        if self.baseline is not None:
+            return
+        self.fields["version"].setText(data["version"])
+        self.fields["configuration"].setText(json.dumps(data["settings"]["Graphics"], ensure_ascii=False))
+        # Only actual observations are copied; speed, date range and mods remain explicit.
 
     def add_row(self):
         self.table.insertRow(self.table.rowCount())
