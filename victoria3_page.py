@@ -22,7 +22,7 @@ class Victoria3Page(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         layout = QVBoxLayout(body)
-        self.quick = Victoria3Quick()
+        self.quick = Victoria3Quick(database_path=database_path)
         layout.addWidget(self.quick)
         self.advanced_toggle = QCheckBox("展开高级性能测试（可选）")
         layout.addWidget(self.advanced_toggle)
@@ -165,6 +165,10 @@ class Victoria3Page(QScrollArea):
                       "configuration_confirmed": self.confirmed.isChecked(), "result": result}
             self.repository.save(report)
             self.report = report
+            try:
+                self.quick.attach_experiment(report)
+            except ValueError as error:
+                self.quick.status.setText(str(error))
             self.output.setPlainText(f"{result['reason']}\n模拟速度变化：{result['simulation_delta_pct']:+.2f}%\n"
                 + json.dumps(result, ensure_ascii=False, indent=2))
             self.confirmed.setChecked(False)
