@@ -104,7 +104,9 @@ class CapturePage(QWidget):
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.tick)
         self.clock = QElapsedTimer()
-        self.overlay = QLabel('', self.window(), Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.capture_window = None
+        self.capture_was_maximized = False
+        self.overlay = QLabel('', None, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.overlay.setStyleSheet('background:#202421;color:#d7ff62;padding:16px;border-radius:10px;font-size:24px;')
@@ -112,6 +114,9 @@ class CapturePage(QWidget):
 
     def begin_countdown(self):
         self.clock.start()
+        self.capture_window = self.window()
+        self.capture_was_maximized = self.capture_window.isMaximized()
+        self.capture_window.showMinimized()
         self.countdown.setText('8 秒后开始采集 · 请切回游戏')
         self.overlay.setText('8 秒后开始采集')
         self.overlay.adjustSize()
@@ -128,9 +133,9 @@ class CapturePage(QWidget):
             self.countdown.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集 · 请切回游戏')
             self.overlay.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集')
         else:
-            self.overlay.hide()
             remaining = max(0, ceil((self.seconds.value() * 1000 - (milliseconds - 8000)) / 1000))
             self.countdown.setText(f'正在采集 · 剩余约 {remaining} 秒' if remaining else '采集结束 · 正在计算并保存报告…')
+            self.overlay.setText(f'采集中 · 剩余 {remaining} 秒' if remaining else '正在计算并保存报告…')
 
     def open_admin(self):
         if self.job:
@@ -186,6 +191,7 @@ class CapturePage(QWidget):
     def finished(self):
         self.timer.stop()
         self.overlay.hide()
+        self.restore_capture_window()
         self.countdown.setText('本次任务已结束 · 结果或报错见下方（可复制）')
         self.job.deleteLater()
         self.job = None
@@ -193,6 +199,17 @@ class CapturePage(QWidget):
         self.prepare_button.setEnabled(True)
         self.seconds.setEnabled(True)
         self.side.setEnabled(True)
+
+    def restore_capture_window(self):
+        if self.capture_window is not None:
+            window = self.capture_window
+            self.capture_window = None
+            if self.capture_was_maximized:
+                window.showMaximized()
+            else:
+                window.showNormal()
+            window.raise_()
+            window.activateWindow()
 
     def prepare(self):
         self.status.setText('正在从官方 GitHub 下载并校验工具，请稍候…')

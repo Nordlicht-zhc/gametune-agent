@@ -60,6 +60,13 @@ class PresentMonTests(unittest.TestCase):
             self.assertEqual(result['selected_swap_chain'], 'main')
             self.assertEqual(result['run_count'], 1)
 
+    def test_official_260_lowercase_ms_header(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'capture.csv'
+            path.write_text('Application,ProcessID,SwapChainAddress,msBetweenPresents\n'
+                            + 'victoria3.exe,123,main,16\n' * 120, encoding='utf-8-sig')
+            self.assertEqual(load_capture(path, 123)['avg_fps'], 62.5)
+
     def test_capture_uses_native_csv_and_validates_duration(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as folder:
@@ -111,6 +118,23 @@ class PresentMonTests(unittest.TestCase):
             clock.milliseconds = 8000
             page.tick()
             self.assertIn('正在采集', page.countdown.text())
+            self.assertIn('剩余 60 秒', page.overlay.text())
+            class FakeWindow:
+                state = ''
+                def showNormal(self):
+                    self.state = 'normal'
+                def showMaximized(self):
+                    self.state = 'maximized'
+                def raise_(self):
+                    pass
+                def activateWindow(self):
+                    pass
+            window = FakeWindow()
+            page.capture_window = window
+            page.capture_was_maximized = True
+            page.restore_capture_window()
+            self.assertEqual(window.state, 'maximized')
+            self.assertIsNone(page.capture_window)
             result = {'metrics': {'avg_fps': 60, 'low_fps': 40}, 'seconds': 60, 'csv': 'fixture'}
             page.save_capture(report, 'baseline', settings, result)
             quick.preview()
