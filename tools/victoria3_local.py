@@ -77,6 +77,7 @@ class LocalVictoria3:
                 "install": str(install) if install and install.is_dir() else "未识别",
                 "version": field(r"Exe Git Version: (.+)"),
                 "cpu": field(r"CPU Model: (.+)"), "gpu": field(r"GPU Name: (.+)"),
+                "ram": field(r"RAM Total: (.+)") + " MB（游戏日志）", "os": field(r"OS Version: (.+)"),
                 "saves": saves,
                 "hardware_source": "最近一次游戏启动日志，可能不是当前硬件状态"}
 
