@@ -3,12 +3,12 @@ import argparse
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, QTimer, QObject, QEvent
+from PySide6.QtCore import Qt, QThread, QTimer, QObject, QEvent, Signal, Slot
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QHBoxLayout,
     QMainWindow, QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget, QTabWidget, QLabel)
 from victoria3_capture import CapturePage
-from app import STYLESHEET, APISettingsPage, ModelWorker, PageHeader, SectionHeader, label, set_margins
+from app import STYLESHEET, APISettingsPage, PageHeader, SectionHeader, label, set_margins
 from agent.api import OpenAICompatibleProvider, provider_from_env
 from agent.victoria3_model import explain_victoria3
 from victoria3_page import Victoria3Page
@@ -23,6 +23,23 @@ class CopyableLabels(QObject):
         if event.type() == QEvent.Type.Show and isinstance(watched, QLabel):
             watched.setTextInteractionFlags(watched.textInteractionFlags() | Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         return False
+
+
+class ReportExplanationJob(QThread):
+    completed = Signal(object)
+
+    def __init__(self, provider, snapshot, parent=None):
+        super().__init__(parent)
+        self.provider = provider
+        self.snapshot = snapshot
+
+    def run(self):
+        try:
+            result = explain_victoria3(self.provider, self.snapshot)
+        except Exception:
+            result = {'source': 'local', 'summary': '模型解读失败，原始报告保留不变。',
+                      'steps': ['请检查接口配置，或继续使用报告中的本地建议。']}
+        self.completed.emit(result)
 
 
 class Victoria3Window(QMainWindow):
@@ -113,6 +130,7 @@ class Victoria3Window(QMainWindow):
         self.model_text.setPlaceholderText('模型解读独立展示，不会改变报告中的数值或自动执行操作。')
         self.model_text.setMaximumHeight(110)
         report_layout.addWidget(self.model_text)
+        self.quick.report_view.report_selected.connect(self.restore_model_explanation)
         self.stack.addWidget(report_page)
         config = provider.config if isinstance(provider, OpenAICompatibleProvider) else None
         self.settings = APISettingsPage(config)
@@ -168,7 +186,8 @@ class Victoria3Window(QMainWindow):
             box = set_margins(QVBoxLayout(card), 20, 20, 20, 20, 10)
             box.addWidget(label(metric[0], 'cardKicker'))
             box.addWidget(label(metric[2], 'metricValue'))
-            box.addWidget(label('最新报告中的优化后实测', 'metricNote'))
+            box.addWidget(label('优化前实测：' + metric[1], 'metricNote', True))
+            box.addWidget(label('上方大字为优化后实测；缺失项不估算', 'metricNote'))
             row.addWidget(card)
         layout.addLayout(row)
         card = QFrame()
@@ -215,24 +234,49 @@ class Victoria3Window(QMainWindow):
         snapshot = deepcopy(report)
         provider = self.provider
         self.model_button.setEnabled(False)
-        self.job = QThread(self)
-        self.worker = ModelWorker(lambda: explain_victoria3(provider, snapshot))
-        self.worker.moveToThread(self.job)
-        self.job.started.connect(self.worker.run)
-        self.worker.finished.connect(lambda result: self.receive_explanation(result, snapshot, provider))
-        self.worker.finished.connect(self.job.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.job.finished.connect(self.finish_job)
+        self.model_text.setPlainText('正在生成解读，原始实测与报告已保存…')
+        self.job = ReportExplanationJob(provider, snapshot, self)
+        self.job.completed.connect(self.model_completed, Qt.ConnectionType.QueuedConnection)
+        self.job.finished.connect(self.finish_job, Qt.ConnectionType.QueuedConnection)
         self.job.start()
 
-    def receive_explanation(self, result, snapshot, provider):
-        if self.quick.report_view.report == snapshot and self.provider is provider:
-            self.model_text.setPlainText(('模型建议（未经性能验证）' if result['source'] == 'model' else '本地建议') + '\n' + result['summary'] + '\n' + '\n'.join(result['steps']))
+    @Slot(object)
+    def model_completed(self, result):
+        job = self.sender()
+        if job is not self.job:
+            return
+        self.receive_explanation(result, job.snapshot, job.provider)
 
+    def receive_explanation(self, result, snapshot, provider):
+        durable = next((record for record in self.quick.reports.list() if record['id'] == snapshot['id']), None)
+        if self.quick.report_view.report == snapshot and durable == snapshot and self.provider is provider:
+            from copy import deepcopy
+            report = deepcopy(snapshot)
+            report['model_explanation'] = result
+            try:
+                self.quick.reports.save(report)
+                self.quick.current_report = report
+                self.quick.report_view.load(report)
+            except Exception:
+                self.model_text.setPlainText('模型返回成功，但保存失败；原实测报告保留。\n' + result['summary'])
+        else:
+            self.model_text.setPlainText('请求期间报告或模型配置已改变，本次解读未覆盖当前报告。请重新生成。')
+
+    @Slot(dict)
+    def restore_model_explanation(self, report):
+        result = report.get('model_explanation')
+        if result:
+            self.model_text.setPlainText(('模型建议（未经性能验证）' if result['source'] == 'model' else '本地建议') + '\n' + result['summary'] + '\n' + '\n'.join(result['steps']))
+        elif not self.job:
+            self.model_text.clear()
+
+    @Slot()
     def finish_job(self):
-        self.job.deleteLater()
+        job = self.sender()
+        if job is not self.job:
+            return
+        job.deleteLater()
         self.job = None
-        self.worker = None
         self.model_button.setEnabled(True)
 
     def closeEvent(self, event):

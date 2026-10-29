@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 from contextlib import closing
 from uuid import uuid4
+from tools.resolution import normalize_resolution
 
 from tools.victoria3 import compare_runs
 
@@ -18,6 +19,38 @@ SETTING_LABELS = {"resolution": "分辨率", "quality": "画质模式", "multi_s
                   "shadowmap_resolution": "阴影分辨率"}
 PHASE_LABELS = {"assessment": "本机诊断 · 尚未应用", "applied": "设置已应用 · 待性能验证",
                 "restored": "设置已恢复", "external_change": "当前设置已发生额外变化"}
+
+
+def transfer_baseline(source, target):
+    """Carry measured baseline and provenance, ignoring audio/UI bookkeeping."""
+    target.pop('baseline_report_id', None)
+    if not source or not source['observations'].get('baseline'):
+        target['baseline_notice'] = '本轮没有关联优化前实测；已有记录仍可在历史报告查看。'
+        return target
+    def graphics(settings):
+        result = deepcopy(settings['Graphics'])
+        if isinstance(result.get('resolution'), str):
+            try:
+                result['resolution'] = normalize_resolution(result['resolution'])
+            except ValueError:
+                pass
+        return result
+    if graphics(source['before']) != graphics(target['before']):
+        target['baseline_notice'] = '优化前图形配置已改变，旧实测仍保留在历史报告，本轮未自动关联。'
+        return target
+    for key in ('cpu', 'gpu', 'version'):
+        before, after = source['machine'].get(key), target['machine'].get(key)
+        if before and after and before != '未识别' and after != '未识别' and before != after:
+            target['baseline_notice'] = '设备或游戏版本发生变化，旧基线仍保留在历史报告。'
+            return target
+    target['observations']['baseline'] = deepcopy(source['observations']['baseline'])
+    for key in ('captures', 'sensor_status'):
+        if source.get(key, {}).get('baseline'):
+            target.setdefault(key, {})['baseline'] = deepcopy(source[key]['baseline'])
+    target['sources'].update({key: deepcopy(value) for key, value in source['sources'].items() if key.startswith('baseline_')})
+    target['baseline_report_id'] = source['id']
+    target['baseline_notice'] = '已保留优化前实测及原始采集记录。'
+    return target
 METRICS = (("avg_fps", "平均 FPS", "FPS"), ("low_fps", "1% Low", "FPS"),
            ("days_per_second", "模拟推进速度", "游戏天/秒"), ("gpu_usage", "GPU 占用率", "%"),
            ("cpu_usage", "CPU 占用率", "%"), ("gpu_temperature", "GPU 温度", "℃"),
@@ -155,12 +188,17 @@ def report_html(report: dict) -> str:
     html = '<html><head><meta charset="utf-8"></head><body style="font-family:Microsoft YaHei UI;color:#202422">'
     html += '<h1>Victoria 3 优化报告</h1><p>' + e(PHASE_LABELS[report["phase"]]) + '</p>'
     html += '<p>生成时间：' + e(report["created_at"]) + ' · 报告编号：' + e(report["id"][:12]) + '</p>'
-    html += '<h2>本机配置与来源</h2>' + table(["项目", "读取结果"], [
+    hardware_html = '<h2>本机配置与来源</h2>' + table(["项目", "读取结果"], [
         ["游戏版本", machine.get("version", "未识别")], ["CPU", machine.get("cpu", "未识别")],
         ["GPU", machine.get("gpu", "未识别")], ["内存", machine.get("ram", "未识别")],
         ["操作系统", machine.get("os", "未识别")], ["硬件来源", machine.get("hardware_source", "最近一次启动日志")]])
     html += '<h2>优化前后性能水平</h2><p>指标来自导入或受控实验。未采集项不估算；GPU 占用变化不直接代表性能收益。</p>'
+    if report.get('baseline_notice'):
+        html += '<p>' + e(report['baseline_notice']) + '</p>'
+    if report.get('baseline_report_id'):
+        html += '<p>优化前记录来源：' + e(report['baseline_report_id']) + '</p>'
     html += table(["指标", "优化前实测", "优化后实测", "变化", "证据状态"], metric_rows(report))
+    html += hardware_html
     if report.get('sensor_status'):
         html += '<h2>传感器来源与采样情况</h2>' + table(['阶段', '指标', '来源/原因', '有效样本', '峰值'], [
             ['优化前' if side == 'baseline' else '优化后', next((label for ident, label, _ in METRICS if ident == key), key),
@@ -174,6 +212,10 @@ def report_html(report: dict) -> str:
         [SETTING_LABELS.get(key, key), report["before"]["Graphics"].get(key), report["after"]["Graphics"].get(key)]
         for key in sorted(set(report["before"]["Graphics"]) | set(report["after"]["Graphics"]))])
     html += '<h2>高级优化建议</h2><ul>' + ''.join('<li>' + e(item) + '</li>' for item in advice(report)) + '</ul>'
+    if report.get('model_explanation'):
+        explanation = report['model_explanation']
+        html += '<h2>补充解读（不改变实测结论）</h2><p>' + e('模型建议，未经性能验证' if explanation['source'] == 'model' else '本地建议') + '</p>'
+        html += '<p>' + e(explanation['summary']) + '</p><ul>' + ''.join('<li>' + e(step) + '</li>' for step in explanation['steps']) + '</ul>'
     html += '<h2>数据来源与操作记录</h2>'
     html += '<p>' + e(json.dumps(report["sources"], ensure_ascii=False)) + '</p>'
     html += table(["状态", "时间"], [[PHASE_LABELS.get(event["phase"], event["phase"]), event["at"]] for event in report["events"]])

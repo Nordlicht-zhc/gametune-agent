@@ -9,7 +9,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QTextEdit,
                               QVBoxLayout, QWidget)
 from tools.victoria3_local import LocalVictoria3
-from tools.victoria3_report import ReportRepository, new_report, attach_simulation
+from tools.victoria3_report import ReportRepository, new_report, attach_simulation, transfer_baseline
 from victoria3_report_view import Victoria3ReportView
 
 
@@ -31,6 +31,7 @@ class Victoria3Quick(QWidget):
         self.report_embedded = False
         self.machine = {}
         self.current_report = None
+        self.report_view.report_selected.connect(self.select_current_report)
         self.plan = None
         layout = QVBoxLayout(self)
         title = QLabel("Victoria 3 · 一键设置优化")
@@ -181,13 +182,7 @@ class Victoria3Quick(QWidget):
             previous = next((item for item in self.reports.list() if self.current_report and item["id"] == self.current_report["id"]), None)
             self.current_report = new_report(machine, before, self.service.read_settings(),
                                              phase="applied", backup=str(backup), mode=mode)
-            if previous and previous["phase"] == "assessment" and previous["before"] == before:
-                self.current_report["observations"]["baseline"] = previous["observations"]["baseline"]
-                if previous.get('captures', {}).get('baseline'):
-                    self.current_report['captures'] = {'baseline': previous['captures']['baseline']}
-                if previous.get('sensor_status', {}).get('baseline'):
-                    self.current_report['sensor_status'] = {'baseline': previous['sensor_status']['baseline']}
-                self.current_report["sources"] = {key: value for key, value in previous["sources"].items() if key.startswith("baseline_")}
+            self.current_report = transfer_baseline(previous, self.current_report)
             self.reports.save(self.current_report)
             self.refresh_backups()
             self.show_report()
@@ -239,6 +234,9 @@ class Victoria3Quick(QWidget):
                 self.report_view.raise_()
         except (OSError, ValueError, sqlite3.Error) as error:
             self.status.setText(f"报告生成失败：{error}")
+
+    def select_current_report(self, report):
+        self.current_report = report
 
     def attach_experiment(self, experiment):
         if not self.current_report:
