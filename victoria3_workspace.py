@@ -3,7 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import sqlite3
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QFrame,QTabWidget,QTableWidgetItem
+from PySide6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QFrame,QTabWidget,QTableWidgetItem,QPushButton
 from victoria3_app import Victoria3Window,ReportExplanationJob
 from app import PageHeader,label,set_margins
 from tools.configurations import ConfigurationRepository,comparison_snapshot,value_text
@@ -44,6 +44,15 @@ class ConfigurationWindow(Victoria3Window):
         for widget in (self.consent,self.model_button,self.model_text):layout.addWidget(widget);widget.show()
         self.consent.setText('允许将当前配置或 A/B 对比的硬件型号、设置与实测摘要发送到模型接口')
         self.stack.insertWidget(4,page)
+        guide=QFrame();guide.setObjectName('card')
+        guide_layout=QVBoxLayout(guide)
+        guide_layout.addWidget(label('性能分析 · 按顺序完成','sectionTitle'))
+        guide_layout.addWidget(label('① 选择下面的配置 → ② 采集 60 秒 → ③ 分析瓶颈 → ④ 按建议调整并对比','ruleText',True))
+        actions=QHBoxLayout()
+        for text,callback in [('② 开始性能测试',lambda:self.navigate(2)),('③ 分析当前配置',self.start_guided_analysis),('④ 查看配置对比',lambda:self.config_tabs.setCurrentIndex(1))]:
+            button=QPushButton(text);button.clicked.connect(callback);actions.addWidget(button)
+        guide_layout.addLayout(actions);layout.insertWidget(1,guide)
+        self.model_button.setText('分析主要瓶颈与改进步骤')
         self.group.button(3).setText('配置库')
         self.group.button(4).setText('配置报告与对比')
         self.history.setHorizontalHeaderLabels(['配置名称','测试次数','分辨率','配置编号'])
@@ -141,7 +150,16 @@ class ConfigurationWindow(Victoria3Window):
         else:self.show_explanation(self.config_report.record.get('model_explanation') if self.config_report.record else None)
 
     def show_explanation(self,result):
-        self.model_text.setPlainText(('模型建议（未经验证）' if result['source']=='model' else '本地建议')+'\n'+result['summary']+'\n'+'\n'.join(result['steps']) if result else '')
+        self.model_text.setPlainText(result['summary']+'\n\n'+'\n\n'.join(f'{i}. {step}' for i,step in enumerate(result['steps'],1)) if result else '')
+
+    def start_guided_analysis(self):
+        self.config_tabs.setCurrentIndex(0)
+        record=self.config_report.record
+        if not record or not record['observations'].get('run_count'):
+            self.navigate(2)
+            self.capture_page.status.setText('下一步：载入游戏存档，勾选场景确认，然后开始 60 秒采集。')
+            return
+        self.explain()
 
     def restore_model_explanation(self,report):
         if not hasattr(self,'configurations'):return super().restore_model_explanation(report)
