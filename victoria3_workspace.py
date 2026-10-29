@@ -64,6 +64,15 @@ class ConfigurationWindow(Victoria3Window):
         self.config_report.selected.connect(self.configuration_selected)
         self.comparison.changed.connect(self.comparison_changed)
         self.config_tabs.currentChanged.connect(self.comparison_changed)
+        from hardware_upgrade import HardwareUpgradeTool
+        self.upgrade_tool=HardwareUpgradeTool(self)
+        self.stack.addWidget(self.upgrade_tool)
+        sidebar=self.group.button(5).parentWidget().layout()
+        sidebar.insertWidget(sidebar.count()-2,label('工具区','sidebarLabel'))
+        tool_button=QPushButton('硬件升级分析')
+        tool_button.setObjectName('navButton');tool_button.setCheckable(True)
+        self.group.addButton(tool_button,6)
+        sidebar.insertWidget(sidebar.count()-2,tool_button)
         self.refresh_config_views()
         self.navigate(0)
 
@@ -100,6 +109,14 @@ class ConfigurationWindow(Victoria3Window):
                     self.history.setItem(row,col,QTableWidgetItem(value))
             self.history.resizeColumnsToContents()
         elif index==4:self.refresh_config_views()
+        elif index==6:self.upgrade_tool.refresh()
+
+    def closeEvent(self,event):
+        if hasattr(self,'upgrade_tool') and self.upgrade_tool.job:
+            self.upgrade_tool.result.setPlainText('硬件升级分析正在生成，完成后即可关闭。')
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def open_history(self):
         if not hasattr(self,'configurations'):return super().open_history()

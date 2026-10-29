@@ -305,7 +305,7 @@ class Victoria3Window(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--page', type=int, choices=range(6), default=0)
+    parser.add_argument('--page', type=int, choices=range(7), default=0)
     parser.add_argument('--screenshot', type=Path)
     parser.add_argument('--handoff-port', type=int)
     parser.add_argument('--handoff-token')
