@@ -5,10 +5,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QRect, QThread, QTimer, Signal
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtGui import QPainter, QColor, QCursor
 from PySide6.QtWidgets import QApplication, QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 from tools.presentmon import PresentMon
 from tools.game_date_ocr import recognize_date, summarize_dates
+from date_hotkey import SnapshotHotkey
 
 
 def foreground_pid():
@@ -22,8 +23,9 @@ class RegionPicker(QWidget):
     canceled = Signal()
 
     def __init__(self, screen, pixmap):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.image = pixmap
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.image = pixmap.copy()
         self.setGeometry(screen.geometry())
         self.origin = None
         self.selection = QRect()
@@ -33,10 +35,14 @@ class RegionPicker(QWidget):
         painter = QPainter(self)
         painter.drawPixmap(self.rect(), self.image)
         painter.setPen(QColor('#d7ff62'))
-        painter.drawText(24, 40, '仅框选游戏日期，例如 1900年1月15日。按 Esc 取消。截图仅在本机识别。')
+        painter.drawText(24, 40, '已冻结画面。拖动框选游戏日期；右键取消。日期截图仅在本机识别。')
         painter.drawRect(self.selection)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.canceled.emit()
+            self.close()
+            return
         self.origin = event.position().toPoint()
 
     def mouseMoveEvent(self, event):
@@ -89,6 +95,14 @@ class DatePanel(QWidget):
         self.error = ''
         self.picker = None
         self.pick_window = None
+        self.hotkey = None
+        self.pick_timeout = QTimer(self)
+        self.pick_timeout.setSingleShot(True)
+        self.pick_timeout.timeout.connect(self.cancel_selection)
+        self.pick_hint = QLabel('', None, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.pick_hint.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.pick_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.pick_hint.setStyleSheet('background:#202421;color:#d7ff62;padding:14px;font-size:18px;')
         root = QVBoxLayout(self)
         self.enabled = QCheckBox('同时自动识别游戏日期，计算跑日速度（首次需框选日期）')
         root.addWidget(self.enabled)
@@ -112,6 +126,9 @@ class DatePanel(QWidget):
             pass
 
     def select_region(self):
+        if self.pick_window:
+            self.cancel_selection()
+            return
         if self.worker or self.active:
             self.status.setText('请先等待当前采集或识别结束。')
             return
@@ -120,14 +137,42 @@ class DatePanel(QWidget):
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
             return
-        self.status.setText('3 秒后显示框选界面，请切回 Victoria 3，再拖动框选游戏日期。')
+        try:
+            self.hotkey = SnapshotHotkey(self.show_picker)
+            key = self.hotkey.start()
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self.status.setText(f'回到游戏，把鼠标移到日期使其显示，再按 {key} 冻结画面框选。等待超时或再次点击此按钮可取消。')
         self.pick_window = self.window()
         self.pick_maximized = self.pick_window.isMaximized()
         self.pick_screen = self.screen()
         self.pick_window.showMinimized()
-        QTimer.singleShot(3000, self.show_picker)
+        self.select_button.setText('取消日期框选')
+        self.pick_hint.setText(f'移到游戏日期使其显示 → 按 {key} 冻结画面后框选')
+        self.pick_hint.adjustSize()
+        self.pick_hint.move(self.pick_screen.availableGeometry().center().x() - self.pick_hint.width() // 2,
+                            self.pick_screen.availableGeometry().top() + 24)
+        self.pick_hint.show()
+        self.pick_timeout.start(60000)
+
+    def stop_picker_wait(self):
+        self.pick_timeout.stop()
+        self.pick_hint.hide()
+        if self.hotkey:
+            self.hotkey.stop()
+            self.hotkey = None
+        self.select_button.setText('框选游戏日期区域（一次）')
+
+    def cancel_selection(self):
+        self.stop_picker_wait()
+        if self.picker:
+            self.picker.close()
+        self.status.setText('日期框选已取消或等待超时，未修改选区。')
+        self.restore_picker_window()
 
     def restore_picker_window(self):
+        self.stop_picker_wait()
         if self.pick_window:
             self.pick_window.showMaximized() if self.pick_maximized else self.pick_window.showNormal()
             self.pick_window.activateWindow()
@@ -135,12 +180,26 @@ class DatePanel(QWidget):
 
     def show_picker(self):
         if foreground_pid() != self.pid:
-            self.status.setText('未检测到前台 Victoria 3。请重试，并在 3 秒内切回游戏。')
+            self.pick_hint.setText('请先切回 Victoria 3，将鼠标移到日期，再按截图快捷键。')
+            self.pick_hint.adjustSize()
+            return
+        self.pick_screen = QApplication.screenAt(QCursor.pos()) or self.pick_screen
+        self.stop_picker_wait()
+        QTimer.singleShot(120, self.freeze_picker)
+
+    def freeze_picker(self):
+        if foreground_pid() != self.pid:
+            self.status.setText('截图前游戏失去焦点，请重新框选。')
             self.restore_picker_window()
             return
-        self.picker = RegionPicker(self.pick_screen, self.pick_screen.grabWindow(0))
+        image = self.pick_screen.grabWindow(0)
+        if image.isNull():
+            self.status.setText('游戏画面无法截图，请使用无边框窗口模式后重试。')
+            self.restore_picker_window()
+            return
+        self.picker = RegionPicker(self.pick_screen, image)
         self.picker.selected.connect(self.region_selected)
-        self.picker.canceled.connect(self.restore_picker_window)
+        self.picker.canceled.connect(self.cancel_selection)
         self.picker.show()
 
     def region_selected(self, region):
@@ -181,7 +240,7 @@ class DatePanel(QWidget):
         if result['calibration']:
             self.config_path.write_text(json.dumps(self.config), encoding='utf-8')
             self.enabled.setChecked(True)
-            self.status.setText(f'识别日期：{result["date"]}。选区已保存；请核对正确后开始采集。')
+            self.status.setText(f'识别日期：{result["date"]}。选区已保存；请核对后开始采集，并在采集时保持日期可见。')
         elif self.active:
             self.samples.append({'date': result['date'], 'at_seconds': result['at_seconds']})
             self.status.setText(f'已识别 {len(self.samples)} 次日期，最近：{result["date"]}')
