@@ -41,6 +41,7 @@ from tools.api_settings import (
 from agent.planner import GENERIC_OPTIMIZATION_DIRECTIONS, plan_candidate_id, plan_next_experiment
 from ui_theme import STYLESHEET
 from ui_charts import RunChart
+from victoria3_page import Victoria3Page
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -484,6 +485,7 @@ class ToastNotice(QFrame):
 
 def label(text: str, object_name: str | None = None, wrap: bool = False) -> QLabel:
     widget = QLabel(text)
+    widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
     if object_name:
         widget.setObjectName(object_name)
     widget.setWordWrap(wrap)
@@ -2582,7 +2584,7 @@ class Sidebar(QFrame):
         root.addWidget(self.new_task_button)
         root.addSpacing(8)
         root.addWidget(label("当前任务", "sidebarLabel"))
-        for text, index in [("当前调校", 0), ("当前实验", 2), ("测试记录", 3), ("配置与报告", 4)]:
+        for text, index in [("当前调校", 0), ("当前实验", 2), ("测试记录", 3), ("配置与报告", 4), ("维多利亚 3", 6)]:
             if index == 3:
                 root.addSpacing(10)
                 root.addWidget(label("记录与结果", "sidebarLabel"))
@@ -2735,6 +2737,8 @@ class MainWindow(QMainWindow):
         self.api_settings = APISettingsPage(initial_api_config)
         for page in [self.dashboard, self.new_task, self.experiment, self.history, self.report, self.api_settings]:
             self.stack.addWidget(page)
+        self.victoria3 = Victoria3Page(database_path or DATA_DIR / "gametune.db")
+        self.stack.addWidget(self.victoria3)
         layout.addWidget(self.sidebar)
         layout.addWidget(self.stack, 1)
         self.sidebar.navigate.connect(self.set_page)
@@ -3708,7 +3712,7 @@ def run_app(screenshot: Path | None = None, page_index: int = 0) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="GameTune Agent desktop UI")
     parser.add_argument("--screenshot", type=Path, help="Render the dashboard to a PNG and exit")
-    parser.add_argument("--page", type=int, choices=range(6), default=0, help="Page index used by screenshot mode (0-5)")
+    parser.add_argument("--page", type=int, choices=range(7), default=0, help="Page index used by screenshot mode (0-6)")
     args = parser.parse_args()
     return run_app(args.screenshot, args.page)
 
