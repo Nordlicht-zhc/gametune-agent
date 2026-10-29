@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
 
-from PySide6.QtCore import QObject, QEvent, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
-from PySide6.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QBrush, QPainterPath, QRegion
+from PySide6.QtCore import QObject, QEvent, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSize, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
+from PySide6.QtGui import QFont, QPixmap, QPainter, QIcon, QPen, QColor, QBrush, QPainterPath, QRegion, QValidator
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QBoxLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -19,16 +19,17 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
 )
 
+from agent.explainer import explain_decision
+from agent.prompts import _plan_dict
 from agent.controller import GameTuneController, UNCAPPED_CHOICES
 from agent.api import (
     APIConfig, ModelAPIError, ModelMessage, ModelRequest, ModelResponse,
     OpenAICompatibleProvider, provider_from_env,
 )
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
-from tools.configuration import CONFIGURATION_LABELS
+from tools.configuration import CONFIGURATION_LABELS, canonical_value
 from tools.import_benchmark import import_benchmark_csv
 from tools.analyze_evidence import analyze_evidence, dominant_hypothesis, evidence_support_level
-from tools.calculate_metrics import normalized_score
 from tools.resolution import RESOLUTION_PRESETS, aspect_ratio_name, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog, HardwareEntry
 from tools.api_settings import (
@@ -38,9 +39,12 @@ from tools.api_settings import (
     save_saved_api_config,
 )
 from agent.planner import GENERIC_OPTIMIZATION_DIRECTIONS, plan_candidate_id, plan_next_experiment
+from ui_theme import STYLESHEET
+from ui_charts import RunChart
 
 
 APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR) / ".data"
 HARDWARE_CATALOG = HardwareCatalog(APP_DIR / "knowledge" / "hardware.json")
 
 
@@ -96,6 +100,21 @@ class TaskState:
             }
 
 
+class MeasurementSpinBox(QSpinBox):
+    """Keep missing measurements empty so hint text never blocks numeric typing."""
+
+    def textFromValue(self, value: int) -> str:
+        return "" if value == self.minimum() else super().textFromValue(value)
+
+    def valueFromText(self, text: str) -> int:
+        return self.minimum() if not text.strip() else super().valueFromText(text)
+
+    def validate(self, text: str, position: int):
+        if not text.strip():
+            return QValidator.State.Acceptable, text, position
+        return super().validate(text, position)
+
+
 class RoundedComboBox(QComboBox):
     """Clip the popup window as well as painting a rounded list border."""
 
@@ -115,7 +134,7 @@ class RoundedComboBox(QComboBox):
         center = QRectF(arrow_rect).center()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#526b8e" if self.isEnabled() else "#97a7bb")
+        color = QColor("#756f66" if self.isEnabled() else "#b3aa9e")
         painter.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         path = QPainterPath()
@@ -175,122 +194,28 @@ class ActualSettingInput(RoundedComboBox):
             self.setEditText(value)
 
 
-STYLESHEET = """
-* { font-family: "Microsoft YaHei UI"; font-size: 13px; color: #26364b; }
-QMainWindow, QWidget#root, QStackedWidget, QScrollArea,
-QScrollArea > QWidget > QWidget { background: #eef3f9; }
-QScrollArea { border: none; }
-QDialog#usageGuide { background: #eef3f9; }
-QFrame#sidebar { background: #e5edf7; border: none; border-right: 1px solid #c9d6e6; }
-QLabel#brandMark { background: #245dd8; color: #ffffff; border-radius: 10px; font-size: 18px; font-weight: 800; }
-QLabel#brandName { color: #1b304e; font-size: 17px; font-weight: 800; }
-QLabel#brandSub, QLabel#sidebarLabel { color: #66778d; font-size: 11px; font-weight: 700; }
-QPushButton#navButton { color: #536680; background: transparent; border: none; border-radius: 9px; text-align: left; padding: 10px 13px; font-size: 13px; }
-QPushButton#navButton:hover { background: #dbe6f5; color: #1b304e; }
-QPushButton#navButton:checked { color: #1c4fa7; background: #d2e0f5; font-weight: 700; }
-QPushButton#navButton:pressed { background: #c3d5ef; }
-QFrame#navIndicator { background: #245dd8; border-radius: 2px; }
-QFrame#sideTask { background: #f5f8fc; border: 1px solid #c9d6e6; border-radius: 11px; }
-QLabel#sideTaskTitle { color: #244672; font-weight: 700; font-size: 12px; }
-QLabel#sideTaskText { color: #657890; font-size: 11px; }
-QLabel#eyebrow { color: #687a90; font-size: 11px; font-weight: 800; }
-QLabel#pageTitle { color: #1b304e; font-size: 26px; font-weight: 800; }
-QLabel#subtitle { color: #63768e; font-size: 12px; }
-QLabel#sectionTitle { color: #26364b; font-size: 17px; font-weight: 800; }
-QLabel#sectionMeta { color: #6b7e96; font-size: 11px; }
-QLabel#statusPill { color: #2454a8; background: #e8f0ff; border-radius: 13px; padding: 6px 12px; font-size: 11px; font-weight: 800; }
-QFrame#card, QFrame#metricCard, QFrame#formCard { background: #ffffff; border: 1px solid #dce5ef; border-radius: 12px; }
-QLabel#cardKicker { color: #64778f; font-size: 11px; font-weight: 800; }
-QLabel#metricValue { color: #203d65; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 29px; font-weight: 800; }
-QLabel#metricNote { color: #64778f; font-size: 11px; }
-QProgressBar { background: #e5ecf5; border: none; border-radius: 3px; max-height: 6px; }
-QProgressBar::chunk { background: #245dd8; border-radius: 3px; }
-QFrame#heroCard { background: #e3edfc; border: none; border-radius: 16px; }
-QFrame#heroCard QLabel#cardKicker { color: #4d6e9b; }
-QLabel#heroTitle { color: #234b85; font-size: 20px; font-weight: 800; }
-QLabel#heroBody { color: #4d6587; font-size: 12px; }
-QLabel#confidence { color: #245dd8; background: #f5f8fe; border: 1px solid #bdcfeb; border-radius: 8px; padding: 7px 10px; font-size: 11px; font-weight: 700; }
-QLabel#tagGreen, QLabel#tagOrange, QLabel#tagNeutral { border-radius: 9px; padding: 4px 8px; font-size: 11px; font-weight: 700; }
-QLabel#tagGreen { color: #205ba2; background: #e7f0ff; }
-QLabel#tagOrange { color: #95501f; background: #ffefe2; }
-QLabel#tagNeutral { color: #596d86; background: #edf2f8; }
-QLabel#warningBox { color: #95501f; background: #ffefe2; border: 1px solid #f5d8c1; border-radius: 7px; padding: 6px 10px; min-height: 28px; }
-QLabel#actionNumber { color: #ffffff; background: #245dd8; border-radius: 7px; padding: 5px 7px; font-size: 11px; font-weight: 800; }
-QLabel#actionTitle { font-size: 15px; font-weight: 800; }
-QLabel#settingOld, QLabel#settingNew { border-radius: 8px; padding: 7px 10px; font-size: 11px; font-weight: 700; }
-QLabel#settingOld { color: #586b83; background: #eff3f9; }
-QLabel#settingNew { color: #1e53ac; background: #e8f0ff; }
-QLabel#ruleName { color: #2b405c; font-size: 12px; font-weight: 800; }
-QLabel#ruleText { color: #536781; font-size: 12px; }
-QFrame#ruleLine { background: #e0e8f2; max-height: 1px; }
-QPushButton#primaryButton { color: #ffffff; background: #245dd8; border: none; border-radius: 9px; padding: 9px 15px; font-weight: 700; }
-QPushButton#primaryButton:hover { background: #1d50c2; }
-QPushButton#primaryButton:pressed { background: #1843a4; }
-QPushButton#primaryButton:disabled { background: #d8e2f1; color: #7387a3; }
-QPushButton#secondaryButton { color: #2b456c; background: #ffffff; border: 1px solid #cbd8e9; border-radius: 9px; padding: 8px 14px; font-weight: 700; }
-QPushButton#secondaryButton:hover { background: #edf3fc; }
-QPushButton#secondaryButton:pressed { background: #e5e9e2; border-color: #aeb7ae; }
-QFrame#toastNotice { background: #ffffff; border: 1px solid #c9d6e6; border-radius: 10px; }
-QFrame#toastNotice[variant="success"] { border-left: 3px solid #245dd8; }
-QFrame#toastNotice[variant="info"] { border-left: 3px solid #85b6ee; }
-QFrame#toastNotice[variant="error"] { border-left: 3px solid #f29a73; }
-QLabel#toastText { color: #26364b; font-size: 12px; font-weight: 700; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
-    background-color: #ffffff;
-    color: #26364b;
-    border: 1px solid #cbd7e6;
-    border-radius: 8px;
-    padding: 7px 9px;
-    selection-background-color: #dbe8ff;
-    selection-color: #163c85;
-}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus { border: 1px solid #245dd8; }
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTextEdit:disabled,
-QLineEdit[readOnly="true"], QTextEdit[readOnly="true"] {
-    background-color: #ffffff;
-    color: #687a90;
-    border-color: #d8e2ee;
-}
-QComboBox { border-radius: 10px; padding-right: 30px; }
-QComboBox QLineEdit { border: none; border-radius: 0; padding: 0; background: transparent; }
-QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 24px; border: none; border-top-right-radius: 10px; border-bottom-right-radius: 10px; background: transparent; }
-QComboBox::down-arrow { image: none; width: 0; height: 0; }
-QComboBox QAbstractItemView { border-radius: 10px; padding: 5px; background: #ffffff; color: #26364b; border: 1px solid #cbd8e9; outline: none; selection-background-color: #dbe8ff; selection-color: #163c85; }
-QComboBox QAbstractItemView::item { min-height: 30px; padding: 4px 9px; }
-QFrame#actionCard { background: #ffffff; border: 1px solid #bdcfeb; border-left: 4px solid #245dd8; border-radius: 12px; }
-QFrame#guidePanel { background: #e9f0fb; border: none; border-radius: 9px; }
-QLabel#guideTitle { color: #254d86; font-weight: 700; font-size: 13px; }
-QLabel#guideText { color: #526b8e; font-size: 12px; }
-QPushButton { min-height: 28px; padding: 5px 10px; border: 1px solid #cbd8e9; border-radius: 8px; background: #ffffff; }
-QPushButton:disabled { color: #8997aa; background: #e8eef6; border-color: #d6e0ec; }
-QPushButton:focus { border: 2px solid #668de3; }
-QCheckBox { spacing: 8px; }
-QCheckBox::indicator { width: 16px; height: 16px; }
-QLabel#sideTaskTitle { color: #244672; }
-QLabel#sideTaskText { color: #607690; }
-QPushButton#secondaryButton:disabled { color: #8a99ad; background: #f1f5fa; border-color: #d8e2ef; }
-QMessageBox { background-color: #ffffff; }
-QMessageBox QLabel { background: transparent; color: #202422; min-width: 300px; }
-QMessageBox QPushButton {
-    min-width: 88px;
-    min-height: 30px;
-    padding: 4px 14px;
-    color: #202422;
-    background-color: #ffffff;
-    border: 1px solid #cfd5cf;
-    border-radius: 7px;
-}
-QMessageBox QPushButton:hover { background-color: #f0f3ed; border-color: #9ca69d; }
-QMessageBox QPushButton:default { color: #ffffff; background-color: #202421; border-color: #202421; }
-QToolTip { color: #202422; background-color: #ffffff; border: 1px solid #cfd5cf; padding: 5px; }
-QFormLayout QLabel { color: #505752; font-size: 11px; font-weight: 600; }
-QTableWidget { background: #ffffff; alternate-background-color: #f5f8fc; border: 1px solid #dce5ef; border-radius: 12px; gridline-color: #e8eef6; selection-background-color: #e8f0ff; }
-QHeaderView::section { background: #e9f0f9; color: #536984; border: none; border-bottom: 1px solid #d2dfed; padding: 9px; font-size: 10px; font-weight: 800; }
-QStatusBar { background: #eef3f9; color: #697c93; border-top: 1px solid #d5e0ed; }
-QScrollBar:vertical { background: transparent; width: 9px; margin: 3px; }
-QScrollBar::handle:vertical { background: #becce0; border-radius: 4px; min-height: 30px; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-"""
+class EditableChoiceInput(ActualSettingInput):
+    """Preserve text editing while offering known values and custom entries."""
+
+    textChanged = Signal(str)
+
+    def __init__(self, value: str, options: list[str]):
+        super().__init__(value, options)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setMaxVisibleItems(12)
+        self.setText(value)
+        self.currentTextChanged.connect(self.textChanged.emit)
+
+    def selectAll(self):
+        self.lineEdit().selectAll()
+
+    def clear(self):
+        self.clearEditText()
+
+    def setPlaceholderText(self, text: str):
+        self.lineEdit().setPlaceholderText(text)
+
 
 
 def set_margins(layout, left=0, top=0, right=0, bottom=0, spacing=0):
@@ -468,7 +393,7 @@ def animate_visibility(widget: QWidget, visible: bool, duration: int = 180) -> N
 
 
 class BusyIndicator(QWidget):
-    def __init__(self, color: str = "#245dd8", parent: QWidget | None = None):
+    def __init__(self, color: str = "#a9513c", parent: QWidget | None = None):
         super().__init__(parent)
         self._color = QColor(color)
         self._angle = 0
@@ -736,11 +661,11 @@ class UsageGuideDialog(QDialog):
         body = QWidget()
         content = set_margins(QVBoxLayout(body), 0, 0, 10, 0, 12)
         for title, text in [
-            ("1. 记录环境", "在“新建任务”记录设备、游戏内设置、测试场景和目标。下一步才测基线，创建前无需知道帧率。"),
+            ("1. 记录环境", "在“新建调校”记录设备、游戏内设置、测试场景和目标。下一步才测基线，创建前无需知道帧率。"),
             ("2. 建立基线", "同一场景、相同设置先测 2 次，每次至少 60 秒。波动超过 5% 时补测第 3 次。填写实际结果并确认测试条件。"),
-            ("3. 按建议验证", "在“概览”查看下一步，只改变指定设置。诊断测试用于查找原因；优化验证用于判断能否保留。不要同时更改多项。"),
+            ("3. 按实际设置继续", "建议可供参考，也可以同时调整多项画质。按实际配置录入后，程序会评估整组表现并更新后续建议；单项诊断只在满足对应条件时使用。"),
             ("4. 录入与恢复", "在“当前实验”导入 CSV 或填写测量值，核对实际设置。优化候选先测 1 次，没有明显退步时继续累计到 3 次；诊断参考按页面要求复测。出现恢复提示时，先在游戏里恢复，再确认。"),
-            ("5. 查看已验证结果", "“历史记录”保存每次测量和执行状态；“最终报告”显示已验证配置。平均 FPS 反映整体流畅度，1% Low 帮助观察慢帧表现；GPU 占用只作辅助证据。"),
+            ("5. 查看已验证结果", "“测试记录”保存每次测量和执行状态；“配置与报告”显示已验证配置。平均 FPS 反映整体流畅度，1% Low 帮助观察慢帧表现；GPU 占用只作辅助证据。"),
             ("模型连接是可选项", "模型可以解释结果、从校验过的候选中选择建议。指标、有效性与保留或回滚由程序判断。连接失败时使用本地规则；记录保存在本机。"),
         ]:
             content.addWidget(GuidancePanel(title, text))
@@ -753,58 +678,128 @@ class UsageGuideDialog(QDialog):
         layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
 
 
+class WorkflowStrip(QWidget):
+    """A presentation of the real workflow phase, never a state transition."""
+
+    def __init__(self, state: TaskState, plan: ExperimentPlan | None):
+        super().__init__()
+        row = set_margins(QHBoxLayout(self), 0, 9, 0, 9, 12)
+        if state.step == "优化完成":
+            active = 3
+        elif "恢复" in state.step or "回滚" in state.step:
+            active = 3
+        elif plan and plan.action == AgentAction.REQUEST_DATA:
+            active = 0
+        else:
+            active = 1
+        for index, title in enumerate(("基线测试", "调整与复测", "结果比较", "保留或恢复")):
+            step = label(f"{'✓' if index < active else index + 1}  {title}",
+                         "settingNew" if index == active else "sectionMeta")
+            step.setAccessibleName(f"{title}，{'当前阶段' if index == active else '已完成' if index < active else '后续阶段'}")
+            row.addWidget(step)
+            if index < 3:
+                row.addWidget(hline(), 1)
+
+
 class DashboardPage(QScrollArea):
     experiment_requested = Signal()
     task_requested = Signal()
 
-    def __init__(self, state: TaskState, evidence: list[Evidence] | None = None, plan: ExperimentPlan | None = None):
+    def __init__(self, state: TaskState, evidence: list[Evidence] | None = None,
+                 plan: ExperimentPlan | None = None, record: BenchmarkRecord | None = None):
         super().__init__()
         self.state = state
         self.evidence = evidence or []
         self.plan = plan
+        self.record = record
         self.setWidgetResizable(True)
         body = QWidget()
         self.setWidget(body)
-        root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 16)
-        root.addWidget(PageHeader("性能概览", "性能工作区", "先确认测试条件，再用一次只改一项的实验验证改善。", state.step if state.has_task else "尚未开始"))
+        root = set_margins(QVBoxLayout(body), 40, 30, 40, 36, 20)
+        if state.has_task:
+            root.addWidget(label(state.game, "eyebrow"))
+        root.addWidget(PageHeader("当前调校", "让每一次调整，都有依据" if state.has_task else "让游戏运行得更从容",
+                                  f"{state.name} · {state.step}" if state.has_task else "记录当前表现，再逐项验证值得尝试的调整。",
+                                  state.step if state.has_task else "尚未开始"))
         if not state.has_task:
+            root.addSpacing(30)
             welcome = QFrame()
-            welcome.setObjectName("actionCard")
-            welcome_layout = set_margins(QVBoxLayout(welcome), 28, 28, 28, 28, 14)
+            welcome.setObjectName("welcomePanel")
+            welcome_layout = set_margins(QVBoxLayout(welcome), 32, 36, 32, 36, 18)
             welcome_layout.addWidget(label("从一次可靠的基线开始", "heroTitle", True))
             welcome_layout.addWidget(label("记录电脑配置与游戏设置，再在同一场景完成基线测试。保存后，这里会显示真实的性能数据、判断依据和下一步建议。", "ruleText", True))
-            self.create_button = QPushButton("新建优化任务")
+            self.create_button = QPushButton("新建调校")
             self.create_button.setObjectName("primaryButton")
             self.create_button.clicked.connect(self.task_requested)
             welcome_layout.addWidget(self.create_button, 0, Qt.AlignmentFlag.AlignLeft)
             root.addWidget(welcome)
             root.addWidget(GuidancePanel("测试前准备", "使用同一种采集工具、同一段游戏场景和相同设置。基线先测 2 次，波动超过 5% 时补测第 3 次。"))
-            root.addWidget(GuidancePanel("已有任务？", "到“历史记录”选择以前保存的任务并打开，继续上次的测试。结果不足时，程序会提示补测或补充设置。"))
+            root.addWidget(GuidancePanel("已有任务？", "到“测试记录”选择以前保存的任务并打开，继续上次的测试。结果不足时，程序会提示补测或补充设置。"))
             root.addStretch()
             return
-        root.addWidget(SectionHeader("下一步操作", "建议尚未代表已执行"))
-        root.addWidget(self._action_card())
-        root.addWidget(SectionHeader("当前表现", "当前记录与目标；基线使用中位数"))
-        metrics = QGridLayout()
-        metrics.setHorizontalSpacing(12)
-        cards = [
-            MetricCard("平均帧率", f"{state.avg_fps} FPS", f"目标 {state.target_avg} FPS", round(state.avg_fps / state.target_avg * 100)),
-            MetricCard("1% Low", f"{state.low_fps} FPS", f"目标 {state.target_low} FPS", round(state.low_fps / state.target_low * 100)),
-            MetricCard("GPU 占用", f"{state.gpu_usage}%", "帮助分析性能受限的原因", state.gpu_usage),
-            MetricCard("目标完成度", f"{self._score():.0f} / 100", self._mode_name(), round(self._score())),
-        ]
-        for index, card in enumerate(cards):
-            metrics.addWidget(card, 0, index)
-        root.addLayout(metrics)
-        root.addWidget(SectionHeader("当前判断", "根据你提供的测试结果分析"))
-        diagnosis = QHBoxLayout()
-        diagnosis.setSpacing(14)
-        diagnosis.addWidget(self._hero(), 3)
-        diagnosis.addWidget(self._timeline(), 2)
-        root.addLayout(diagnosis)
-        root.addWidget(SectionHeader("测试环境", "比较结果前先核对条件"))
-        root.addWidget(self._environment_card())
+        root.addWidget(WorkflowStrip(state, plan))
+        root.addWidget(self._measurement_card())
+        self._work_columns = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._work_columns.setSpacing(24)
+        action = QWidget()
+        action_layout = set_margins(QVBoxLayout(action), spacing=8)
+        action_layout.addWidget(SectionHeader("本次调整", "建议尚未代表已执行"))
+        action_layout.addWidget(self._action_card())
+        action_layout.addStretch()
+        self._work_columns.addWidget(action, 3)
+        self._work_columns.addWidget(self._environment_card(), 2)
+        root.addLayout(self._work_columns)
+        self.evidence_button = QPushButton("展开分析依据")
+        self.evidence_button.setObjectName("evidenceButton")
+        self.evidence_button.setCheckable(True)
+        root.addWidget(self.evidence_button)
+        self.evidence_panel = self._hero()
+        self.evidence_panel.hide()
+        root.addWidget(self.evidence_panel)
+        self.evidence_button.toggled.connect(self._toggle_evidence)
         root.addStretch()
+
+    def _toggle_evidence(self, checked: bool):
+        self.evidence_panel.setVisible(checked)
+        self.evidence_button.setText("收起分析依据" if checked else "展开分析依据")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_work_columns"):
+            self._work_columns.setDirection(QBoxLayout.Direction.TopToBottom if self.viewport().width() < 850
+                                            else QBoxLayout.Direction.LeftToRight)
+
+    def _measurement_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("measurementCard")
+        layout = set_margins(QVBoxLayout(card), 22, 18, 22, 16, 10)
+        layout.addWidget(SectionHeader("当前测试表现", "逐次帧率 / FPS"))
+        legend = QHBoxLayout()
+        for text, color in (("平均帧率", "#607e99"), ("1% Low", "#a9513c")):
+            item = label(f"▪  {text}", "sectionMeta")
+            item.setStyleSheet(f"color: {color};")
+            legend.addWidget(item)
+        legend.addStretch()
+        layout.addLayout(legend)
+        self.run_chart = RunChart(self.record.runs if self.record else [])
+        layout.addWidget(self.run_chart)
+        layout.addWidget(hline())
+        metrics = QHBoxLayout()
+        record = self.record
+        values = [("平均帧率", f"{record.avg_fps:g} FPS" if record else f"{self.state.avg_fps} FPS"),
+                  ("1% Low", f"{record.low_fps:g} FPS" if record else f"{self.state.low_fps} FPS"),
+                  ("单次测试时长", f"{record.duration_seconds} 秒" if record and record.duration_seconds else "未记录")]
+        for title, value in values:
+            group = QWidget()
+            column = set_margins(QVBoxLayout(group), 8, 4, 8, 4, 3)
+            for text, name in ((title, "cardKicker"), (value, "metricValue")):
+                item = label(text, name)
+                item.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                column.addWidget(item)
+            metrics.addWidget(group, 1)
+        layout.addLayout(metrics)
+        layout.addWidget(label("图表按实际测试次数展示；汇总值使用当前记录，不表示连续帧时间。", "metricNote", True))
+        return card
 
     def _hero(self) -> QFrame:
         card = QFrame()
@@ -817,6 +812,13 @@ class DashboardPage(QScrollArea):
         layout.addWidget(label(names.get(hypothesis, "需要补充证据"), "heroTitle", True))
         body_text = "；".join(item.detail for item in self.evidence[:2]) or "创建任务后，这里会显示最重要的两条判断依据。"
         layout.addWidget(label(body_text, "heroBody", True))
+        if self.plan:
+            if self.plan.selection_reason:
+                layout.addWidget(RuleRow("选择理由", self.plan.selection_reason))
+            for name, text in (("为什么做", self.plan.hypothesis), ("怎么测试", self.plan.method),
+                               ("有效标准", self.plan.success_criteria)):
+                layout.addWidget(hline())
+                layout.addWidget(RuleRow(name, text))
         tags = QHBoxLayout()
         tags.setSpacing(7)
         for item in self.evidence[:3]:
@@ -829,39 +831,10 @@ class DashboardPage(QScrollArea):
         layout.addWidget(confidence)
         return card
 
-    def _timeline(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
-        layout = set_margins(QVBoxLayout(card), 18, 16, 18, 16, 8)
-        layout.addWidget(label("优化进度", "cardKicker"))
-        hypothesis, _ = dominant_hypothesis(self.evidence)
-        hypothesis_name = {"cpu": "CPU 侧限制", "cpu_or_other": "CPU 侧或其他限制待区分", "gpu": "GPU 侧限制", "frametime": "帧时间稳定性", "platform": "笔记本平台状态待核对", "insufficient": "待补充证据"}.get(hypothesis, "待补充证据")
-        items = [
-            ("✓", "任务信息", "硬件和目标已保存", True),
-            ("✓", "基线数据", "测试数据已检查", True),
-            ("3", "分析原因", f"当前判断：{hypothesis_name}", bool(self.evidence)),
-            ("4", "验证建议", "等待录入复测结果", bool(self.plan)),
-            ("5", "生成报告", "保存最佳已验证配置", self.state.step == "优化完成"),
-        ]
-        for mark, title, desc, active in items:
-            row = QHBoxLayout()
-            badge = label(mark, "tagGreen" if active else "tagNeutral")
-            badge.setFixedWidth(27)
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            text = QVBoxLayout()
-            text.setSpacing(1)
-            text.addWidget(label(title, "ruleName"))
-            text.addWidget(label(desc, "metricNote", True))
-            row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
-            row.addLayout(text, 1)
-            layout.addLayout(row)
-        layout.addStretch()
-        return card
-
     def _action_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("actionCard")
-        layout = set_margins(QVBoxLayout(card), 20, 17, 20, 17, 8)
+        layout = set_margins(QVBoxLayout(card), 0, 6, 0, 12, 10)
         plan = self.plan
         if plan:
             purpose = "诊断测试" if plan.purpose == "diagnostic" else "优化验证"
@@ -880,12 +853,7 @@ class DashboardPage(QScrollArea):
         settings.addWidget(label(setting_value_label(plan.setting_id, plan.new_value) if plan else "待生成", "settingNew"))
         settings.addStretch()
         layout.addLayout(settings)
-        rows = [("为什么做", plan.hypothesis), ("怎么测试", plan.method), ("什么算有效", plan.success_criteria)] if plan else [("说明", "创建任务后，这里会显示下一步。")]
-        if plan and plan.selection_reason:
-            rows.insert(0, ("AI 选择理由", plan.selection_reason))
-        for name, text in rows:
-            layout.addWidget(hline())
-            layout.addWidget(RuleRow(name, text))
+        layout.addWidget(label(plan.hypothesis if plan else "当前没有待执行建议，可查看配置与报告。", "ruleText", True))
         buttons = QHBoxLayout()
         primary = QPushButton("补充当前设置" if plan and plan.action == AgentAction.REQUEST_DATA else "选择验证目标" if plan and plan.setting_id == "uncapped_validation" else "录入测试结果")
         primary.setObjectName("primaryButton")
@@ -901,9 +869,9 @@ class DashboardPage(QScrollArea):
 
     def _environment_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("card")
+        card.setObjectName("actionCard")
         layout = set_margins(QVBoxLayout(card), 18, 16, 18, 16, 4)
-        layout.addWidget(label("当前环境", "cardKicker"))
+        layout.addWidget(label("测试条件", "sectionTitle"))
         rows = [("处理器", self.state.cpu), ("显卡", self.state.gpu), ("分辨率", self.state.resolution), ("优化模式", self._mode_name()), ("测试场景", self.state.test_scene)]
         if self.state.is_laptop:
             rows.extend([
@@ -922,9 +890,6 @@ class DashboardPage(QScrollArea):
             return
         QMessageBox.information(self, "诊断实验步骤", f"调整：{self.plan.setting}，{self.plan.old_value} → {self.plan.new_value}\n\n{self.plan.method}\n\n恢复方式：{self.plan.rollback}")
 
-    def _score(self) -> float:
-        return normalized_score(self.state.avg_fps, self.state.low_fps, self.state.target_avg, self.state.target_low, self.state.mode)
-
     def _mode_name(self) -> str:
         return {"competitive": "竞技模式", "balanced": "平衡模式", "visual": "视觉模式"}.get(self.state.mode, "竞技模式")
 
@@ -940,7 +905,7 @@ class NewTaskPage(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
-        root.addWidget(PageHeader("任务设置", "新建优化任务", "先记录设备与目标。下一步才采集基线，不需要提前知道帧率。"))
+        root.addWidget(PageHeader("任务设置", "新建调校", "先记录设备与目标。下一步才采集基线，不需要提前知道帧率。"))
         root.addWidget(GuidancePanel("建立可比较的起点", "按游戏内当前设置填写；不确定的选项如实标记。硬件型号用于记录设备，性能是否受限由后续实测判断。"))
         self.setup_stage = QWidget()
         self.stage_stack = CurrentPageStack()
@@ -983,14 +948,16 @@ class NewTaskPage(QScrollArea):
         self.resolution_input.currentIndexChanged.connect(self._resolution_mode_changed)
         self.refresh_input = RoundedComboBox()
         self.refresh_input.addItems(["300 Hz", "240 Hz", "165 Hz", "144 Hz"])
+        self.refresh_input.setEditable(True)
+        self.refresh_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.refresh_input.setCurrentText(state.refresh_rate)
         self.scene_input = QLineEdit(state.test_scene)
         self.display_mode_input = RoundedComboBox()
         self.display_mode_input.addItem("全屏", "fullscreen")
         self.display_mode_input.addItem("全屏窗口模式", "borderless")
         self.display_mode_input.addItem("窗口模式", "windowed")
         self.display_mode_input.setCurrentIndex(max(0, self.display_mode_input.findData(state.display_mode)))
-        self.cap_input = self._spin(-1, 1000, state.fps_cap if state.fps_cap is not None else -1, 10)
-        self.cap_input.setSpecialValueText("未确认")
+        self.cap_input = self._spin(-1, 1000, state.fps_cap if state.fps_cap is not None else -1, 10, placeholder="未确认")
         self.cap_input.setToolTip("填写游戏内“最大 FPS”；0 表示不限制")
         self.vsync_input = RoundedComboBox()
         self.vsync_input.addItem("已禁用", "disabled")
@@ -1014,8 +981,7 @@ class NewTaskPage(QScrollArea):
         for name, widget in [("平均 FPS 目标", self.target_avg), ("1% Low 目标", self.target_low), ("优化模式", self.mode_input)]:
             goal_form.addRow(name, widget)
         self.laptop_card, laptop_form = self._form_card("笔记本运行状态")
-        self.gpu_power_input = self._spin(0, 250, state.gpu_power_w or 0, 5)
-        self.gpu_power_input.setSpecialValueText("未知")
+        self.gpu_power_input = self._spin(0, 250, state.gpu_power_w or 0, 5, placeholder="未知（可不填）")
         self.graphics_mode_input = RoundedComboBox()
         self.graphics_mode_input.addItem("独显直连 / dGPU only", "dgpu")
         self.graphics_mode_input.addItem("混合输出 / Optimus", "hybrid")
@@ -1096,12 +1062,9 @@ class NewTaskPage(QScrollArea):
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(10)
-            avg_input = self._spin(0, 2000, 0)
-            avg_input.setSpecialValueText("未填写")
-            low_input = self._spin(0, 2000, 0)
-            low_input.setSpecialValueText("未填写")
-            gpu_input = self._spin(0, 100, 0)
-            gpu_input.setSpecialValueText("未记录")
+            avg_input = self._spin(0, 2000, 0, placeholder="未填写")
+            low_input = self._spin(0, 2000, 0, placeholder="未填写")
+            gpu_input = self._spin(0, 100, 0, placeholder="未记录（可不填）")
             row_layout.addWidget(QLabel("平均 FPS"))
             row_layout.addWidget(avg_input, 1)
             row_layout.addWidget(QLabel("1% Low"))
@@ -1144,10 +1107,12 @@ class NewTaskPage(QScrollArea):
             self._columns.setDirection(QBoxLayout.Direction.TopToBottom if self.viewport().width() < 900 else QBoxLayout.Direction.LeftToRight)
 
     @staticmethod
-    def _spin(minimum: int, maximum: int, value: int, step: int = 1) -> QSpinBox:
-        spin = QSpinBox()
+    def _spin(minimum: int, maximum: int, value: int, step: int = 1, *, placeholder: str = "") -> QSpinBox:
+        spin = MeasurementSpinBox() if placeholder else QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
+        if placeholder:
+            spin.lineEdit().setPlaceholderText(placeholder)
         spin.setSingleStep(step)
         spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         return spin
@@ -1222,6 +1187,12 @@ class NewTaskPage(QScrollArea):
         if not self.name_input.text().strip():
             QMessageBox.warning(self, "信息不完整", "请填写任务名称。")
             return
+        if not self.scene_input.text().strip() or not self.refresh_input.currentText().strip():
+            QMessageBox.warning(self, "信息不完整", "请填写测试场景和刷新率。")
+            return
+        if self.target_low.value() > self.target_avg.value():
+            QMessageBox.warning(self, "目标无效", "目标 1% Low 不能高于目标平均 FPS。")
+            return
         cpu_data = self.cpu_input.currentData()
         gpu_data = self.gpu_input.currentData()
         cpu_entry = cpu_data if isinstance(cpu_data, HardwareEntry) else None
@@ -1240,6 +1211,9 @@ class NewTaskPage(QScrollArea):
             for entry in (cpu_data, gpu_data)
         )
         if self.state.is_laptop:
+            if 0 < self.gpu_power_input.value() < 20:
+                QMessageBox.warning(self, "GPU 功耗无效", "GPU 功耗应在 20W 到 250W 之间；未知时请留空。")
+                return
             self.state.gpu_power_w = self.gpu_power_input.value() or None
             self.state.graphics_mode = str(self.graphics_mode_input.currentData())
             self.state.power_mode = str(self.power_mode_input.currentData())
@@ -1382,8 +1356,10 @@ class NewTaskPage(QScrollArea):
 class ExperimentPage(QScrollArea):
     result_saved = Signal(dict)
     task_requested = Signal()
+    retry_diagnostic_requested = Signal()
     rollback_requested = Signal()
     notice_requested = Signal(str, str)
+    overview_requested = Signal()
 
     def __init__(self, state: TaskState, plan: ExperimentPlan | None = None):
         super().__init__()
@@ -1394,10 +1370,16 @@ class ExperimentPage(QScrollArea):
         self.rollback_pending = False
         self._csv_metrics: dict | None = None
         self._csv_values: tuple[int, int, int, int] | None = None
+        self._loaded_csv_path = ""
         self.setWidgetResizable(True)
         body = QWidget()
         self.setWidget(body)
         root = set_margins(QVBoxLayout(body), 34, 27, 34, 36, 18)
+        self.overview_button = QPushButton("返回当前调校总览")
+        self.overview_button.setObjectName("secondaryButton")
+        self.overview_button.clicked.connect(self.overview_requested)
+        root.addWidget(self.overview_button, 0, Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(label(f"{state.name} / 当前实验" if state.has_task else "新建调校 / 保存基线 / 当前实验", "eyebrow", True))
         round_number = plan.round_number if plan else state.round_number
         if plan and plan.setting_id == "uncapped_validation":
             subtitle = "选择是否在不限帧条件下继续验证，以及正式验证结束后是否恢复原限帧。此步骤不采集帧率。"
@@ -1412,13 +1394,19 @@ class ExperimentPage(QScrollArea):
         entry_type = "诊断测试" if plan and plan.purpose == "diagnostic" else "优化验证"
         root.addWidget(PageHeader(entry_type, "当前实验" if not state.has_task else "选择后续验证目标" if plan and plan.setting_id == "uncapped_validation" else f"录入第 {round_number} 轮结果", "先创建任务并保存基线，再开始诊断或优化验证。" if not state.has_task else subtitle, "尚未开始" if not state.has_task else "等待选择" if plan and plan.setting_id == "uncapped_validation" else "等待录入"))
         if not state.has_task:
-            root.addWidget(GuidancePanel("尚无待执行实验", "先进入“新建任务”记录环境并采集基线；已有任务可从“历史记录”打开。这里不会使用预填值代替测量结果。"))
-        elif plan and plan.action == AgentAction.REQUEST_DATA:
-            root.addWidget(GuidancePanel("先补齐信息", "本轮只记录实际设置，不需要重新测帧率。补充后，程序会根据已知条件继续规划。"))
+            root.addWidget(GuidancePanel("尚无待执行实验", "先进入“新建调校”记录环境并采集基线；已有任务可从“测试记录”打开。这里不会使用预填值代替测量结果。"))
         elif plan and plan.setting_id == "uncapped_validation":
             root.addWidget(GuidancePanel("先选择，再继续", "选择后续验证使用的限帧条件。这里的选择不会替你修改游戏设置。"))
+        elif plan and plan.action == AgentAction.REQUEST_DATA:
+            root.addWidget(GuidancePanel("先补齐信息", "本轮只记录实际设置，不需要重新测帧率。补充后，程序会根据已知条件继续规划。"))
         else:
-            root.addWidget(GuidancePanel("提交前核对", "只修改本轮指定的设置，使用相同场景和采集方式。确认已实际执行后，再录入结果；需要恢复配置时，先按提示恢复。"))
+            root.addWidget(GuidancePanel("按实际配置提交", "填写本次测试真正使用的设置，未执行建议也可保存。原设置复测会单独记录；计划之外的变化不会直接算作建议调整的收益。需要恢复配置时，按提示处理。"))
+        self.execution_guide = label("", "guideText", True)
+        root.addWidget(self.execution_guide)
+        self.result_feedback = label("", "warningBox", True)
+        self.result_feedback.hide()
+        root.addWidget(self.result_feedback)
+        self._update_execution_guide()
         columns = QHBoxLayout()
         self._columns = columns
         columns.setSpacing(15)
@@ -1426,9 +1414,13 @@ class ExperimentPage(QScrollArea):
         input_card.setObjectName("formCard")
         input_layout = set_margins(QVBoxLayout(input_card), 20, 18, 20, 20, 12)
         input_layout.addWidget(label("验证目标" if plan and plan.setting_id == "uncapped_validation" else "复测结果", "sectionTitle"))
+        if plan and plan.action not in {AgentAction.REQUEST_DATA, AgentAction.FINISH}:
+            input_layout.addWidget(label("每次完成测试后录入一次结果；测试次数填本次提交包含的次数，程序会累计同配置记录。CSV 与手填任选一种。", "metricNote", True))
         file_row = QHBoxLayout()
         self.file_input = QLineEdit()
         self.file_input.setPlaceholderText("导入 PresentMon CSV（可选）")
+        self.file_input.returnPressed.connect(self._import_entered_file)
+        self.file_input.textChanged.connect(self._csv_path_changed)
         browse = QPushButton("浏览文件")
         self.browse_button = browse
         browse.setObjectName("secondaryButton")
@@ -1438,19 +1430,21 @@ class ExperimentPage(QScrollArea):
         input_layout.addLayout(file_row)
         form = QFormLayout()
         form.setVerticalSpacing(11)
-        self.avg = NewTaskPage._spin(1, 1000, 296)
-        self.low = NewTaskPage._spin(1, 1000, 174)
-        self.gpu = NewTaskPage._spin(0, 100, 59)
+        self.avg = NewTaskPage._spin(0, 2000, 0, placeholder="填写实测平均 FPS")
+        self.low = NewTaskPage._spin(0, 2000, 0, placeholder="填写实测 1% Low")
+        self.gpu = NewTaskPage._spin(0, 100, 0, placeholder="未记录（可不填）")
         self.repeats = NewTaskPage._spin(1, 10, 1)
         self.duration = NewTaskPage._spin(10, 3600, 60)
         self.condition = RoundedComboBox()
         self.condition.addItems(["与基线一致", "有变化，需要说明"])
-        self.actual_cpu = QLineEdit(state.cpu)
-        self.actual_gpu = QLineEdit(state.gpu)
-        self.actual_resolution = QLineEdit(state.resolution)
-        self.actual_refresh_rate = QLineEdit(state.refresh_rate)
+        self.condition.setToolTip("仅按本轮计划修改设置时保持“与基线一致”；画质改动在下方如实记录，不算测试条件变化；仅场景、路线、采集方式等改变时选择“有变化”。")
+        self.actual_cpu = EditableChoiceInput(state.cpu, [entry.name for entry in HARDWARE_CATALOG.entries("cpu")])
+        self.actual_gpu = EditableChoiceInput(state.gpu, [entry.name for entry in HARDWARE_CATALOG.entries("gpu")])
+        self.actual_resolution = EditableChoiceInput(state.resolution, list(RESOLUTION_PRESETS))
+        self.actual_refresh_rate = EditableChoiceInput(state.refresh_rate, ["60 Hz", "75 Hz", "120 Hz", "144 Hz", "165 Hz", "240 Hz", "300 Hz", "360 Hz"])
         self.actual_scene = QLineEdit(state.test_scene)
-        self.actual_setting = ActualSettingInput(
+        setting_editor = EditableChoiceInput if plan and plan.setting_id in {"resolution", "refresh_rate"} else ActualSettingInput
+        self.actual_setting = setting_editor(
             self._setting_value_from_state(),
             self._setting_options(),
         )
@@ -1473,20 +1467,24 @@ class ExperimentPage(QScrollArea):
             "test_scene": self.actual_scene,
         }
         if plan and plan.required_configuration:
-            self._actual_fields["fps_cap"] = QLineEdit("unknown" if state.fps_cap is None else str(state.fps_cap))
-            self._actual_fields["vsync"] = QLineEdit({"disabled": "已关闭", "enabled": "已开启", "unknown": "未确认"}.get(state.vsync, "未确认"))
+            self._actual_fields["fps_cap"] = EditableChoiceInput("" if state.fps_cap is None else str(state.fps_cap), ["0", "120", "144", "240", "300", "500"])
+            self._actual_fields["vsync"] = EditableChoiceInput({"disabled": "已关闭", "enabled": "已开启", "unknown": "未确认"}.get(state.vsync, "未确认"), ["已关闭", "已开启", "未确认"])
             self._actual_fields["vsync"].setPlaceholderText("填写已关闭或已开启")
             form.addRow("实际最高 FPS（0 为不限帧）", self._actual_fields["fps_cap"])
             form.addRow("实际垂直同步", self._actual_fields["vsync"])
         for field in self._actual_fields.values():
-            field.textChanged.connect(self._clear_csv_if_manual_edit)
-        self.actual_setting.currentTextChanged.connect(self._clear_csv_if_manual_edit)
+            field.textChanged.connect(self._configuration_edited)
+        self.actual_setting.currentTextChanged.connect(self._configuration_edited)
+        if plan and plan.setting_id in {"resolution", "refresh_rate"}:
+            related = self._actual_fields[plan.setting_id]
+            self.actual_setting.currentTextChanged.connect(related.setText)
+            related.textChanged.connect(self.actual_setting.setText)
         if plan and plan.action == AgentAction.REQUEST_DATA:
             confirmation_label = "我已核对并记录当前实际状态"
         elif plan and plan.purpose == "diagnostic":
-            confirmation_label = "我已完成本轮诊断测试，并核对实际配置"
+            confirmation_label = "已提前核对实际配置（可选；保存时按表单提交）"
         else:
-            confirmation_label = "我已完成本轮调整，并核对上述实际配置"
+            confirmation_label = "已提前核对实际配置（可选；保存时按表单提交）"
         self.configuration_confirmed = QCheckBox(confirmation_label)
         # A proposed value is not evidence that the user executed it.
         self.configuration_confirmed.setChecked(False)
@@ -1508,7 +1506,53 @@ class ExperimentPage(QScrollArea):
         else:
             form.addRow(f"本轮{setting_label}", self.actual_setting)
         input_layout.addLayout(form)
+        self.changed_settings_panel = QWidget()
+        changed_layout = set_margins(QVBoxLayout(self.changed_settings_panel), spacing=10)
+        changed_layout.addWidget(label("记录实际画面与运行设置", "sectionTitle"))
+        changed_layout.addWidget(label("这里记录本次测试时的实际值，不会替你修改游戏。可同时修改多项画质，程序按整组实际配置评估，并据此生成下一步建议。", "metricNote", True))
+        changed_form = QFormLayout()
+        changed_form.setVerticalSpacing(10)
+        changed_layout.addLayout(changed_form)
+        self.actual_video_fields: dict[str, ActualSettingInput] = {}
+        self._video_value_maps = {
+            "video_preset": {"custom": "自定义", "low": "低", "medium": "中", "high": "高", "very_high": "非常高"},
+            "display_mode": {"fullscreen": "全屏", "borderless": "全屏窗口模式", "windowed": "窗口模式"},
+            "vsync": {"disabled": "已关闭", "enabled": "已开启"},
+            "shadow_quality": {value: value for value in ("低", "中", "高", "非常高")},
+            "dynamic_shadows": {"all": "全部", "sun_only": "仅限日光"},
+            **ADVANCED_SETTING_LABELS,
+            "player_contrast": {"enabled": "已启用", "disabled": "已禁用"},
+            "nvidia_gsync": {"enabled": "已启用", "disabled": "已禁用", "not_available": "此设备不可用"},
+            "nvidia_reflex": {"enabled": "已启用", "enabled_boost": "已启用 + 加速", "disabled": "已禁用", "not_available": "此设备不可用"},
+            "amd_anti_lag": {"enabled": "已启用", "disabled": "已禁用", "not_available": "此设备不可用"},
+        }
+        for key, values in self._video_value_maps.items():
+            if key in self._actual_fields or (plan and key == plan.setting_id):
+                continue
+            current = str(getattr(state, key, (state.video_settings or {}).get(key, "unknown")))
+            display = values.get(current, current if current not in {"", "unknown"} else "未确认")
+            choices = list(dict.fromkeys([*values.values(), "未确认", display]))
+            field = ActualSettingInput(display, choices)
+            self.actual_video_fields[key] = field
+            changed_form.addRow(CONFIGURATION_LABELS.get(key, key), field)
+            field.currentTextChanged.connect(self._configuration_edited)
+        if "fps_cap" not in self._actual_fields and not (plan and plan.setting_id == "fps_cap"):
+            field = EditableChoiceInput("" if state.fps_cap is None else str(state.fps_cap), ["0", "120", "144", "240", "300", "500"])
+            field.setPlaceholderText("未确认；0 为不限帧")
+            self.actual_video_fields["fps_cap"] = field
+            changed_form.addRow("游戏最高 FPS", field)
+            field.textChanged.connect(self._configuration_edited)
+        if not (plan and plan.setting_id == "menu_fps_cap"):
+            field = EditableChoiceInput(str((state.video_settings or {}).get("menu_fps_cap", "")), ["60", "120", "144", "240", "300"])
+            field.setPlaceholderText("未确认")
+            self.actual_video_fields["menu_fps_cap"] = field
+            changed_form.addRow("菜单最高 FPS", field)
+            field.textChanged.connect(self._configuration_edited)
+        form.insertRow(form.getWidgetPosition(self.condition)[0] + 1, self.changed_settings_panel)
+        self.changed_settings_panel.show()
+        self.condition.currentIndexChanged.connect(self._condition_changed)
         input_layout.addWidget(self.configuration_confirmed)
+        input_layout.addWidget(label("点击“保存并分析”即按以上实际配置提交；未执行建议也可以保存，程序将区分原配置复测与调整验证。", "metricNote", True))
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("备注（可选）：记录测试中的异常或变化")
         self.notes.setMaximumHeight(85)
@@ -1532,14 +1576,20 @@ class ExperimentPage(QScrollArea):
         self.rollback_button.setObjectName("secondaryButton")
         self.rollback_button.setVisible(False)
         self.rollback_button.clicked.connect(self.rollback_requested.emit)
-        input_layout.addWidget(self.rollback_button)
+        root.addWidget(self.rollback_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.retry_diagnostic_button = QPushButton("重新核对实际配置并继续诊断")
+        self.retry_diagnostic_button.setVisible(bool(plan and plan.action == AgentAction.FINISH
+                                                   and plan.setting_id in {"no_supported_action", "frame_limit_result"}))
+        self.retry_diagnostic_button.clicked.connect(self.retry_diagnostic_requested.emit)
+        root.addWidget(self.retry_diagnostic_button)
+
         guide_box = QFrame()
         guide_box.setObjectName("card")
         guide_layout = set_margins(QVBoxLayout(guide_box), 20, 18, 20, 20, 7)
-        guide_layout.addWidget(label("临时排除帧率限制" if plan and plan.setting_id == "frame_limits" else "本轮只改这一项", "cardKicker"))
+        guide_layout.addWidget(label("临时排除帧率限制" if plan and plan.setting_id == "frame_limits" else "下一步建议（可按偏好调整）", "cardKicker"))
         change_title = f"{plan.setting}：{setting_value_label(plan.setting_id, plan.old_value)} → {setting_value_label(plan.setting_id, plan.new_value)}" if plan else "等待生成实验计划"
         guide_layout.addWidget(label(change_title, "actionTitle", True))
-        guide_layout.addWidget(label("其他设置保持不变", "metricNote"))
+        guide_layout.addWidget(label("按建议单项测试便于判断原因；自行调整多项时，将按整组配置重新规划。", "metricNote", True))
         if plan and plan.setting_id == "uncapped_validation":
             test_requirement = "只选择目标，本步骤不会生成测试记录"
         elif plan and plan.action == AgentAction.REQUEST_DATA:
@@ -1551,8 +1601,8 @@ class ExperimentPage(QScrollArea):
         else:
             test_requirement = "先测 1 次，帧率没明显变差就继续测到累计 3 次"
         reference_text = f"{plan.reference_avg_fps:g} / {plan.reference_low_fps:g} FPS（不限帧诊断记录）" if plan and plan.reference_avg_fps is not None and plan.reference_low_fps is not None else f"{state.avg_fps} / {state.low_fps} FPS"
-        for name, value in [("测试场景", state.test_scene), ("测试要求", test_requirement), ("比较基准", reference_text), ("有效变化", "平均帧率变化超过 5%")]:
-            if plan and plan.setting_id == "uncapped_validation" and name == "有效变化":
+        for name, value in [("测试场景", state.test_scene), ("测试要求", test_requirement), ("比较基准", reference_text), ("判断标准", plan.success_criteria if plan else "等待实验计划")]:
+            if plan and plan.action in {AgentAction.REQUEST_DATA, AgentAction.FINISH} and name == "判断标准":
                 continue
             guide_layout.addWidget(hline())
             guide_layout.addWidget(RuleRow(name, value))
@@ -1567,7 +1617,32 @@ class ExperimentPage(QScrollArea):
                 guide_layout.addWidget(RuleRow("恢复方法", plan.rollback))
             if plan.selection_reason:
                 guide_layout.addWidget(hline())
-                guide_layout.addWidget(RuleRow("AI 选择理由", plan.selection_reason))
+                guide_layout.addWidget(RuleRow("选择来源", "AI 比较候选" if plan.planning_source == "model" else "本地规则"))
+                guide_layout.addWidget(RuleRow("选择依据", plan.selection_reason))
+            if plan.planning_context:
+                context = plan.planning_context
+                guide_layout.addWidget(RuleRow("准备验证", plan.hypothesis))
+                self.planning_details_button = QPushButton("查看候选与历史反馈")
+                self.planning_details_button.setCheckable(True)
+                self.planning_details = QWidget()
+                detail_layout = set_margins(QVBoxLayout(self.planning_details), 0, 4, 0, 4, 6)
+                options = context.get("candidate_options", [])
+                for option in options:
+                    selected = option.get("candidate_id") == context.get("selected_candidate_id")
+                    detail_layout.addWidget(label(("已选：" if selected else "候选：") + option.get("title", ""), "ruleText", True))
+                feedback = context.get("feedback", {})
+                attempts = feedback.get("attempts", [])
+                avoid = feedback.get("avoid_repeating", [])
+                unresolved = feedback.get("unresolved", [])
+                detail_layout.addWidget(label(f"已记录 {len(attempts)} 次实验反馈；跳过 {len(avoid)} 项无收益调整；待处理 {len(unresolved)} 项问题。", "metricNote", True))
+                if attempts:
+                    detail_layout.addWidget(RuleRow("最近结论", attempts[-1].get("conclusion", "")))
+                if context.get("status") in {"model_selected", "model_fallback"}:
+                    detail_layout.addWidget(label(f"模型调用耗时：{context.get('elapsed_ms', 0):g} ms", "metricNote"))
+                self.planning_details.hide()
+                self.planning_details_button.toggled.connect(self.planning_details.setVisible)
+                guide_layout.addWidget(self.planning_details_button)
+                guide_layout.addWidget(self.planning_details)
         guide_layout.addSpacing(8)
         guide_label = label(plan.rationale if plan and plan.setting_id == "uncapped_validation" else "提示：GPU 占用低不一定是 CPU 瓶颈，也可能是限帧或垂直同步造成的。", "warningBox", True)
         guide_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -1581,7 +1656,7 @@ class ExperimentPage(QScrollArea):
         if not state.has_task:
             input_card.hide()
             guide_box.hide()
-            self.create_button = QPushButton("新建优化任务")
+            self.create_button = QPushButton("新建调校")
             self.create_button.setObjectName("primaryButton")
             self.create_button.clicked.connect(self.task_requested)
             root.addWidget(self.create_button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -1650,6 +1725,8 @@ class ExperimentPage(QScrollArea):
         """Return controlled choices for settings with a finite domain."""
         setting_id = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
         return {
+            "resolution": list(RESOLUTION_PRESETS),
+            "refresh_rate": ["60 Hz", "75 Hz", "120 Hz", "144 Hz", "165 Hz", "240 Hz", "300 Hz", "360 Hz"],
             "uncapped_validation": ["请选择验证目标", *UNCAPPED_CHOICES],
             "frame_limits": ["未确认", "不限帧且关闭垂直同步", "仍有限制"],
             "graphics_mode": ["独显直连", "混合输出", "自动切换", "不确定"],
@@ -1691,6 +1768,14 @@ class ExperimentPage(QScrollArea):
         aliases.update(advanced_aliases)
         return aliases.get(setting_id, {}).get(value, value)
 
+    def _configuration_edited(self, *_args):
+        if hasattr(self, "configuration_confirmed"):
+            self.configuration_confirmed.setChecked(False)
+
+    def _condition_changed(self, *_args):
+        self.changed_settings_panel.setVisible(True)
+        self._configuration_edited()
+
     def _clear_csv_if_manual_edit(self, *_args):
         if self._csv_metrics is not None:
             self._csv_metrics = None
@@ -1698,37 +1783,54 @@ class ExperimentPage(QScrollArea):
 
     def set_completed(self, completed: bool = True):
         self.completed = completed
+        self._update_execution_guide()
         self._sync_input_enabled()
-        for widget in [self.file_input, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition,
-                        self.actual_cpu, self.actual_gpu, self.actual_resolution, self.actual_refresh_rate,
-                        self.actual_scene, self.actual_setting, self.configuration_confirmed, self.notes,
-                        self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
-                        self.adjustment_new_value]:
-            widget.setEnabled(not completed and not self.planning)
-        self.browse_button.setEnabled(not completed and not self.planning)
 
     def set_rollback_pending(self, pending: bool = True):
         self.rollback_pending = pending
         self.rollback_button.setVisible(pending)
+        self._update_execution_guide()
         self._sync_input_enabled()
+
+    def _update_execution_guide(self):
+        plan = self.plan
+        if not self.state.has_task:
+            text = "先创建任务并保存基线，再执行本轮实验。"
+        elif self.rollback_pending:
+            text = "当前步骤：恢复配置。" + (plan.rollback if plan else "恢复上一组已验证配置。") + " 完成后点击“确认已恢复上一组配置”；此时不用再提交帧率。"
+        elif self.completed or (plan and plan.action == AgentAction.FINISH):
+            text = "本轮测试已结束。返回当前调校查看结论，或在配置与报告中查看已有验证结果。"
+        elif plan and plan.action == AgentAction.REQUEST_DATA:
+            text = "当前步骤：补充信息。" + plan.method + " 提交后查看新生成的实验要求。"
+        elif plan:
+            count = "至少 2 次" if plan.setting_id == "frame_limits" else "先测 1 次，按评估提示补测" if plan.purpose == "diagnostic" else "先测 1 次，无明显退步后累计到 3 次"
+            target = setting_value_label(plan.setting_id, plan.new_value)
+            text = f"1. 将“{plan.setting}”调整为“{target}”，其余设置不变。 2. 在“{self.state.test_scene}”{count}。 3. 录入并核对实际配置，再保存评估；要求补测时保持当前设置，要求恢复时再改回。"
+        else:
+            text = "返回当前调校查看待办事项。"
+        self.execution_guide.setText(text)
+        pill = self.findChild(QLabel, "statusPill")
+        if pill:
+            status = "等待恢复配置" if self.rollback_pending else "本轮已结束" if self.completed or (plan and plan.action == AgentAction.FINISH) else "等待补充信息" if plan and plan.action == AgentAction.REQUEST_DATA else "等待录入" if self.state.has_task else "尚未开始"
+            pill.setText(f"●  {status}")
+
+    def show_evaluation(self, decision: Decision):
+        self.result_feedback.setText("本次评估：" + decision.summary + " " + "；".join(decision.reasons))
+        self.result_feedback.show()
 
     def set_planning(self, planning: bool = True):
         self.planning = planning
         self._sync_input_enabled()
-        for widget in [self.file_input, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition,
-                       self.actual_cpu, self.actual_gpu, self.actual_resolution, self.actual_refresh_rate,
-                       self.actual_scene, self.actual_setting, self.configuration_confirmed, self.notes,
-                       self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
-                       self.adjustment_new_value]:
-            widget.setEnabled(not planning and not self.completed)
-        self.browse_button.setEnabled(not planning and not self.completed)
 
     def _sync_input_enabled(self):
-        for widget in (self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition):
-            widget.setEnabled(not self.is_data_request and not self.completed and not self.rollback_pending and not self.planning)
-        for field in self._actual_fields.values():
-            field.setEnabled(not self.completed and not self.rollback_pending and not self.planning)
-        self.save_button.setEnabled(not self.completed and not self.rollback_pending and not self.planning)
+        editable = self.state.has_task and not self.completed and not self.rollback_pending and not self.planning
+        for widget in (self.file_input, self.browse_button, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition):
+            widget.setEnabled(editable and not self.is_data_request)
+        for field in (*self._actual_fields.values(), *self.actual_video_fields.values(), self.actual_setting, self.configuration_confirmed, self.notes,
+                      self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
+                      self.adjustment_new_value):
+            field.setEnabled(editable)
+        self.save_button.setEnabled(editable)
         self.rollback_button.setEnabled(not self.completed and self.rollback_pending and not self.planning)
 
     def _actual_configuration(self) -> dict[str, str]:
@@ -1742,6 +1844,10 @@ class ExperimentPage(QScrollArea):
         })
         config.update(self.state.video_settings or {})
         config.update({key: field.text().strip() for key, field in self._actual_fields.items()})
+        for key, field in self.actual_video_fields.items():
+            value = field.text().strip()
+            reverse = {label: stable for stable, label in self._video_value_maps.get(key, {}).items()}
+            config[key] = reverse.get(value, canonical_value(key, value)) if value else "unknown"
         config["vsync"] = {"已关闭": "disabled", "已开启": "enabled", "未确认": "unknown"}.get(config.get("vsync"), config.get("vsync", "unknown"))
         config["planned_setting"] = str(getattr(self.plan, "setting", "") or "") if self.plan else ""
         config["planned_setting_id"] = str(getattr(self.plan, "setting_id", "") or "") if self.plan else ""
@@ -1755,24 +1861,44 @@ class ExperimentPage(QScrollArea):
         path, _ = QFileDialog.getOpenFileName(self, "选择基准测试 CSV", str(APP_DIR), "CSV 文件 (*.csv);;所有文件 (*.*)")
         if path:
             self.file_input.setText(path)
-            try:
-                metrics = import_benchmark_csv(path)
-            except ValueError as error:
-                QMessageBox.warning(self, "CSV 无法导入", str(error))
-                return
-            self.avg.setValue(round(float(metrics["avg_fps"])))
-            self.low.setValue(round(float(metrics["low_fps"])))
-            if "gpu_usage" in metrics:
-                self.gpu.setValue(round(float(metrics["gpu_usage"])))
-            self.repeats.setValue(int(metrics.get("run_count", 1)))
-            self._csv_metrics = metrics
-            self._csv_values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
-            self.notes.setPlainText(f"已导入 CSV（{metrics['format']}）。保存前请核对测试条件。")
-            self.notice_requested.emit("测试数据已导入，请核对测试条件", "success")
+            self._import_entered_file()
+
+    def _csv_path_changed(self, *_args):
+        self._clear_csv_if_manual_edit()
+        self._loaded_csv_path = ""
+
+    def _import_entered_file(self) -> bool:
+        path = self.file_input.text().strip().strip('"')
+        if not path:
+            return False
+        try:
+            metrics = import_benchmark_csv(path)
+        except ValueError as error:
+            QMessageBox.warning(self, "CSV 无法导入", str(error))
+            return False
+        self.avg.setValue(round(float(metrics["avg_fps"])))
+        self.low.setValue(round(float(metrics["low_fps"])))
+        self.gpu.setValue(round(float(metrics.get("gpu_usage", 0))))
+        self.repeats.setValue(int(metrics.get("run_count", 1)))
+        self._csv_metrics = metrics
+        self._loaded_csv_path = self.file_input.text().strip()
+        self._csv_values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
+        self.notice_requested.emit("测试数据已导入，请核对测试条件", "success")
+        return True
 
     def _save(self):
-        if self.completed:
+        if self.completed or self.planning or self.rollback_pending:
             return
+        if not self.is_data_request and self.file_input.text().strip() and self.file_input.text().strip() != self._loaded_csv_path:
+            if not self._import_entered_file():
+                return
+        if not self.is_data_request:
+            if self.avg.value() <= 0 or self.low.value() <= 0:
+                QMessageBox.warning(self, "测试数据不完整", "请填写实测平均 FPS 和 1% Low，或导入测试 CSV。")
+                return
+            if self.low.value() > self.avg.value() * 1.05:
+                QMessageBox.warning(self, "测试数据无效", "1% Low 不应高于平均 FPS，请检查录入数据。")
+                return
         if self.is_data_request and self.is_user_adjustment_request:
             direction = self.adjustment_direction.currentText().strip()
             setting_name = self.adjustment_setting_name.text().strip()
@@ -1796,10 +1922,13 @@ class ExperimentPage(QScrollArea):
             return
         values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
         metrics = self._csv_metrics if values == self._csv_values else None
+        # Saving is the explicit confirmation of the actual form snapshot.
+        # The optional checkbox must not prevent recording a real observation.
+        self.configuration_confirmed.setChecked(True)
         self.result_saved.emit({
             "avg": self.avg.value(),
             "low": self.low.value(),
-            "gpu": self.gpu.value(),
+            "gpu": self.gpu.value() if self.gpu.value() > 0 else None,
             "repeats": self.repeats.value(),
             "duration": self.duration.value(),
             "condition": self.condition.currentText(),
@@ -2389,6 +2518,41 @@ class APISettingsPage(QScrollArea):
         super().closeEvent(event)
 
 
+def navigation_icon(index: int) -> QIcon:
+    """Small native line icons, with no external font or image dependency."""
+    pixmap = QPixmap(40, 40)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(2, 2)
+    painter.setPen(QPen(QColor("#625b52"), 1.4, Qt.PenStyle.SolidLine,
+                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    if index == 0:
+        for x, height in ((4, 6), (9, 10), (14, 14)):
+            painter.drawRoundedRect(QRectF(x, 17 - height, 2, height), .5, .5)
+    elif index == 2:
+        path = QPainterPath()
+        path.moveTo(2, 10)
+        for x, y in ((5, 10), (7, 4), (10, 16), (13, 7), (15, 10), (18, 10)):
+            path.lineTo(x, y)
+        painter.drawPath(path)
+    elif index == 3:
+        painter.drawRoundedRect(QRectF(4, 2, 12, 16), 2, 2)
+        for y in (7, 11, 15):
+            painter.drawLine(7, y, 13, y)
+    elif index == 4:
+        painter.drawRoundedRect(QRectF(2, 5, 16, 12), 2, 2)
+        painter.drawLine(4, 3, 9, 3)
+        painter.drawLine(9, 3, 11, 5)
+    else:
+        for y, x in ((5, 7), (10, 13), (15, 6)):
+            painter.drawLine(2, y, 18, y)
+            painter.setBrush(QColor("#f0eee8"))
+            painter.drawEllipse(QRectF(x - 2, y - 2, 4, 4))
+    painter.end()
+    return QIcon(pixmap)
+
+
 class Sidebar(QFrame):
     navigate = Signal(int)
     help_requested = Signal()
@@ -2397,30 +2561,42 @@ class Sidebar(QFrame):
         super().__init__()
         self.state = state
         self.setObjectName("sidebar")
-        self.setFixedWidth(225)
-        root = set_margins(QVBoxLayout(self), 17, 20, 17, 18, 8)
+        self.setFixedWidth(224)
+        root = set_margins(QVBoxLayout(self), 20, 25, 20, 20, 8)
         brand = QHBoxLayout()
         brand.setSpacing(10)
-        mark = label("G", "brandMark")
-        mark.setFixedSize(38, 38)
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand_text = QVBoxLayout()
         brand_text.setSpacing(0)
         brand_text.addWidget(label("GameTune", "brandName"))
-        brand_text.addWidget(label("游戏性能实验台", "brandSub"))
-        brand.addWidget(mark)
         brand.addLayout(brand_text)
         brand.addStretch()
         root.addLayout(brand)
-        root.addSpacing(22)
-        root.addWidget(label("工作区", "sidebarLabel"))
+        root.addSpacing(18)
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
-        for text, index in [("概览", 0), ("新建任务", 1), ("当前实验", 2), ("历史记录", 3), ("最终报告", 4), ("模型设置", 5)]:
+        self.new_task_button = QPushButton("＋  新建调校")
+        self.new_task_button.setObjectName("newTaskButton")
+        self.new_task_button.setCheckable(True)
+        self.new_task_button.setMinimumHeight(38)
+        self.group.addButton(self.new_task_button, 1)
+        root.addWidget(self.new_task_button)
+        root.addSpacing(8)
+        root.addWidget(label("当前任务", "sidebarLabel"))
+        for text, index in [("当前调校", 0), ("当前实验", 2), ("测试记录", 3), ("配置与报告", 4)]:
+            if index == 3:
+                root.addSpacing(10)
+                root.addWidget(label("记录与结果", "sidebarLabel"))
             button = QPushButton(text)
+            if index == 2:
+                button.setText("    执行本轮实验")
+                button.setToolTip("属于当前调校：查看步骤、录入结果、补测或确认恢复")
+            elif index == 0:
+                button.setToolTip("当前任务总览：查看表现、判断依据和下一步")
             button.setObjectName("navButton")
             button.setCheckable(True)
             button.setMinimumHeight(39)
+            button.setIcon(navigation_icon(index))
+            button.setIconSize(QSize(19, 19))
             self.group.addButton(button, index)
             root.addWidget(button)
         self.nav_indicator = QFrame(self)
@@ -2448,6 +2624,13 @@ class Sidebar(QFrame):
         task_layout.addWidget(self.task_text)
         root.addWidget(task)
         root.addStretch()
+        model_button = QPushButton("模型设置")
+        model_button.setObjectName("navButton")
+        model_button.setCheckable(True)
+        model_button.setIcon(navigation_icon(5))
+        model_button.setIconSize(QSize(19, 19))
+        self.group.addButton(model_button, 5)
+        root.addWidget(model_button)
         self.help_button = QPushButton("使用说明")
         self.help_button.setObjectName("secondaryButton")
         self.help_button.clicked.connect(self.help_requested)
@@ -2456,7 +2639,8 @@ class Sidebar(QFrame):
 
     def update_task(self):
         self.task_title.setText(self.state.name if self.state.has_task else "尚未创建任务")
-        self.task_text.setText(f"第 {self.state.round_number} 轮 · {self.state.step}\n{self.state.game}")
+        self.task_text.setText(f"第 {self.state.round_number} 轮 · {self.state.step}\n{self.state.game}"
+                               if self.state.has_task else "先记录环境，再开始测试")
 
     def set_active(self, index: int, animated: bool = True):
         button = self.group.button(index)
@@ -2509,7 +2693,7 @@ class MainWindow(QMainWindow):
                 model_provider = OpenAICompatibleProvider(saved_config)
                 loaded_saved_config = True
         self.controller = controller or GameTuneController(
-            database_path or APP_DIR / ".data" / "gametune.db",
+            database_path or DATA_DIR / "gametune.db",
             model_provider=model_provider,
         )
         initial_api_config = model_provider.config if isinstance(model_provider, OpenAICompatibleProvider) else None
@@ -2528,7 +2712,7 @@ class MainWindow(QMainWindow):
         self.current_evidence = analyze_evidence(preview_task, preview_baseline, fps_cap_known=True, vsync_known=True)
         self.current_plan = plan_next_experiment(preview_task, preview_baseline, self.current_evidence, 1)
         self.setWindowTitle("GameTune Agent · 游戏性能优化智能体")
-        self.resize(1280, 820)
+        self.resize(1360, 900)
         self.setMinimumSize(1050, 700)
         root = QWidget()
         root.setObjectName("root")
@@ -2540,7 +2724,9 @@ class MainWindow(QMainWindow):
         self._busy_operations: set[tuple[str, int]] = set()
         self.busy_indicator = BusyIndicator(parent=self)
         self.statusBar().addPermanentWidget(self.busy_indicator)
-        self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan)
+        current_record = (self.controller.current_record(self.core_task.task_id) or self.baseline_record
+                          if self.core_task else None)
+        self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan, current_record)
         self.new_task = NewTaskPage(self.state)
         self.experiment = ExperimentPage(self.state, self.current_plan)
         self.experiment.set_completed()
@@ -2559,8 +2745,10 @@ class MainWindow(QMainWindow):
         self.new_task.notice_requested.connect(self._show_toast)
         self.experiment.result_saved.connect(self._result_saved)
         self.experiment.task_requested.connect(lambda: self.set_page(1))
+        self.experiment.overview_requested.connect(lambda: self.set_page(0))
         self.experiment.notice_requested.connect(self._show_toast)
         self.experiment.rollback_requested.connect(self._confirm_pending_rollback)
+        self.experiment.retry_diagnostic_requested.connect(self._retry_invalid_diagnostic)
         self.history.task_restore_requested.connect(self._restore_task)
         self.api_settings.provider_applied.connect(self._apply_model_provider)
         self.api_settings.notice_requested.connect(self._show_toast)
@@ -2703,6 +2891,7 @@ class MainWindow(QMainWindow):
         self.state.avg_fps = round(current.avg_fps)
         self.state.low_fps = round(current.low_fps)
         self.state.gpu_usage = round(current.gpu_usage or self.state.gpu_usage)
+        self._apply_record_to_state(current)
         runtime = self.controller.repository.runtime_state(task.task_id) or {}
         self.state.round_number = int(runtime.get("round_number", 1))
         self.state.step = "优化完成" if str(runtime.get("workflow_state", "")) in {"complete", "completed", "finished"} else "等待复测"
@@ -2775,7 +2964,9 @@ class MainWindow(QMainWindow):
         old_dashboard = self.dashboard
         self.stack.removeWidget(old_dashboard)
         old_dashboard.deleteLater()
-        self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan)
+        current_record = (self.controller.current_record(self.core_task.task_id) or self.baseline_record
+                          if self.core_task else None)
+        self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan, current_record)
         self.dashboard.experiment_requested.connect(lambda: self.set_page(2))
         self.dashboard.task_requested.connect(lambda: self.set_page(1))
         self.stack.insertWidget(0, self.dashboard)
@@ -2786,9 +2977,14 @@ class MainWindow(QMainWindow):
         self.experiment = ExperimentPage(self.state, self.current_plan)
         self.experiment.result_saved.connect(self._result_saved)
         self.experiment.task_requested.connect(lambda: self.set_page(1))
+        self.experiment.overview_requested.connect(lambda: self.set_page(0))
         self.experiment.notice_requested.connect(self._show_toast)
         self.experiment.rollback_requested.connect(self._confirm_pending_rollback)
+        self.experiment.retry_diagnostic_requested.connect(self._retry_invalid_diagnostic)
         self.stack.insertWidget(2, self.experiment)
+        last = getattr(self.controller, "last_decisions", {}).get(self.core_task.task_id) if self.core_task else None
+        if last and (last.retry_same_experiment or last.rollback_required):
+            self.experiment.show_evaluation(last)
         if self.core_task and getattr(getattr(self.controller, "workflows", {}).get(self.core_task.task_id), "state", "") == "awaiting_rollback":
             self.experiment.set_rollback_pending(True)
 
@@ -2833,6 +3029,20 @@ class MainWindow(QMainWindow):
                 kwargs[key] = value
         return BenchmarkRecord(**kwargs)
 
+    def _retry_invalid_diagnostic(self):
+        if self.core_task is None:
+            return
+        try:
+            self.current_plan = self.controller.retry_invalid_diagnostic(self.core_task)
+        except (ValueError, KeyError, TypeError) as error:
+            QMessageBox.warning(self, "无法继续诊断", str(error))
+            return
+        self._task_generation += 1
+        self._pending_rollback = None
+        self.state.step = "等待核对实际配置"
+        self._rebuild_task_pages()
+        self.set_page(2)
+
     def _result_saved(self, result: dict):
         if result.get("supplement"):
             self._supplement_task_data(result)
@@ -2849,11 +3059,12 @@ class MainWindow(QMainWindow):
             candidate = self._record_from_result(result)
             evaluated_round = self.state.round_number
             reference = self.controller.current_record(self.core_task.task_id) or self.baseline_record
+            evaluated_plan = deepcopy(self.current_plan)
             decision = self.controller.evaluate(self.core_task, self.baseline_record, candidate, evaluated_round, reference=reference)
         except (ValueError, TypeError, KeyError) as error:
             QMessageBox.warning(self, "结果无法评估", str(error))
             return
-        context = {"result": result, "candidate": candidate, "decision": decision, "round": evaluated_round}
+        context = {"result": result, "candidate": candidate, "decision": decision, "round": evaluated_round, "evaluated_plan": evaluated_plan}
         if decision.rollback_required:
             if decision.accepted:
                 self.current_plan = self.controller.pending_plan(self.core_task.task_id) or self.current_plan
@@ -2874,6 +3085,7 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 self._pending_rollback = context
+                self.experiment.show_evaluation(decision)
                 self.experiment.set_rollback_pending(True)
                 self.statusBar().showMessage("已暂停 · 请先恢复上一组配置", 0)
                 self._start_explanation(context)
@@ -3032,7 +3244,7 @@ class MainWindow(QMainWindow):
                                 ("power_mode", "power_mode"), ("cooling_mode", "cooling_mode")):
             if config.get(key):
                 setattr(self.state, state_name, str(config[key]))
-        known_video_keys = set((self.state.video_settings or {}).keys())
+        known_video_keys = set((self.state.video_settings or {}).keys()) | set(ADVANCED_SETTING_LABELS) | {"video_preset", "player_contrast", "nvidia_gsync", "nvidia_reflex", "amd_anti_lag", "menu_fps_cap"}
         updated_video = {
             key: str(value) for key, value in config.items()
             if key in known_video_keys and value not in (None, "")
@@ -3055,6 +3267,9 @@ class MainWindow(QMainWindow):
         result, candidate = context["result"], context["candidate"]
         decision, evaluated_round = context["decision"], context["round"]
         accepted = bool(decision.accepted)
+        if decision.stop_reason == "player_profile":
+            current = self.controller.current_record(self.core_task.task_id) if self.core_task else candidate
+            self._apply_record_to_state(current or candidate)
         if decision.action == AgentAction.REVERT_CHANGE:
             # A rollback restores the previous accepted record.  The
             # regression candidate remains rejected even after the user
@@ -3079,7 +3294,7 @@ class MainWindow(QMainWindow):
             self.state.step = "等待同配置复测"
         else:
             self.state.round_number = evaluated_round + 1
-            self.state.step = "诊断实验完成" if decision.diagnostic_summary else "复测评估完成"
+            self.state.step = "已更新实际配置，继续优化" if decision.stop_reason == "player_profile" else "诊断实验完成" if decision.diagnostic_summary else "复测评估完成"
         self.sidebar.update_task()
         self.history.add_result(result, decision, evaluated_round)
         self._show_toast("复测结果已保存，正在整理分析")
@@ -3088,6 +3303,7 @@ class MainWindow(QMainWindow):
             if current:
                 self._apply_record_to_state(current)
             self.current_plan = self._same_retest_plan(self.state.round_number)
+            self.experiment.show_evaluation(decision)
         elif not task_complete and self.state.round_number <= self.core_task.max_rounds:
             current = self.controller.current_record(self.core_task.task_id) or self.baseline_record
             try:
@@ -3262,6 +3478,11 @@ class MainWindow(QMainWindow):
         decision_snapshot = deepcopy(context["decision"])
         evidence_snapshot = deepcopy(self.current_evidence)
         plan_snapshot = deepcopy(self.current_plan)
+        workflow_snapshot = {
+            "submitted_result": context["candidate"].to_dict() if context.get("candidate") else None,
+            "evaluated_plan": _plan_dict(context.get("evaluated_plan")),
+            "rollback_confirmed": bool(context.get("rollback_confirmed")),
+        }
         job_context = {
             **context,
             "generation": job_id,
@@ -3271,6 +3492,7 @@ class MainWindow(QMainWindow):
             "decision_snapshot": decision_snapshot,
             "evidence_snapshot": evidence_snapshot,
             "plan_snapshot": plan_snapshot,
+            "workflow_snapshot": workflow_snapshot,
         }
         thread = QThread(self)
         worker = ModelWorker(lambda: self.controller.explain(
@@ -3278,6 +3500,7 @@ class MainWindow(QMainWindow):
             decision_snapshot,
             evidence=evidence_snapshot,
             plan=plan_snapshot,
+            workflow=workflow_snapshot,
         ), job_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -3321,7 +3544,7 @@ class MainWindow(QMainWindow):
             AgentAction.RETEST: "需要复测", AgentAction.KEEP_CHANGE: "保留调整",
             AgentAction.REVERT_CHANGE: "撤销调整", AgentAction.FINISH: "完成优化",
         }
-        action = action_names.get(decision.action, decision.action.value)
+        action = "按实际配置继续" if decision.stop_reason == "player_profile" else action_names.get(decision.action, decision.action.value)
         details = "\n".join(f"• {item}" for item in explanation.get("reasoning", []))
         warning = f"\n\n{explanation['warning']}" if explanation.get("warning") else ""
         QMessageBox.information(
@@ -3329,7 +3552,7 @@ class MainWindow(QMainWindow):
             f"结论：{action}\n{explanation['summary']}\n\n{details}\n\n下一步：{explanation['next_step']}{warning}",
         )
         self.statusBar().showMessage(f"复测结果已保存 · {action}", 6000)
-        self.set_page(3)
+        self.set_page(4 if decision.task_complete else 2)
 
     @Slot(int, object)
     def _explanation_failed(self, job_id: int, error: Exception):
@@ -3337,13 +3560,12 @@ class MainWindow(QMainWindow):
         if context is None:
             return
         decision = context["decision"]
-        fallback = {
-            "summary": decision.summary,
-            "reasoning": list(getattr(decision, "reasons", []))[:4],
-            "next_step": "请按当前测试建议继续。",
-            "warning": "模型暂不可用，已改用本地说明。",
-            "source": "local",
-        }
+        fallback = explain_decision(
+            None, context["task"], decision,
+            plan=context.get("plan_snapshot"),
+            workflow=context.get("workflow_snapshot"),
+        )
+        fallback["warning"] = "模型暂不可用，已改用本地说明。"
         self._explanation_finished(job_id, fallback)
 
     def _explanation_thread_finished(self, job_id: int, thread: QThread):
@@ -3460,7 +3682,7 @@ def run_app(screenshot: Path | None = None, page_index: int = 0) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("GameTune Agent")
     app.setStyle("Fusion")
-    app.setFont(QFont("Microsoft YaHei UI", 9))
+    app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
     window.show()

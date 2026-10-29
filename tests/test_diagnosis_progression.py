@@ -42,6 +42,27 @@ class DiagnosisProgressionTests(unittest.TestCase):
         candidate = self.record(230, 120, 85, {**config, setting: target})
         return baseline, candidate, plan
 
+    def test_reopen_invalid_diagnostic_survives_restart(self):
+        baseline = self.record(config={"fps_cap": "144", "vsync": "enabled"})
+        self.controller.create_task(self.task, baseline)
+        for _ in range(2):
+            wrong = replace(self.record(config=dict(baseline.configuration)), configuration_confirmed=False)
+            self.controller.evaluate(self.task, baseline, wrong, 1)
+        self.controller.confirm_rollback(self.task)
+        _, stopped = self.controller.plan_after_result(self.task, baseline, baseline, 2)
+        self.assertEqual(stopped.action, AgentAction.FINISH)
+        plan = self.controller.retry_invalid_diagnostic(self.task)
+        self.assertEqual(plan.setting_id, "frame_limits")
+        self.controller = GameTuneController(self.path)
+        self.controller.restore_task(self.task.task_id)
+        self.assertEqual(self.controller.workflow_state(self.task.task_id), WorkflowState.AWAITING_TEST)
+        self.assertEqual(self.controller._retry_counts[self.task.task_id], 0)
+        self.assertEqual(self.controller.pending_plan(self.task.task_id).round_number, 2)
+        valid = self.record(200, 120, config={"fps_cap": "0", "vsync": "disabled"})
+        result = self.controller.evaluate(self.task, baseline, valid, 2)
+        self.assertTrue(result.measurement_valid)
+        self.assertTrue(result.rollback_required)
+
     def test_known_cap_and_vsync_only_offer_limit_diagnostic(self):
         for config in ({"fps_cap": "144", "vsync": "disabled"},
                        {"fps_cap": "0", "vsync": "enabled"}):
@@ -82,12 +103,44 @@ class DiagnosisProgressionTests(unittest.TestCase):
     def test_limits_not_actually_removed_cannot_become_reference(self):
         baseline = self.record(config={"fps_cap": "144", "vsync": "enabled"})
         self.controller.create_task(self.task, baseline)
-        candidate = self.record(200, 120, config={"fps_cap": "144", "vsync": "enabled"})
-        self.assertEqual(self.controller.evaluate(self.task, baseline, candidate, 1).action, AgentAction.RETEST)
-        self.controller.evaluate(self.task, baseline, replace(candidate, record_id=uuid4().hex), 1)
-        self.controller.confirm_rollback(self.task)
+        for _ in range(4):
+            candidate = self.record(200, 120, config={"fps_cap": "144", "vsync": "enabled"})
+            decision = self.controller.evaluate(self.task, baseline, candidate, 1)
+            self.assertEqual(decision.action, AgentAction.RETEST)
+            self.assertTrue(decision.measurement_valid)
+            self.assertEqual(decision.stop_reason, "unchanged_observation")
         self.assertIsNone(self.controller._uncapped_reference(self.task.task_id))
-        self.assertFalse(self.controller.experiment_history(self.task.task_id)[-1]["valid"])
+        self.assertEqual(self.controller._retry_counts[self.task.task_id], 0)
+        self.assertEqual(self.controller.workflow_state(self.task.task_id), WorkflowState.AWAITING_TEST)
+
+    def test_exhausted_limit_diagnostic_does_not_restart_after_restore(self):
+        baseline = self.record(config={"fps_cap": "144", "vsync": "enabled"})
+        self.controller.create_task(self.task, baseline)
+        wrong = replace(self.record(200, 120, config={"fps_cap": "144", "vsync": "enabled"}), configuration_confirmed=False)
+        self.controller.evaluate(self.task, baseline, wrong, 1)
+        self.controller.evaluate(self.task, baseline, replace(wrong, record_id=uuid4().hex), 1)
+        self.controller.confirm_rollback(self.task)
+        self.controller = GameTuneController(self.path)
+        self.controller.restore_task(self.task.task_id)
+        _, plan = self.controller.plan_after_result(self.task, baseline, baseline, 2)
+        self.assertEqual(plan.action, AgentAction.FINISH)
+        self.assertIsNone(self.controller._uncapped_reference(self.task.task_id))
+        self.assertNotIn("frame_limits", self.controller._diagnosed_setting_ids(self.task.task_id))
+
+    def test_limit_diagnostic_does_not_use_resolution_ambiguity_threshold(self):
+        for avg in (144, 154):
+            with self.subTest(avg=avg):
+                self.task = replace(self.task, task_id=uuid4().hex)
+                baseline = self.record(config={"fps_cap": "144", "vsync": "enabled"})
+                self.controller.create_task(self.task, baseline)
+                uncapped = self.record(avg, 100, config={"fps_cap": "0", "vsync": "disabled"})
+                uncapped = replace(uncapped, repeats=2)
+                result = self.controller.evaluate(self.task, baseline, uncapped, 1)
+                self.assertEqual(result.action, AgentAction.REVERT_CHANGE)
+                self.assertTrue(result.measurement_valid)
+                self.assertFalse(result.accepted)
+                self.controller.confirm_rollback(self.task)
+                self.assertIsNotNone(self.controller._uncapped_reference(self.task.task_id))
 
     def test_platform_improvement_promotes_only_after_restore(self):
         for setting in ("power_mode", "cooling_mode", "graphics_mode"):
@@ -160,13 +213,16 @@ class DiagnosisProgressionTests(unittest.TestCase):
         self.assertEqual(chosen.source, "model")
         self.assertEqual(chosen.plan.purpose, "optimization")
 
-    def test_unrelated_diagnostic_configuration_change_is_invalid(self):
+    def test_player_graphics_edit_does_not_become_platform_diagnostic(self):
         baseline, candidate, _ = self.start_platform()
         baseline.configuration["shadow_quality"] = "高"
         candidate.configuration["shadow_quality"] = "低"
-        self.assertEqual(self.controller.evaluate(self.task, baseline, candidate, 1).action, AgentAction.RETEST)
-        self.controller.evaluate(self.task, baseline, replace(candidate, record_id=uuid4().hex), 1)
-        self.controller.confirm_rollback(self.task)
+        decision = self.controller.evaluate(self.task, baseline, candidate, 1)
+        self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
+        self.assertEqual(decision.stop_reason, "player_profile")
+        self.assertFalse(decision.diagnostic_summary)
+        self.assertFalse(decision.rollback_required)
+        self.assertEqual(self.controller.current_record(self.task.task_id).record_id, candidate.record_id)
         self.assertEqual(self.controller._promoted_candidates(self.task, baseline, 2), [])
 
 

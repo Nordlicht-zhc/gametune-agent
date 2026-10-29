@@ -6,7 +6,7 @@ from statistics import median
 from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
 from tools.calculate_metrics import normalized_score, weighted_relative_change
 from tools.resolution import parse_resolution
-from tools.configuration import CONFIGURATION_LABELS, unexpected_configuration_changes
+from tools.configuration import CONFIGURATION_LABELS, changed_graphics, unexpected_configuration_changes
 
 
 _DISPERSION_LIMIT_PCT = 5.0
@@ -149,6 +149,7 @@ def evaluate_result(
     max_retries: int = 2,
     accept_neutral_change: bool = False,
     setting_id: str = "",
+    graphics_profile: bool = False,
 ) -> Decision:
     """Evaluate one candidate against the currently accepted configuration.
 
@@ -215,6 +216,9 @@ def evaluate_result(
         )
     comparison = reference or baseline
     unexpected = unexpected_configuration_changes(comparison, candidate, setting_id or str(candidate.configuration.get("planned_setting_id", "")))
+    if graphics_profile:
+        actual_changes = set(changed_graphics(comparison, candidate))
+        unexpected = [key for key in unexpected if key not in actual_changes]
     if unexpected:
         return bounded_retest(
             "计划之外的配置发生变化或缺少记录，暂不把收益归因于本项调整。",
@@ -424,6 +428,7 @@ def evaluate_diagnostic_result(
                 AgentAction.RETEST,
                 "诊断设置还没有确认，请核对实际配置后重新提交。",
                 reasons=["诊断测试必须确认实际改动，才能判断结果。"],
+                measurement_valid=False,
                 retry_same_experiment=True,
             )
         return _diagnostic_restore(
@@ -480,7 +485,7 @@ def evaluate_diagnostic_result(
 
     avg_delta = (candidate.avg_fps - reference.avg_fps) / reference.avg_fps * 100
     low_delta = (candidate.low_fps - reference.low_fps) / reference.low_fps * 100
-    if 5.0 < abs(avg_delta) < 10.0 and retry_count < max_retries:
+    if setting_id == "resolution" and 5.0 < abs(avg_delta) < 10.0 and retry_count < max_retries:
         return _decision(
             AgentAction.RETEST,
             "分辨率对比的变化还不够明确，再测一次后判断原因。",

@@ -110,6 +110,44 @@ class UiWorkflowTests(unittest.TestCase):
             self.assertEqual(window.controller.repository.list_tasks(), [])
             window.close()
 
+    def test_limit_steps_and_restore_are_visible_on_experiment_page(self):
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT, "排除限帧", "帧率限制", "144", "不限帧且关闭垂直同步",
+            "原因", "假设", "至少测试两次", "记录变化，不要求提升", "最高 FPS 恢复为 144，垂直同步开启。",
+            1, setting_id="frame_limits", purpose="diagnostic",
+            required_configuration={"fps_cap": "0", "vsync": "disabled"},
+        )
+        page = ExperimentPage(TaskState(has_task=True), plan)
+        self.assertIn("至少 2 次", page.execution_guide.text())
+        self.assertNotIn("平均帧率变化超过 5%", " ".join(item.text() for item in page.findChildren(QLabel)))
+        page.set_rollback_pending(True)
+        self.assertIn("最高 FPS 恢复为 144", page.execution_guide.text())
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertTrue(page.rollback_button.isEnabled())
+        page.deleteLater()
+
+    def test_experiment_belongs_to_overview_and_can_return(self):
+        with tempfile.TemporaryDirectory() as folder:
+            window = MainWindow(database_path=Path(folder) / "ui.db")
+            window.set_page(2)
+            window.experiment.overview_button.click()
+            self.assertEqual(window.stack.currentIndex(), 0)
+            self.assertIn("执行本轮实验", window.sidebar.group.button(2).text())
+            window.close()
+
+    def test_assessment_returns_to_action_page_until_task_is_complete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            window = MainWindow(database_path=Path(folder) / "ui.db", controller=FakeController())
+            window._replace_report = Mock()
+            for complete, expected in ((False, 2), (True, 4)):
+                decision = Decision(AgentAction.FINISH if complete else AgentAction.RETEST, "结果", task_complete=complete)
+                context = {"decision": decision, "result": {}, "task_id": "test"}
+                window._explanation_context = Mock(return_value=context)
+                with patch("app.QMessageBox.information"):
+                    window._explanation_finished(1, {"summary": "结果", "reasoning": [], "next_step": "继续"})
+                self.assertEqual(window.stack.currentIndex(), expected)
+            window.close()
+
     def test_actual_configuration_is_unchecked_by_default(self):
         page = ExperimentPage(TaskState())
         self.assertFalse(page.configuration_confirmed.isChecked())
@@ -139,6 +177,8 @@ class UiWorkflowTests(unittest.TestCase):
             QTest.keyClicks(page._actual_fields["fps_cap"], "0")
             page._actual_fields["vsync"].setText("已关闭")
             page.actual_setting.setText("不限帧且关闭垂直同步")
+            page.avg.setValue(300)
+            page.low.setValue(180)
             page.configuration_confirmed.setChecked(True)
             QTest.mouseClick(page.save_button, Qt.MouseButton.LeftButton)
             self.assertEqual(len(submitted), 1)

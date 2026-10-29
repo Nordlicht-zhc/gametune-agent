@@ -244,7 +244,7 @@ class ValidationControlsTests(unittest.TestCase):
         changed = {**config, plan.setting_id: plan.new_value}
         valid = self.record(220, 130, config=changed, repeats=1)
         self.controller.evaluate(self.task, baseline, valid, 1)
-        invalid = self.record(330, 180, config={**changed, "msaa_mode": "4x_msaa"}, repeats=1)
+        invalid = self.record(330, 180, config={**changed, "fps_cap": "144"}, repeats=1)
         self.controller.evaluate(self.task, baseline, invalid, 1)
         self.controller = GameTuneController(self.path)
         self.controller.restore_task(self.task.task_id)

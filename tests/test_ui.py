@@ -10,12 +10,12 @@ class ThemeRegressionTests(unittest.TestCase):
 
     def test_combo_popup_has_high_contrast_text_and_selection(self):
         self.assertIn("QComboBox QAbstractItemView", STYLESHEET)
-        self.assertIn("color: #202422", STYLESHEET)
-        self.assertIn("selection-color: #163c85", STYLESHEET)
+        self.assertIn("color: #302d29", STYLESHEET)
+        self.assertIn("selection-color: #302d29", STYLESHEET)
 
     def test_message_boxes_override_system_dark_content_area(self):
         self.assertIn("QMessageBox { background-color: #ffffff; }", STYLESHEET)
-        self.assertIn("QMessageBox QLabel { background: transparent; color: #202422;", STYLESHEET)
+        self.assertIn("QMessageBox QLabel { background: transparent; color: #302d29;", STYLESHEET)
         self.assertIn("QMessageBox QPushButton:default", STYLESHEET)
 
     def test_wrapped_warning_box_has_explicit_height(self):

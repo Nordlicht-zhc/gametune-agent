@@ -15,6 +15,10 @@ class KnowledgeBase:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
 
+    def performance_evidence(self, game: str) -> dict:
+        from tools.performance_knowledge import load_performance_knowledge
+        return load_performance_knowledge(self.directory, game)
+
     def game_rules(self, game: str) -> dict:
         candidates = {
             "Counter-Strike 2": "cs2.json",

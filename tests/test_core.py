@@ -465,6 +465,33 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertTrue(payload["final_decision"]["rollback_required"])
         self.assertTrue(any("先要求恢复" in item for item in payload["constraints"]))
 
+    def test_invalid_submission_cannot_be_reinterpreted_by_model(self):
+        provider = FakeProvider()
+        current_task = task()
+        candidate = record(596, 208)
+        candidate.gpu_usage = 95
+        candidate.configuration_confirmed = False
+        decision = Decision(AgentAction.RETEST, "请核对实际配置后重新提交。",
+                            reasons=["诊断设置未确认"], retry_same_experiment=True)
+        workflow = {"submitted_result": candidate.to_dict(), "evaluated_plan": None}
+        explanation = explain_decision(provider, current_task, decision, workflow=workflow)
+        self.assertEqual(explanation["summary"], decision.summary)
+        self.assertEqual(explanation["reasoning"], decision.reasons)
+        payload = json.loads(provider.last_request.messages[-1].content)
+        self.assertEqual(payload["workflow"]["submitted_result"]["gpu_usage"], 95)
+        self.assertIn("核对", explanation["next_step"])
+
+    def test_generated_operations_are_replaced_by_workflow_action(self):
+        provider = FakeProvider()
+        decision = Decision(AgentAction.REVERT_CHANGE, "诊断完成，请恢复原配置。",
+                            rollback_required=True)
+        explanation = explain_decision(provider, task(), decision)
+        self.assertIn("恢复", explanation["next_step"])
+        self.assertNotEqual(explanation["next_step"], "复测")
+        restored = explain_decision(provider, task(), decision,
+                                    workflow={"rollback_confirmed": True, "submitted_result": None})
+        self.assertIn("已确认恢复", restored["next_step"])
+
     def test_missing_provider_uses_local_fallback(self):
         current_task = task()
         decision = evaluate_result(current_task, record(284, 168), record(296, 174), round_number=1)

@@ -11,7 +11,7 @@ from .api import ModelMessage, ModelRequest
 SYSTEM_PROMPT = """你是 GameTune 的玩家助手。确定性分析模块已经作出结论，你不能修改数值、动作或虚构测试数据。
 
 请把结果写给不熟悉性能测试的普通游戏玩家：
-- 使用日常、直接的中文，先说“这次调整有没有用”，再说原因和下一步。
+- 使用日常、直接的中文。诊断阶段先说测试是否有效、能否判断原因；优化验证阶段先说调整是否有用，再解释原因和下一步。
 - 不要使用“综合得分”“非退化”“置信区间”“方差”“显著性”“归因”“证据指向”等研究或统计术语。
 - 必须提到专有名词时，紧跟一句白话解释。首次出现 1% Low 时，可写成“1% Low（卡顿时的帧率表现）”。
 - 不要复述内部字段名、英文动作名或计算公式，不要自行增加复测次数或新的优化动作。
@@ -29,12 +29,14 @@ def decision_explanation_request(
     decision: Decision,
     evidence: list[Evidence] | None = None,
     plan: ExperimentPlan | None = None,
+    workflow: dict | None = None,
 ) -> ModelRequest:
     payload = {
         "task": task.to_dict(),
         "decision": decision.to_dict(),
         "evidence": [asdict(item) for item in (evidence or [])],
         "next_plan": _plan_dict(plan),
+        "workflow": workflow or {},
         "required_output": {
             "summary": "不超过 80 字；用白话说明这次调整是保留、撤销还是需要继续测",
             "reasoning": ["2 到 3 条普通玩家能看懂的原因，每条一句"],
@@ -47,6 +49,10 @@ def decision_explanation_request(
         "constraints": [
             "summary、reasoning 和 next_step 不能互相矛盾",
             "next_step 必须严格遵守 must_follow，不得自行要求重复本轮实验",
+            "workflow.submitted_result 是本次提交值；evidence 是其他阶段的背景证据，不得混称本轮测量",
+            "workflow.evaluated_plan 是刚评估的实验，next_plan 是当前待执行计划，不能混淆",
+            "诊断实验只用于判断原因，不用这次调整有没有收益来描述；无效或不可比记录不得推断瓶颈或收益",
+            "缺失 GPU 占用是未知，不是 0%；不得从旧证据替换本次输入",
             "decision.action 为 keep_change 时表示保留调整并进入下一步，不是重复本轮复测",
             "decision.action 为 retest 时才能要求保持同一配置重新测试",
         ],
@@ -67,6 +73,7 @@ def final_report_request(
     decision: Decision,
     evidence: list[Evidence] | None = None,
     plan: ExperimentPlan | None = None,
+    workflow: dict | None = None,
 ) -> ModelRequest:
     payload = {
         "report_type": "final_report",
@@ -74,6 +81,7 @@ def final_report_request(
         "final_decision": decision.to_dict(),
         "evidence": [asdict(item) for item in (evidence or [])],
         "last_plan": _plan_dict(plan),
+        "workflow": workflow or {},
         "required_output": {
             "summary": "不超过 120 字；用白话说明最后保留或恢复哪类设置，以及任务为什么结束",
             "reasoning": ["3 到 4 条普通玩家能看懂的关键发现，每条一句"],
@@ -142,10 +150,13 @@ def _plan_dict(plan: ExperimentPlan | None) -> dict | None:
 
 def _next_step_guard(decision: Decision, plan: ExperimentPlan | None) -> str:
     """Give the model a plain-language action boundary it must not exceed."""
+    if decision.stop_reason == "player_profile":
+        return (f"按你实际采用的配置继续；下一项建议：{plan.method}" if plan else "已记录实际配置，按页面查看下一步建议；这不代表收益已经验证。")
     if decision.rollback_required or decision.action.value == "revert_change":
         return "先恢复上一组已验证配置，不能保留本轮调整。"
     if decision.action.value == "retest":
-        return "保持本轮配置和测试条件不变，重复本轮测试。"
+        return (f"先核对并确认实际配置和测试条件；按本轮计划操作：{plan.method}"
+                if plan else "先核对并确认实际配置和测试条件，再重复本轮测试。")
     if decision.task_complete or decision.action.value == "finish":
         return "任务已结束，保存最佳已验证配置和报告。"
     if plan is not None:

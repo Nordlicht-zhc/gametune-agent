@@ -10,7 +10,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QBoxLayout
-from app import MainWindow, STYLESHEET
+from app import DashboardPage, MainWindow, STYLESHEET, TaskState
+from models.schemas import BenchmarkRecord
 
 
 class RedesignWorkflowTests(unittest.TestCase):
@@ -127,6 +128,49 @@ class RedesignWorkflowTests(unittest.TestCase):
         self.assertEqual(self.window.history.table.rowCount(), 1)
         self.assertTrue(self.window.dashboard.findChildren(QLabel, "metricValue"))
         self.assertEqual(self.window.stack.currentIndex(), 0)
+
+    def test_workspace_chart_uses_persisted_runs_and_evidence_expands(self):
+        page = self.window.new_task
+        page.begin_baseline_button.click()
+        for inputs, avg in zip(page.baseline_run_inputs[:2], (200, 204)):
+            inputs["avg_fps"].setValue(avg)
+            inputs["low_fps"].setValue(140)
+            inputs["gpu_usage"].setValue(90)
+        page.baseline_confirmed_input.setChecked(True)
+        page._finish_baseline()
+        dashboard = self.window.dashboard
+        current = self.window.controller.current_record(self.window.core_task.task_id)
+        self.assertEqual(dashboard.run_chart.runs, current.runs)
+        self.assertEqual([run["avg_fps"] for run in dashboard.run_chart.runs], [200, 204])
+        self.assertTrue(dashboard.evidence_panel.isHidden())
+        dashboard.evidence_button.click()
+        self.assertFalse(dashboard.evidence_panel.isHidden())
+        dashboard.evidence_button.click()
+        self.assertTrue(dashboard.evidence_panel.isHidden())
+        dashboard.findChildren(type(dashboard.evidence_button), "primaryButton")[0].click()
+        self.assertEqual(self.window.stack.currentIndex(), 2)
+
+    def test_summary_record_does_not_invent_measurements(self):
+        record = BenchmarkRecord(200, 140, None, "1920 × 1080", "Test")
+        page = DashboardPage(TaskState(), record=record)
+        self.addCleanup(page.deleteLater)
+        self.assertEqual(page.run_chart.runs, [])
+        self.assertIn("没有逐次", page.run_chart.accessibleDescription())
+        self.assertIn("200 FPS", [item.text() for item in page.findChildren(QLabel, "metricValue")])
+
+    def test_workspace_chart_reloads_from_saved_task(self):
+        page = self.window.new_task
+        page.begin_baseline_button.click()
+        for inputs in page.baseline_run_inputs[:2]:
+            inputs["avg_fps"].setValue(200)
+            inputs["low_fps"].setValue(140)
+            inputs["gpu_usage"].setValue(90)
+        page.baseline_confirmed_input.setChecked(True)
+        page._finish_baseline()
+        task_id = self.window.core_task.task_id
+        expected = self.window.dashboard.run_chart.runs
+        self.window._restore_task(task_id)
+        self.assertEqual(self.window.dashboard.run_chart.runs, expected)
 
 
 if __name__ == "__main__":

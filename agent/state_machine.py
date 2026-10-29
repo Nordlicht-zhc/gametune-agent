@@ -100,3 +100,9 @@ class Workflow:
     def complete_without_test(self) -> None:
         """Complete when planning has no remaining supported experiment."""
         self.transition(WorkflowState.COMPLETE)
+
+    def reopen_invalid_diagnostic(self) -> None:
+        """User-requested recovery, guarded by the controller's invalid history."""
+        if self.state != WorkflowState.COMPLETE:
+            raise ValueError("只有停止的任务可以重新核对诊断")
+        self.state = WorkflowState.AWAITING_TEST

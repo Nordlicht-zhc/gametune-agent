@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "game": "Counter-Strike 2",
+  "reviewed_on": "2026-10-28",
+  "purpose": "外部性能参考，用于比较调整方向，不代表用户设备的已验证收益。",
+  "sources": [
+    {
+      "id": "erza_graphics_202604",
+      "url": "https://github.com/9Erza/CS2-Optimization-Guide",
+      "section": "Section 8: Graphics Settings Performance Impact",
+      "source_type": "author_reported_benchmark",
+      "confidence": "single_system_community_reference",
+      "test_period": "2026-04-17/2026-04-22",
+      "reported_game_update": "2026-04-21 Animgraph",
+      "cpu": "AMD Ryzen 7 7800X3D",
+      "gpu": "AMD Radeon RX 9070 XT 16 GB",
+      "reported_general_resolution": "1280 × 960",
+      "map": "CS2 FPS Benchmark workshop map 3240880604",
+      "capture_tool": "CapFrameX",
+      "reported_repeats": 3,
+      "low_metric": "1% Low Average (not P1 percentile FPS)",
+      "graphics_section_baseline": "最低档 / 关闭 / 无，逐项提高设置",
+      "limitations": [
+        "只代表一套桌面平台；无法直接预测其他设备或当前版本收益。",
+        "总测试配置与画质章节的最低档说明不同，按章节表格保留，具体条件需复核。",
+        "三线性过滤文字与表格低帧值不一致，该异常结论不入库。",
+        "仅保留选取的数值事实，不采纳作者对延迟、系统安全或通用最佳配置的推断。"
+      ]
+    },
+    {
+      "id": "computerbase_cs2_202404",
+      "url": "https://www.computerbase.de/artikel/gaming/counter-strike-2-benchmark-test.87904/",
+      "source_type": "editorial_benchmark",
+      "published_on": "2024-04-29",
+      "scope": "Ancient 可重复场景，多显卡、多分辨率、组合画质对照；仅作背景，不能拆分单项收益。"
+    }
+  ],
+  "measurements": [
+    {"setting_id": "msaa_mode", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "none", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "2x_msaa", "avg_fps": 941.0, "low_fps": 284.8},
+      {"value": "4x_msaa", "avg_fps": 924.7, "low_fps": 282.7},
+      {"value": "8x_msaa", "avg_fps": 865.6, "low_fps": 284.2}
+    ]},
+    {"setting_id": "shadow_quality", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "低", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "中", "avg_fps": 961.3, "low_fps": 287.1},
+      {"value": "高", "avg_fps": 932.3, "low_fps": 281.7},
+      {"value": "非常高", "avg_fps": 879.3, "low_fps": 284.3}
+    ]},
+    {"setting_id": "particle_detail", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "low", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "very_high", "avg_fps": 885.8, "low_fps": 271.8}
+    ]},
+    {"setting_id": "texture_detail", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "low", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "high", "avg_fps": 926.1, "low_fps": 287.5}
+    ]},
+    {"setting_id": "shader_detail", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "low", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "high", "avg_fps": 964.9, "low_fps": 285.3}
+    ]},
+    {"setting_id": "ambient_occlusion", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "disabled", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "high", "avg_fps": 971.6, "low_fps": 288.3}
+    ]},
+    {"setting_id": "dynamic_shadows", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "sun_only", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "all", "avg_fps": 973.3, "low_fps": 286.3}
+    ]},
+    {"setting_id": "texture_filtering", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "bilinear", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "anisotropic_16x", "avg_fps": 970.7, "low_fps": 285.4}
+    ]},
+    {"setting_id": "hdr", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "performance", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "quality", "avg_fps": 968.2, "low_fps": 288.3}
+    ]},
+    {"setting_id": "player_contrast", "source_id": "erza_graphics_202604", "levels": [
+      {"value": "disabled", "avg_fps": 979.5, "low_fps": 284.7},
+      {"value": "enabled", "avg_fps": 978.6, "low_fps": 292.0}
+    ]}
+  ],
+  "usage_rules": [
+    "只用于假设、候选优先级和用户改动影响解释，不作为用户设备的收益测量。",
+    "只对来源中同时记录的原值和新值计算方向变化，缺失档位不插值。",
+    "多项设置影响不能相加，也不能据此拆分组合测试的贡献。",
+    "有效的本机对照优先；限帧、CPU 限制、版本、分辨率和场景会改变效果。"
+  ]
+}

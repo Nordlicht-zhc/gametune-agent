@@ -182,6 +182,7 @@ class ExperimentPlan:
     reference_low_fps: float | None = None
     diagnostic_record_id: str = ""
     required_configuration: dict[str, str] = field(default_factory=dict)
+    planning_context: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.purpose == "auto":

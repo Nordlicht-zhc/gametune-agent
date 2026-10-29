@@ -8,7 +8,7 @@ from typing import Any
 from agent.api import ModelProvider
 from agent.evaluator import evaluate_diagnostic_result, evaluate_result
 from agent.explainer import explain_decision
-from agent.next_step import NextStepSelection, choose_next_step
+from agent.next_step import NextStepSelection, choose_next_step, rank_candidates
 from agent.planner import (
     GENERIC_OPTIMIZATION_DIRECTIONS,
     gpu_optimization_candidates,
@@ -22,7 +22,7 @@ from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, Exp
 from storage.repository import SQLiteRepository
 from tools.analyze_evidence import analyze_evidence
 from tools.calculate_metrics import weighted_performance_score
-from tools.configuration import canonical_value, unexpected_configuration_changes
+from tools.configuration import CONFIGURATION_LABELS, changed_graphics, canonical_value, unexpected_configuration_changes
 
 
 UNCAPPED_CHOICES = {
@@ -79,7 +79,7 @@ class GameTuneController:
         baseline_runs = len(baseline.runs) if baseline.runs else baseline.repeats
         if baseline_runs < 2:
             raise ValueError("基线至少需要 2 次有效测试后才能创建优化任务")
-        if len(baseline.runs) == 2:
+        if len(baseline.runs) >= 2:
             avg_values = [float(run["avg_fps"]) for run in baseline.runs]
             low_values = [float(run["low_fps"]) for run in baseline.runs]
 
@@ -88,7 +88,12 @@ class GameTuneController:
                 return (max(values) - min(values)) / centre * 100 if centre else float("inf")
 
             if spread(avg_values) > 5.0 or spread(low_values) > 5.0:
-                raise ValueError("两次基线结果差异超过 5%，请补充第 3 次基线测试")
+                if len(baseline.runs) == 2:
+                    raise ValueError("两次基线结果差异超过 5%，请补充第 3 次基线测试")
+                raise ValueError(
+                    "基线补测后波动仍超过 5%，暂不能作为可靠比较基准。"
+                    "请检查固定场景、预热、后台任务及采集方式，再重新采集一组基线；不要仅增加次数。"
+                )
         workflow = Workflow()
         workflow.start()
         workflow.validated()
@@ -157,6 +162,7 @@ class GameTuneController:
             raise ValueError(f"实验轮次不匹配：应为 {workflow.round_number}，收到 {round_number}")
 
         pending = self.pending_plan(task.task_id)
+        submitted_candidate = candidate
         candidate = self._mark_configuration_mismatch(candidate, pending)
         # The controller's accepted record is authoritative.  A UI may hold
         # a stale reference while a restored task has already accepted a
@@ -166,6 +172,14 @@ class GameTuneController:
             comparison = self._comparison_record(task.task_id, pending.reference_record_id)
             if comparison is None or comparison.record_id != pending.reference_record_id:
                 raise ValueError("找不到已确认恢复的不限帧比较基准，请重新规划诊断")
+        changes = changed_graphics(comparison, submitted_candidate)
+        if submitted_candidate.configuration_confirmed and changes and (
+            len(changes) > 1 or pending is None or changes[0] != pending.setting_id
+            or canonical_value(changes[0], submitted_candidate.configuration.get(changes[0], submitted_candidate.resolution))
+               != canonical_value(changes[0], pending.new_value)
+        ):
+            return self._adopt_player_profile(task, baseline, comparison, submitted_candidate,
+                                              round_number, changes, pending)
         setting_id = pending.setting_id if pending else str(candidate.configuration.get("planned_setting_id", ""))
         if unexpected_configuration_changes(comparison, candidate, setting_id):
             candidate = replace(candidate, comparable=False)
@@ -218,6 +232,28 @@ class GameTuneController:
                 decision.summary += " 本轮已验证的画面设置应保留，只恢复帧率限制。"
                 pending = replace(pending, rollback="保留本轮已验证画面设置；" + restore_instruction)
             decision.reasons.append("恢复限帧后的性能尚未重新测量，不沿用不限帧测试数值。")
+        # An unchanged, confirmed configuration is a repeat observation, not
+        # an executed diagnostic and not an invalid measurement.
+        unchanged = (
+            pending is not None and submitted_candidate.configuration_confirmed
+            and submitted_candidate.comparable and comparison.configuration_confirmed
+            and not unexpected_configuration_changes(comparison, submitted_candidate)
+            and canonical_value(pending.setting_id, submitted_candidate.resolution if pending.setting_id == "resolution"
+                                else submitted_candidate.configuration.get(pending.setting_id, "unknown"))
+                == canonical_value(pending.setting_id, comparison.resolution if pending.setting_id == "resolution"
+                                   else comparison.configuration.get(pending.setting_id, "unknown"))
+            and canonical_value(pending.setting_id, pending.new_value)
+                != canonical_value(pending.setting_id, pending.old_value)
+        )
+        if unchanged:
+            candidate = submitted_candidate
+            combined_runs = None
+            decision = Decision(
+                AgentAction.RETEST, "已记录原配置复测；本次没有执行建议调整，尚不能判断该项调整的效果。",
+                reasons=["数据按实际配置保留，不计入建议调整的诊断或收益验证。",
+                         "可以核对实际设置后继续本轮测试；本次不消耗诊断重试次数。"],
+                retry_same_experiment=True, measurement_valid=True, stop_reason="unchanged_observation",
+            )
         next_workflow = Workflow(workflow.state, workflow.round_number, workflow.phase)
         next_workflow.begin_evaluation()
         self._transition_after_decision(next_workflow, decision, pending)
@@ -231,12 +267,12 @@ class GameTuneController:
         )
         pending_payload = asdict(pending) if keep_pending and pending else None
         failed_actions = set(self._failed_actions.get(task.task_id, set()))
-        if decision.action == AgentAction.REVERT_CHANGE and pending is not None and not diagnostic_plan:
+        if decision.action == AgentAction.REVERT_CHANGE and pending is not None and not diagnostic_plan and decision.measurement_valid is not False:
             failed_actions.add(self._action_key(pending))
         diagnostic_results = list(self._diagnostic_results.get(task.task_id, []))
         experiment = {
             "record_id": candidate.record_id, "round_number": round_number,
-            "purpose": pending.purpose if pending else "optimization",
+            "purpose": "observation" if unchanged else pending.purpose if pending else "optimization",
             "setting_id": pending.setting_id if pending else "",
             "reference_record_id": comparison.record_id,
             "before_configuration": dict(comparison.configuration),
@@ -257,6 +293,10 @@ class GameTuneController:
         if decision.measurement_valid is not None:
             experiment["valid"] = decision.measurement_valid
         if pending:
+            experiment["selection"] = {
+                "source": pending.planning_source, "reason": pending.selection_reason,
+                **pending.planning_context,
+            }
             experiment["before_configuration"].setdefault(pending.setting_id, pending.old_value)
             experiment["after_configuration"].setdefault(pending.setting_id, pending.new_value if candidate.configuration_confirmed else "unknown")
         if diagnostic_plan and decision.diagnostic_summary:
@@ -295,7 +335,9 @@ class GameTuneController:
                     and min(decision.avg_delta_pct, decision.low_delta_pct) >= -2,
 
             })
-        if decision.action != AgentAction.RETEST:
+        if unchanged:
+            next_retry_count = retry_count
+        elif decision.action != AgentAction.RETEST:
             next_retry_count = 0
         else:
             next_retry_count = retry_count + 1 if not decision.task_complete else retry_count
@@ -1001,13 +1043,14 @@ class GameTuneController:
     ) -> ExperimentPlan:
         candidates = self.next_step_candidates(task, current, evidence, round_number)
         if candidates:
-            return candidates[0]
+            return choose_next_step(None, task, current, evidence, candidates,
+                                    history=self.experiment_history(task.task_id)).plan
         return plan_next_experiment(
             task,
             current,
             evidence,
             round_number,
-            blocked_setting_ids=self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id),
+            blocked_setting_ids=self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id) | self._exhausted_diagnostic_ids(task.task_id),
         )
 
     def limit_context(self, task_id: str) -> dict[str, Any]:
@@ -1105,7 +1148,9 @@ class GameTuneController:
             plan = ExperimentPlan(**values)
             if self._action_key(plan) in self._failed_actions.get(task.task_id, set()):
                 continue
-            if any(item.get("purpose") == "optimization" and item.get("setting_id") == plan.setting_id
+            if any(item.get("purpose") == "optimization" and item.get("valid") is True
+                   and not (item.get("decision") or {}).get("retry_same_experiment")
+                   and item.get("setting_id") == plan.setting_id
                    and self._canonical_setting_value(plan.setting_id, item.get("after_configuration", {}).get(plan.setting_id))
                    == self._canonical_setting_value(plan.setting_id, plan.new_value) for item in history):
                 continue
@@ -1142,12 +1187,20 @@ class GameTuneController:
         """Return only locally generated and rule-validated model options."""
         if round_number > task.max_rounds:
             return []
+        workflow = self.workflows.get(task.task_id)
+        if workflow and workflow.state in {WorkflowState.AWAITING_ROLLBACK, WorkflowState.COMPLETE}:
+            return []
+        pending = self.pending_plans.get(task.task_id)
+        last = self.last_decisions.get(task.task_id)
+        if pending and last and last.retry_same_experiment and pending.round_number == round_number:
+            validate_plan(task, pending, self.knowledge)
+            return [pending]
         context = self.limit_context(task.task_id)
         if context.get("status") == "active":
             current = self.planning_record(task.task_id) or current
             evidence = analyze_evidence(task, current, fps_cap_known=True, vsync_known=True,
                                         diagnostic_results=self._diagnostic_results.get(task.task_id, []))
-        blocked = self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id)
+        blocked = self._failed_setting_ids(task.task_id) | self._diagnosed_setting_ids(task.task_id) | self._exhausted_diagnostic_ids(task.task_id)
         candidates = self._promoted_candidates(task, current, round_number)
         uncapped = self._uncapped_reference(task.task_id)
         if uncapped and not context and any(item.code == "cap_active" for item in evidence):
@@ -1233,7 +1286,7 @@ class GameTuneController:
                 continue
             valid.append(plan)
             seen.add(identity)
-        return valid
+        return rank_candidates(task, current, evidence, valid)
 
     def choose_next_step(
         self,
@@ -1244,7 +1297,9 @@ class GameTuneController:
         history: list[dict] | None = None,
     ) -> NextStepSelection:
         """Select a validated option in a worker thread, falling back locally."""
-        selection = choose_next_step(self.model_provider, task, current, evidence, candidates, history=self.experiment_history(task.task_id) if history is None else history)
+        selection = choose_next_step(self.model_provider, task, current, evidence, candidates,
+            history=self.experiment_history(task.task_id) if history is None else history,
+            knowledge_directory=self.knowledge.directory)
         validate_plan(task, selection.plan, self.knowledge)
         return selection
 
@@ -1267,15 +1322,22 @@ class GameTuneController:
             or plan_candidate_id(selected_plan) not in allowed_candidate_ids
         ):
             return False
+        last = self.last_decisions.get(task.task_id)
+        if last and last.retry_same_experiment:
+            return False
         validate_plan(task, selected_plan, self.knowledge)
         if self._action_key(selected_plan) in self._failed_actions.get(task.task_id, set()):
             return False
+        metadata = self.repository.runtime_metadata(task.task_id)
+        selections = list(metadata.get("planning_selections", []))
+        selections.append({"round_number": selected_plan.round_number,
+                           "reason": selected_plan.selection_reason, **selected_plan.planning_context})
+        self.repository.save_runtime_metadata(task.task_id, pending_plan=asdict(selected_plan),
+            planning_selections=selections, workflow_phase=selected_plan.purpose)
         self.pending_plans[task.task_id] = selected_plan
-        self._save_pending_plan(task.task_id, selected_plan)
         workflow.set_phase(
             selected_plan.purpose, action=selected_plan.action.value, setting_id=selected_plan.setting_id
         )
-        self.repository.save_runtime_metadata(task.task_id, workflow_phase=workflow.phase.value)
         return True
 
     def _skip_failed_plan(
@@ -1323,6 +1385,130 @@ class GameTuneController:
             and str(item.get("kind", "")).strip()
         }
 
+    def _exhausted_diagnostic_ids(self, task_id: str) -> set[str]:
+        """A restored, exhausted diagnostic is not new evidence or a new plan.
+
+        Invalid results remain excluded from diagnosis. Blocking their automatic
+        reissue prevents the per-round retry budget from resetting forever.
+        """
+        history = self.experiment_history(task_id)
+        last_profile = max((index for index, item in enumerate(history)
+                            if item.get("purpose") == "player_profile"), default=-1)
+        return {
+            str(item["setting_id"])
+            for item in history[last_profile + 1:]
+            if item.get("purpose") == "diagnostic"
+            and item.get("restoration_confirmed")
+            and item.get("decision", {}).get("action") == AgentAction.REVERT_CHANGE.value
+            and item.get("setting_id")
+        }
+
+    def _adopt_player_profile(
+        self, task: OptimizationTask, baseline: BenchmarkRecord, comparison: BenchmarkRecord,
+        candidate: BenchmarkRecord, round_number: int, changes: list[str],
+        suggested: ExperimentPlan | None,
+    ) -> Decision:
+        """Continue from the player's profile without crediting the old suggestion."""
+        result = evaluate_result(task, baseline, candidate, round_number=round_number,
+                                 reference=comparison, minimum_repeats=1,
+                                 acceptance_repeats=3, graphics_profile=True)
+        comparable = result.measurement_valid is True
+        verified = result.accepted
+        reasons = ["实际改动：" + "、".join(CONFIGURATION_LABELS.get(key, key) for key in changes),
+                   "本次按整组配置记录，不能判断其中单项设置各自贡献了多少。"]
+        if comparable:
+            reasons.append(f"相对上一组配置：平均 FPS {(candidate.avg_fps / comparison.avg_fps - 1) * 100:+.1f}%，"
+                           f"1% Low {(candidate.low_fps / comparison.low_fps - 1) * 100:+.1f}%。")
+        else:
+            reasons.extend(result.reasons)
+        reasons.append("已将实际配置用于后续规划。" +
+                       ("整组收益已通过确认。" if verified else "当前采用不等于收益已验证，最佳已验证配置仍单独保留。"))
+        decision = Decision(
+            AgentAction.FINISH if result.task_complete else AgentAction.KEEP_CHANGE,
+            "已记录你实际采用的画质配置，将根据这组配置重新生成建议。",
+            avg_delta_pct=round((candidate.avg_fps / comparison.avg_fps - 1) * 100, 2) if comparable else 0,
+            low_delta_pct=round((candidate.low_fps / comparison.low_fps - 1) * 100, 2) if comparable else 0,
+            score_delta=result.score_delta if comparable else 0,
+            weighted_delta_pct=result.weighted_delta_pct if comparable else 0,
+            accepted=verified, task_complete=result.task_complete,
+            stop_reason="player_profile", measurement_valid=comparable, reasons=reasons,
+        )
+        workflow = self.workflows[task.task_id]
+        next_workflow = Workflow(workflow.state, workflow.round_number, workflow.phase)
+        next_workflow.begin_evaluation()
+        if decision.task_complete:
+            next_workflow.finish()
+        else:
+            next_workflow.continue_testing("optimization")
+        best = self.best_records.get(task.task_id, baseline)
+        if verified:
+            best = self._better_record(task, candidate, best)
+        experiment = {
+            "record_id": candidate.record_id, "round_number": round_number,
+            "purpose": "player_profile", "setting_id": "graphics_profile",
+            "changed_settings": changes, "suggested_setting_id": suggested.setting_id if suggested else "",
+            "reference_record_id": comparison.record_id,
+            "before_configuration": dict(comparison.configuration),
+            "after_configuration": dict(candidate.configuration),
+            "reference_avg_fps": comparison.avg_fps, "reference_low_fps": comparison.low_fps,
+            "avg_fps": candidate.avg_fps, "low_fps": candidate.low_fps, "gpu_usage": candidate.gpu_usage,
+            "avg_delta_pct": decision.avg_delta_pct, "low_delta_pct": decision.low_delta_pct,
+            "configuration_confirmed": candidate.configuration_confirmed, "comparable": candidate.comparable,
+            "repeats": candidate.repeats, "test_scene": candidate.test_scene,
+            "valid": comparable, "decision": decision.to_dict(), "restoration_confirmed": False,
+        }
+        self._commit_evaluation(task, candidate, round_number, decision, next_workflow,
+                               current_record=candidate, best_record=best, pending_payload=None,
+                               failed_actions=set(), diagnostic_results=[], experiment=experiment,
+                               limit_context=self.limit_context(task.task_id))
+        self.current_records[task.task_id] = candidate
+        self.best_records[task.task_id] = best
+        self.workflows[task.task_id] = next_workflow
+        self.last_decisions[task.task_id] = decision
+        self.pending_plans.pop(task.task_id, None)
+        self._retry_counts[task.task_id] = 0
+        self._round_runs[task.task_id] = {}
+        self._round_fingerprints[task.task_id] = {}
+        self._failed_actions[task.task_id] = set()
+        self._diagnostic_results[task.task_id] = []
+        return decision
+
+    def retry_invalid_diagnostic(self, task: OptimizationTask) -> ExperimentPlan:
+        """Explicitly reopen an exhausted invalid diagnostic without accepting it."""
+        task_id = task.task_id
+        workflow = self.workflows.get(task_id)
+        invalid = [item for item in self._diagnostic_results.get(task_id, [])
+                   if item.get("valid") is False and item.get("plan")]
+        if workflow is None or workflow.state != WorkflowState.COMPLETE or not invalid:
+            raise ValueError("当前任务没有可重新核对的无效诊断")
+        if workflow.round_number > task.max_rounds:
+            raise ValueError("已达到实验轮数上限，请建立新任务")
+        last = self.last_decisions.get(task_id)
+        if last and (last.accepted or last.task_complete):
+            raise ValueError("任务已经完成，不能重新打开诊断")
+        data = dict(invalid[-1]["plan"])
+        data["action"] = AgentAction(data["action"])
+        plan = replace(ExperimentPlan(**data), round_number=workflow.round_number)
+        validate_plan(task, plan, self.knowledge)
+        resumed = Workflow(workflow.state, workflow.round_number, workflow.phase)
+        resumed.reopen_invalid_diagnostic()
+        resumed.set_phase(plan.purpose, action=plan.action.value, setting_id=plan.setting_id)
+        self.repository.save_runtime_state(
+            task_id, current_record_id=self.current_records[task_id].record_id,
+            best_record_id=self.best_records[task_id].record_id,
+            workflow_state=resumed.state.value, round_number=resumed.round_number,
+            extra={"pending_plan": asdict(plan), "retest": {"count": 0, "same_round": False},
+                   "last_decision": None, "round_accumulation": {},
+                   "workflow_phase": resumed.phase.value},
+        )
+        self.workflows[task_id] = resumed
+        self.pending_plans[task_id] = plan
+        self._retry_counts[task_id] = 0
+        self._round_runs.get(task_id, {}).pop(workflow.round_number, None)
+        self._round_fingerprints.get(task_id, {}).pop(workflow.round_number, None)
+        self.last_decisions.pop(task_id, None)
+        return plan
+
     def explain(
         self,
         task: OptimizationTask,
@@ -1330,5 +1516,6 @@ class GameTuneController:
         *,
         evidence: list[Evidence] | None = None,
         plan: ExperimentPlan | None = None,
+        workflow: dict | None = None,
     ) -> dict[str, str | list[str]]:
-        return explain_decision(self.model_provider, task, decision, evidence=evidence, plan=plan)
+        return explain_decision(self.model_provider, task, decision, evidence=evidence, plan=plan, workflow=workflow)

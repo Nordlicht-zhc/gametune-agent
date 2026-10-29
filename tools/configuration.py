@@ -9,6 +9,7 @@ from tools.resolution import parse_resolution
 
 
 CONFIGURATION_LABELS = {
+    "video_preset": "当前视频值预设",
     "cpu": "处理器", "gpu": "显卡", "resolution": "分辨率", "refresh_rate": "刷新率", "test_scene": "测试场景",
     "fps_cap": "测试时最高 FPS", "vsync": "测试时垂直同步", "display_mode": "显示模式",
     "shadow_quality": "全局阴影效果", "dynamic_shadows": "动态阴影", "msaa_mode": "抗锯齿模式",
@@ -79,3 +80,20 @@ def unexpected_configuration_changes(
         and value is not None and str(value).strip().lower() not in _UNKNOWN
         and canonical_value(key, value) != canonical_value(key, after.get(key, "unknown"))
     )
+
+
+# Player-editable graphics. Changes here may be evaluated as a whole profile.
+GRAPHICS_SETTINGS = frozenset({
+    "resolution", "video_preset", "display_mode", "shadow_quality", "dynamic_shadows",
+    "msaa_mode", "texture_detail", "texture_filtering", "shader_detail", "particle_detail",
+    "ambient_occlusion", "hdr", "fsr", "player_contrast", "nvidia_reflex", "amd_anti_lag",
+})
+
+
+def changed_graphics(reference: BenchmarkRecord, current: BenchmarkRecord) -> list[str]:
+    before = {**reference.configuration, "resolution": reference.resolution}
+    after = {**current.configuration, "resolution": current.resolution}
+    return sorted(key for key in GRAPHICS_SETTINGS if key in before and key in after
+                  and canonical_value(key, before[key]) not in _UNKNOWN
+                  and canonical_value(key, after[key]) not in _UNKNOWN
+                  and canonical_value(key, before[key]) != canonical_value(key, after[key]))
