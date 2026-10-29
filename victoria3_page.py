@@ -14,7 +14,7 @@ from victoria3_quick import Victoria3Quick
 
 
 class Victoria3Page(QScrollArea):
-    def __init__(self, database_path):
+    def __init__(self, database_path, quick_factory=None):
         super().__init__()
         self.repository = SimulationRepository(database_path)
         self.baseline = None
@@ -23,7 +23,7 @@ class Victoria3Page(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         layout = QVBoxLayout(body)
-        self.quick = Victoria3Quick(database_path=database_path)
+        self.quick = (quick_factory or Victoria3Quick)(database_path=database_path)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.quick, "一键优化")
         self.quick.report_embedded = True

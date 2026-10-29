@@ -43,7 +43,7 @@ class ReportExplanationJob(QThread):
 
 
 class Victoria3Window(QMainWindow):
-    def __init__(self, database_path=None, provider=None):
+    def __init__(self, database_path=None, provider=None, quick_factory=None):
         super().__init__()
         self.setWindowTitle(f"Victoria 3 Optimizer · 维多利亚3性能优化 · v{APP_VERSION}")
         if is_admin():
@@ -57,7 +57,7 @@ class Victoria3Window(QMainWindow):
         self.provider = provider
         self.job = None
         self.worker = None
-        self.source = Victoria3Page(database_path or Path(__file__).parent / '.data/victoria3.db')
+        self.source = Victoria3Page(database_path or Path(__file__).parent / '.data/victoria3.db', quick_factory=quick_factory)
         self.quick = self.source.quick
         self.source.tabs.blockSignals(True)
         self.quick.report_requested.disconnect()
@@ -317,7 +317,8 @@ def main():
         provider = provider_from_env()
     except ValueError:
         provider = None
-    window = Victoria3Window(provider=provider)
+    from victoria3_workspace import ConfigurationWindow
+    window = ConfigurationWindow(provider=provider)
     window.show()
     QTimer.singleShot(200, lambda: window.navigate(args.page))
     if args.handoff_port and args.handoff_token:
