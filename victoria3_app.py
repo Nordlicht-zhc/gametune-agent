@@ -252,6 +252,10 @@ class Victoria3Window(QMainWindow):
             self.model_text.setPlainText('模型请求仍在进行，请等待请求完成或超时后关闭。')
             return
         self.capture_page.overlay.close()
+        self.capture_page.dates.stop_picker_wait()
+        self.capture_page.dates.pick_hint.close()
+        if self.capture_page.dates.picker:
+            self.capture_page.dates.picker.close()
         super().closeEvent(event)
 
 
