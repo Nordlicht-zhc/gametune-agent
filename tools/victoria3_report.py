@@ -48,7 +48,7 @@ def attach_benchmark(report: dict, side: str, metrics: dict, source: str) -> dic
     updated["observations"][side] = {key: metrics[key] for key in
         ("avg_fps", "low_fps", "gpu_usage", "run_count", "avg_spread_pct", "low_spread_pct") if key in metrics}
     # Keep simulation observations from a separately controlled experiment.
-    for key in ("days_per_second", "simulation_spread_pct", "simulation_repeats"):
+    for key in ("days_per_second", "simulation_spread_pct", "simulation_repeats", "cpu_usage", "gpu_temperature", "cpu_temperature", "gpu_power"):
         if key in report["observations"][side]:
             updated["observations"][side][key] = report["observations"][side][key]
     updated["sources"][side + "_fps"] = source
@@ -86,23 +86,41 @@ def metric_rows(report: dict) -> list[list[str]]:
             status = "仅有一侧数据"
         allowed = report.get("comparison_confirmed", False)
         if key == "days_per_second":
-            allowed = report.get("simulation", {}).get("configuration_confirmed", False)
+            allowed = report.get("simulation", {}).get("configuration_confirmed", False) or (
+                report.get('comparison_confirmed', False) and all(report.get('sensor_status', {}).get(side, {}).get(key, {}).get('status') == 'ok' for side in ('baseline', 'candidate')))
         if a is not None and b is not None:
             if allowed:
-                delta = f"{b - a:+.2f} 个百分点" if unit == "%" else f"{(b / a - 1) * 100:+.2f}%"
+                delta = f"{b - a:+.2f} 个百分点" if unit == "%" else (f"{b - a:+.2f} {unit}" if unit == '℃' or a == 0 else f"{(b / a - 1) * 100:+.2f}%")
                 repeats = min(before.get("run_count", 0), after.get("run_count", 0))
                 spread = max(before.get("avg_spread_pct", 0), before.get("low_spread_pct", 0),
                              after.get("avg_spread_pct", 0), after.get("low_spread_pct", 0))
                 status = "已确认归属的实测对比" if repeats >= 3 and spread <= 5 else "样本不足或波动较大，仅供参考"
                 if key == "days_per_second":
-                    result = report["simulation"]["result"]
-                    status = result["reason"]
+                    result = report.get("simulation", {}).get("result")
+                    status = result["reason"] if result else '游戏日期 OCR 参考测量，含整数日边界误差；未完成受控重复实验'
             else:
                 status = "待确认配置归属与场景一致性"
         if report["phase"] in ("restored", "external_change") and b is not None:
             status += "；优化后数据仅代表历史配置"
-        fmt = lambda value: "未采集" if value is None else f"{value:.2f} {unit}"
-        rows.append([label, fmt(a), fmt(b), delta, status])
+        def fmt(value, side):
+            if value is not None:
+                return f"{value:.2f} {unit}"
+            sensor = report.get('sensor_status', {}).get(side, {}).get(key)
+            if not sensor:
+                return '未采集'
+            name = {'unsupported': '设备或接口不支持', 'not_supported': '暂不支持自动采集',
+                    'error': '采集失败', 'warming_up': '样本不足', 'not_sampled': '未采集'}.get(sensor['status'], '未采集')
+            return name + ('：' + sensor['reason'] if sensor.get('reason') else '')
+        if key in ('gpu_usage', 'cpu_usage', 'gpu_temperature', 'cpu_temperature', 'gpu_power'):
+            sensors = [report.get('sensor_status', {}).get(side, {}).get(key, {}) for side in ('baseline', 'candidate')]
+            sources = [row.get('scope', '') for row in sensors if row.get('status') == 'ok']
+            if sources:
+                if a is not None and b is not None and allowed:
+                    status = '硬件传感器均值参考对比'
+                    if any(row.get('runs', 0) < 3 or row.get('failed_runs', 0) for row in sensors):
+                        status += '；有效重复测试不足或存在缺测'
+                status += '；' + sources[-1]
+        rows.append([label, fmt(a, 'baseline'), fmt(b, 'candidate'), delta, status])
     return rows
 
 
@@ -143,6 +161,11 @@ def report_html(report: dict) -> str:
         ["操作系统", machine.get("os", "未识别")], ["硬件来源", machine.get("hardware_source", "最近一次启动日志")]])
     html += '<h2>优化前后性能水平</h2><p>指标来自导入或受控实验。未采集项不估算；GPU 占用变化不直接代表性能收益。</p>'
     html += table(["指标", "优化前实测", "优化后实测", "变化", "证据状态"], metric_rows(report))
+    if report.get('sensor_status'):
+        html += '<h2>传感器来源与采样情况</h2>' + table(['阶段', '指标', '来源/原因', '有效样本', '峰值'], [
+            ['优化前' if side == 'baseline' else '优化后', next((label for ident, label, _ in METRICS if ident == key), key),
+             row.get('source') or row.get('reason', ''), row.get('samples', 0), row.get('peak', '—')]
+            for side, sensors in report['sensor_status'].items() for key, row in sensors.items()])
     html += '<h2>一键优化实际做了什么</h2>'
     html += table(["设置", "原始值", "写入值"], [[c["label"], c["before"], c["after"]] for c in report["changes"]]) if report["changes"] else '<p>尚未执行优化，没有已应用的改动。</p>'
     html += '<p>备份位置：' + e(report.get("backup") or "尚未创建") + '</p>'

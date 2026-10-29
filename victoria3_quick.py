@@ -185,6 +185,8 @@ class Victoria3Quick(QWidget):
                 self.current_report["observations"]["baseline"] = previous["observations"]["baseline"]
                 if previous.get('captures', {}).get('baseline'):
                     self.current_report['captures'] = {'baseline': previous['captures']['baseline']}
+                if previous.get('sensor_status', {}).get('baseline'):
+                    self.current_report['sensor_status'] = {'baseline': previous['sensor_status']['baseline']}
                 self.current_report["sources"] = {key: value for key, value in previous["sources"].items() if key.startswith("baseline_")}
             self.reports.save(self.current_report)
             self.refresh_backups()

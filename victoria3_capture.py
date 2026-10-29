@@ -12,6 +12,10 @@ from tools.resolution import normalize_resolution
 from tools.windows_launch import is_admin, restart_as_admin
 from admin_handoff import AdminHandoff
 from tools.app_version import APP_VERSION
+from tools.hardware_telemetry import TelemetrySession, attach_telemetry
+from tools.victoria3_local import atomic_write, encode
+from victoria3_dates import DatePanel
+from tools.game_date_ocr import prepare_ocr
 
 
 def graphics_differences(actual, expected):
@@ -54,9 +58,12 @@ class CapturePage(QWidget):
         root.addWidget(title)
         note = QLabel('无需寻找或导入 CSV。先采集优化前，再应用方案并重启游戏，最后采集优化后。\n'
                       '每次开始后有 8 秒切回游戏；同一组可重复采集三次。每次请重新载入同一存档并固定视角、缩放与速度。\n'
-                      '此处采集平均 FPS 和 1% Low，不采集跑日速度、温度或功耗。')
+                      '同步采集 FPS、整机 CPU/GPU 占用及可用温度/功耗；跑日速度可用下方日期识别，或高级受控测试。')
         note.setWordWrap(True)
         root.addWidget(note)
+        self.dates = DatePanel(quick.reports.path.parent)
+        self.dates.prepare_button.clicked.connect(self.prepare_dates)
+        root.addWidget(self.dates)
         self.permission = QLabel(f'程序版本：v{APP_VERSION}（已支持 msBetweenPresents 表头）\n当前权限：' + ('管理员，可尝试启动 ETW 采集' if is_admin() else '普通用户；ETW 权限不足时需管理员启动'))
         self.permission.setWordWrap(True)
         root.addWidget(self.permission)
@@ -115,6 +122,7 @@ class CapturePage(QWidget):
 
     def begin_countdown(self):
         self.clock.start()
+        self.dates.start_session(getattr(self, 'capture_pid', 0))
         self.capture_window = self.window()
         self.capture_was_maximized = self.capture_window.isMaximized()
         self.capture_window.showMinimized()
@@ -130,6 +138,7 @@ class CapturePage(QWidget):
         if not self.clock.isValid():
             return
         milliseconds = self.clock.elapsed()
+        self.dates.observe(milliseconds, self.seconds.value())
         if milliseconds < 8000:
             self.countdown.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集 · 请切回游戏')
             self.overlay.setText(f'{ceil((8000 - milliseconds) / 1000)} 秒后开始采集')
@@ -139,6 +148,9 @@ class CapturePage(QWidget):
             self.overlay.setText(f'采集中 · 剩余 {remaining} 秒' if remaining else '正在计算并保存报告…')
 
     def open_admin(self):
+        if self.dates.worker:
+            self.status.setText('请等待日期识别结束后再切换权限。')
+            return
         if self.job:
             self.status.setText('请先等待当前任务结束或取消，再打开管理员窗口。')
             return
@@ -181,6 +193,8 @@ class CapturePage(QWidget):
             return
         self.start.setEnabled(False)
         self.prepare_button.setEnabled(False)
+        self.dates.prepare_button.setEnabled(False)
+        self.dates.select_button.setEnabled(False)
         self.seconds.setEnabled(False)
         self.side.setEnabled(False)
         self.job = CaptureJob(operation, self)
@@ -191,6 +205,7 @@ class CapturePage(QWidget):
 
     def finished(self):
         self.timer.stop()
+        self.dates.active = False
         self.overlay.hide()
         self.restore_capture_window()
         self.countdown.setText('本次任务已结束 · 结果或报错见下方（可复制）')
@@ -198,6 +213,8 @@ class CapturePage(QWidget):
         self.job = None
         self.start.setEnabled(True)
         self.prepare_button.setEnabled(True)
+        self.dates.prepare_button.setEnabled(True)
+        self.dates.select_button.setEnabled(True)
         self.seconds.setEnabled(True)
         self.side.setEnabled(True)
 
@@ -215,6 +232,10 @@ class CapturePage(QWidget):
     def prepare(self):
         self.status.setText('正在从官方 GitHub 下载并校验工具，请稍候…')
         self.run_job(lambda cancel: self.tool.prepare(cancel), lambda _: self.status.setText('采集工具已就绪。载入游戏后即可开始。'))
+
+    def prepare_dates(self):
+        self.status.setText('正在准备本地 Windows OCR 组件，不修改系统脚本策略…')
+        self.run_job(prepare_ocr, lambda _: self.status.setText('日期识别组件已就绪，请框选一次游戏日期。'))
 
     def suggest_stage(self):
         if self.job:
@@ -266,21 +287,51 @@ class CapturePage(QWidget):
                 self.quick.reports.save(report)
             elif differences:
                 raise ValueError('当前设置还不是本报告的优化后配置：\n' + '\n'.join(differences) + '\n请先在一键优化页应用对应方案，再重启游戏。')
-            self.tool.game_pid()
+            if self.dates.worker or self.dates.pick_window:
+                raise ValueError('请先等待日期识别结束，再开始采集')
+            if self.dates.enabled.isChecked() and self.dates.config is None:
+                raise ValueError('请先框选一次游戏日期区域，或取消同时识别日期')
+            self.capture_pid = self.tool.game_pid()
             self.quick.current_report = report
             context = deepcopy(report)
             seconds = self.seconds.value()
             self.confirm.setChecked(False)
             self.countdown.setText('正在启动采集工具…')
-            self.run_job(lambda cancel: self.tool.capture(self.quick.reports.path.parent / 'captures', seconds, cancel,
-                         on_started=self.countdown_started.emit),
+            self.run_job(lambda cancel: self.capture_with_sensors(context, seconds, cancel),
                          lambda result: self.save_capture(context, side, settings, result), timed=True)
             self.status.setText(('当前已应用优化，自动切换为采集优化后。' if switched else '') + '采集将在 8 秒后开始，请切回 Victoria 3。')
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
 
+    def capture_with_sensors(self, report, seconds, cancel):
+        telemetry = TelemetrySession(report['machine'].get('gpu', ''))
+        def started():
+            telemetry.start()
+            self.countdown_started.emit()
+        try:
+            result = self.tool.capture(self.quick.reports.path.parent / 'captures', seconds, cancel, on_started=started)
+        finally:
+            summary = telemetry.stop()
+        result['telemetry'] = summary
+        path = Path(result['csv']).with_suffix('.sensors.json')
+        atomic_write(path, encode({'summary': summary, 'samples': telemetry.samples,
+                                  'timing': 'PresentMon 启动后排除 8 秒准备期，仅统计采集期间返回的样本'}))
+        result['sensor_file'] = str(path)
+        return result
+
     def save_capture(self, snapshot, side, settings, result):
         try:
+            date_summary = self.dates.finish_session()
+            if 'telemetry' in result:
+                result['telemetry']['days_per_second'] = date_summary
+                result['date_samples'] = list(self.dates.samples)
+                if result.get('sensor_file'):
+                    import json
+                    sensor_path = Path(result['sensor_file'])
+                    saved = json.loads(sensor_path.read_text(encoding='utf-8'))
+                    saved['summary'] = result['telemetry']
+                    saved['date_samples'] = result['date_samples']
+                    atomic_write(sensor_path, encode(saved))
             if self.quick.service.read_settings() != settings:
                 raise ValueError('采集中设置发生变化，本次数据未关联报告')
             current = next(r for r in self.quick.reports.list() if r['id'] == snapshot['id'])
@@ -291,6 +342,7 @@ class CapturePage(QWidget):
                 raise ValueError('同组采集时长不同，请保持一致')
             captures.append(result)
             current = attach_benchmark(current, side, summarize_captures(captures), '内置 PresentMon 2.6.0')
+            current = attach_telemetry(current, side, captures)
             current['comparison_confirmed'] = bool(current.get('captures', {}).get('baseline') and current.get('captures', {}).get('candidate'))
             self.quick.reports.save(current)
             self.quick.current_report = current

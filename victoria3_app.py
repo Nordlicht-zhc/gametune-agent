@@ -33,6 +33,8 @@ class Victoria3Window(QMainWindow):
             self.setWindowTitle(self.windowTitle() + '（管理员）')
         self.resize(1280, 860)
         self.setMinimumSize(1050, 720)
+        available = self.screen().availableGeometry()
+        self.resize(min(1280, available.width()), min(860, available.height()))
         self.copyable_labels = CopyableLabels(self)
         QApplication.instance().installEventFilter(self.copyable_labels)
         self.provider = provider
@@ -79,7 +81,7 @@ class Victoria3Window(QMainWindow):
         self.source.advanced.setVisible(True)
         tests = QTabWidget()
         self.capture_page = CapturePage(self.quick)
-        tests.addTab(self.capture_page, '自动采集 FPS')
+        tests.addTab(self.wrap(self.capture_page), '自动采集与硬件监测')
         tests.addTab(self.wrap(self.source.advanced), '高级跑日测试')
         self.stack.addWidget(tests)
         history = QWidget()
@@ -234,6 +236,11 @@ class Victoria3Window(QMainWindow):
         self.model_button.setEnabled(True)
 
     def closeEvent(self, event):
+        if self.capture_page.dates.worker:
+            self.capture_page.dates.active = False
+            self.capture_page.dates.status.setText('正在结束本地日期识别，请稍候再关闭。')
+            event.ignore()
+            return
         if self.capture_page.job:
             self.capture_page.job.cancel.set()
             self.capture_page.status.setText('正在取消采集，请等待任务结束后关闭。')
