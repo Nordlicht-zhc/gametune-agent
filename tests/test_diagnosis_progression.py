@@ -142,23 +142,19 @@ class DiagnosisProgressionTests(unittest.TestCase):
                 self.controller.confirm_rollback(self.task)
                 self.assertIsNotNone(self.controller._uncapped_reference(self.task.task_id))
 
-    def test_platform_improvement_promotes_only_after_restore(self):
+    def test_confirmed_platform_improvement_is_kept_without_restore(self):
         for setting in ("power_mode", "cooling_mode", "graphics_mode"):
             with self.subTest(setting=setting):
                 self.controller = GameTuneController(self.path)
                 baseline, candidate, _ = self.start_platform(setting)
                 result = self.controller.evaluate(self.task, baseline, candidate, 1)
-                self.assertFalse(result.accepted)
-                self.assertEqual(self.controller._promoted_candidates(self.task, baseline, 2), [])
-                self.controller.confirm_rollback(self.task)
+                self.assertTrue(result.accepted)
+                self.assertFalse(result.rollback_required)
+                self.assertEqual(self.controller.best_record(self.task.task_id).record_id, candidate.record_id)
                 self.controller = GameTuneController(self.path)
                 self.controller.restore_task(self.task.task_id)
-                _, formal = self.controller.plan_after_result(self.task, baseline, baseline, 2)
-                self.assertEqual((formal.setting_id, formal.purpose), (setting, "optimization"))
-                formal_record = replace(candidate, record_id=uuid4().hex)
-                accepted = self.controller.evaluate(self.task, baseline, formal_record, 2)
-                self.assertTrue(accepted.accepted)
-                self.assertEqual(self.controller.best_record(self.task.task_id).record_id, formal_record.record_id)
+                self.assertEqual(self.controller.current_record(self.task.task_id).record_id, candidate.record_id)
+                self.assertEqual(self.controller._promoted_candidates(self.task, candidate, 2), [])
                 self.task = replace(self.task, task_id=uuid4().hex)
 
     def test_regression_or_conflicting_diagnostic_does_not_promote(self):
@@ -171,47 +167,39 @@ class DiagnosisProgressionTests(unittest.TestCase):
                 self.assertEqual(self.controller._promoted_candidates(self.task, baseline, 2), [])
                 self.task = replace(self.task, task_id=uuid4().hex)
 
-    def test_formal_failure_is_not_reoffered(self):
+    def test_failed_confirmation_is_not_reoffered(self):
         baseline, candidate, _ = self.start_platform()
-        self.controller.evaluate(self.task, baseline, replace(candidate, record_id=uuid4().hex), 1)
-        self.controller.confirm_rollback(self.task)
-        self.controller.plan_after_result(self.task, baseline, baseline, 2)
-        neutral = replace(candidate, avg_fps=200, low_fps=100, record_id=uuid4().hex,
-                          runs=[{"avg_fps": 200, "low_fps": 100}] * 3)
-        result = self.controller.evaluate(self.task, baseline, neutral, 2)
+        first = replace(candidate, repeats=1, record_id=uuid4().hex)
+        decision = self.controller.evaluate(self.task, baseline, first, 1)
+        self.assertEqual(decision.action, AgentAction.RETEST)
+        regression = replace(candidate, avg_fps=180, low_fps=85, repeats=3, record_id=uuid4().hex)
+        result = self.controller.evaluate(self.task, baseline, regression, 1)
         self.assertFalse(result.accepted)
         self.assertEqual(result.action, AgentAction.REVERT_CHANGE)
         self.controller.confirm_rollback(self.task)
-        self.assertEqual(self.controller._promoted_candidates(self.task, baseline, 3), [])
+        self.assertIn("power_mode", self.controller._failed_setting_ids(self.task.task_id))
+        self.assertEqual(self.controller._promoted_candidates(self.task, baseline, 2), [])
 
-    def test_model_receives_reference_decision_and_chooses_from_results(self):
+    def test_model_receives_kept_platform_result_without_restore(self):
+        from agent.next_step import next_step_request
         baseline, candidate, _ = self.start_platform()
-        baseline.gpu_usage = 99
         baseline.configuration.update({"dynamic_shadows": "all", "shadow_quality": "高"})
         candidate.configuration.update({"dynamic_shadows": "all", "shadow_quality": "高"})
-        self.controller.evaluate(self.task, baseline, replace(candidate, record_id=uuid4().hex), 1)
-        self.controller.confirm_rollback(self.task)
-        evidence, _ = self.controller.plan_after_result(self.task, baseline, baseline, 2)
-        options = self.controller.next_step_candidates(self.task, baseline, evidence, 2)
-        self.assertGreaterEqual(len(options), 2)
-        class Provider:
-            def complete(inner, request):
-                payload = json.loads(request.messages[-1].content)
-                item = payload["completed_experiments"][-1]
-                self.assertEqual(item["reference_record_id"], baseline.record_id)
-                self.assertEqual(item["before_configuration"]["power_mode"], "ac_balanced")
-                self.assertEqual(item["after_configuration"]["power_mode"], "ac_performance")
-                self.assertEqual(item["avg_delta_pct"], 15.0)
-                self.assertTrue(item["valid"])
-                self.assertTrue(item["restoration_confirmed"])
-                self.assertEqual(item["decision"]["action"], "revert_change")
-                self.assertTrue(item["decision"]["reasons"])
-                chosen = next(c for c in payload["candidates"] if c["setting"] == "供电 / 性能模式")
-                return ModelResponse(json.dumps({"candidate_id": chosen["candidate_id"], "reason": "诊断有收益，原配置已恢复，继续正式验证"}), "mock", "mock")
-        self.controller.model_provider = Provider()
-        chosen = self.controller.choose_next_step(self.task, baseline, evidence, options)
-        self.assertEqual(chosen.source, "model")
-        self.assertEqual(chosen.plan.purpose, "optimization")
+        candidate.gpu_usage = 99
+        self.controller.evaluate(self.task, baseline, candidate, 1)
+        evidence, _ = self.controller.plan_after_result(self.task, candidate, baseline, 2)
+        options = self.controller.next_step_candidates(self.task, candidate, evidence, 2)
+        self.assertTrue(options)
+        payload = json.loads(next_step_request(self.task, candidate, evidence, options,
+            history=self.controller.experiment_history(self.task.task_id)).messages[-1].content)
+        item = payload["completed_experiments"][-1]
+        self.assertEqual(item["reference_record_id"], baseline.record_id)
+        self.assertEqual(item["before_configuration"]["power_mode"], "ac_balanced")
+        self.assertEqual(item["after_configuration"]["power_mode"], "ac_performance")
+        self.assertEqual(item["avg_delta_pct"], 15.0)
+        self.assertTrue(item["valid"])
+        self.assertFalse(item["restoration_confirmed"])
+        self.assertTrue(item["decision"]["accepted"])
 
     def test_player_graphics_edit_does_not_become_platform_diagnostic(self):
         baseline, candidate, _ = self.start_platform()

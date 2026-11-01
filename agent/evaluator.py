@@ -11,6 +11,7 @@ from tools.configuration import CONFIGURATION_LABELS, changed_graphics, unexpect
 
 _DISPERSION_LIMIT_PCT = 5.0
 _MEANINGFUL_WEIGHTED_DELTA_PCT = 1.0
+_TARGET_COMPLETION_RATIO = 0.95
 
 # Lower values mean a visibly lower-quality choice.  These are ordinal
 # safeguards for visual mode, not an attempt to pretend that different
@@ -258,7 +259,9 @@ def evaluate_result(
     after = normalized_score(candidate.avg_fps, candidate.low_fps, task.target_avg_fps, task.target_low_fps, task.mode)
     score_delta = after - before
     weighted_delta = weighted_relative_change(avg_delta, low_delta, task.mode)
-    target_met = candidate.avg_fps >= task.target_avg_fps and candidate.low_fps >= task.target_low_fps
+    avg_target_floor = task.target_avg_fps * _TARGET_COMPLETION_RATIO
+    low_target_floor = task.target_low_fps * _TARGET_COMPLETION_RATIO
+    target_met = candidate.avg_fps >= avg_target_floor and candidate.low_fps >= low_target_floor
 
     # Visual mode is quality-first.  It does not turn visual quality into a
     # made-up numeric weight; it simply refuses to call a lower-quality
@@ -285,9 +288,9 @@ def evaluate_result(
             rollback_required=True,
         )
 
-    # Check unacceptable regression before target completion.  Otherwise a
+    # Check unacceptable regression before target completion. Otherwise a
     # candidate could lower one metric substantially, barely meet both target
-    # values, and be accepted only because the target score is capped at 100.
+    # floors, and be accepted only because the target score is capped at 100.
     if avg_delta <= -minimum_change_pct or low_delta <= -minimum_change_pct:
         action = AgentAction.REVERT_CHANGE
         summary = "本轮设置使性能明显下降，建议恢复上一组配置。"
@@ -310,7 +313,7 @@ def evaluate_result(
         # explicit fields make acceptance and completion unambiguous.
         return _decision(
             AgentAction.FINISH,
-            "平均 FPS 和 1% Low 都已达到目标，可以结束优化。",
+            f"平均 FPS 和 1% Low 都已达到各自目标的 {_TARGET_COMPLETION_RATIO:.0%}（或更高），可以结束优化。",
             avg_delta=avg_delta,
             low_delta=low_delta,
             score_delta=score_delta,
@@ -320,6 +323,8 @@ def evaluate_result(
             stop_reason="target_reached",
             measurement_valid=True,
             reasons=[
+                f"平均 FPS 目标容差线：{avg_target_floor:g} FPS（目标的 {_TARGET_COMPLETION_RATIO:.0%}）",
+                f"1% Low 目标容差线：{low_target_floor:g} FPS（目标的 {_TARGET_COMPLETION_RATIO:.0%}）",
                 f"平均 FPS 变化 {avg_delta:+.1f}%",
                 f"1% Low 变化 {low_delta:+.1f}%",
                 f"按模式加权的实际变化 {weighted_delta:+.1f}%",
@@ -525,6 +530,26 @@ def evaluate_diagnostic_result(
         summary = f"对比{name}后帧率变化较小（平均 FPS {avg_delta:+.1f}%，1% Low {low_delta:+.1f}%），暂未发现明显影响。"
     if abs(low_delta) >= 10.0 and (low_delta > 0) != (avg_delta > 0):
         summary = f"平均 FPS 与 1% Low 变化方向不一致（{avg_delta:+.1f}% / {low_delta:+.1f}%），暂不锁定瓶颈方向。"
+    if (setting_id in {"power_mode", "cooling_mode", "graphics_mode"}
+            and max(avg_delta, low_delta) >= 5.0 and min(avg_delta, low_delta) >= -2.0):
+        # A lasting platform improvement can be verified in place. Undoing it
+        # merely because the original plan was diagnostic adds no evidence.
+        result = evaluate_result(
+            task, reference, candidate, round_number=round_number, reference=reference,
+            minimum_repeats=1, acceptance_repeats=3, retry_count=retry_count,
+            max_retries=2, setting_id=setting_id,
+        )
+        if result.action == AgentAction.RETEST and result.measurement_valid is True:
+            result.summary = f"本轮表现已有明显改善，数据已保存。先保留当前设置，已累计 {actual_runs} 次，补足 3 次后确认收益。"
+            result.stop_reason = "platform_confirmation"
+        elif result.accepted:
+            result.summary = "本轮平台设置的改善已通过测试确认，保留当前设置，无需先恢复原配置。"
+            result.stop_reason = result.stop_reason or "platform_confirmed"
+        result.avg_delta_pct = round(avg_delta, 2)
+        result.low_delta_pct = round(low_delta, 2)
+        result.weighted_delta_pct = round(weighted_relative_change(avg_delta, low_delta, task.mode), 2)
+        result.reasons.insert(0, "本轮测试记录已保存，确认收益时继续使用当前设置，不要求先恢复再重新调整。")
+        return result
     return _diagnostic_restore(round_number, "诊断测试完成", summary, avg_delta, low_delta)
 
 

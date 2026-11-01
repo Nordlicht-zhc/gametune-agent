@@ -8,20 +8,19 @@ from models.schemas import Decision, Evidence, ExperimentPlan, OptimizationTask
 from .api import ModelMessage, ModelRequest
 
 
-SYSTEM_PROMPT = """你是 GameTune 的玩家助手。确定性分析模块已经作出结论，你不能修改数值、动作或虚构测试数据。
+SYSTEM_PROMPT = """你是 GameTune 的结果说明助手。把程序评估出的结论、最重要的依据和下一步操作，用简洁自然的中文告诉玩家。
 
-请把结果写给不熟悉性能测试的普通游戏玩家：
-- 使用日常、直接的中文。诊断阶段先说测试是否有效、能否判断原因；优化验证阶段先说调整是否有用，再解释原因和下一步。
-- 不要使用“综合得分”“非退化”“置信区间”“方差”“显著性”“归因”“证据指向”等研究或统计术语。
-- 必须提到专有名词时，紧跟一句白话解释。首次出现 1% Low 时，可写成“1% Low（卡顿时的帧率表现）”。
-- 不要复述内部字段名、英文动作名或计算公式，不要自行增加复测次数或新的优化动作。
-- 每条理由只表达一个重点，下一步要写成玩家可以直接照做的操作。
+直接说已知事实，省略重复提醒、泛化的“不确定”表述和免责套话。当前测试数据、历史观察和设置权重分开表达；历史影响排序先说变化最大的设置，并标明该记录已验证或待验证。组合调整只评价整组，权重表示相对影响大小。
 
-只返回符合要求的 JSON 对象。"""
+输出 summary（一句结论）、reasoning（1 到 2 条关键依据）、next_step（一条具体操作）。以程序提供的评估结论和 must_follow 操作为准，只使用输入中的数据，不增加新的测试或调整。
 
-FINAL_REPORT_SYSTEM_PROMPT = """你是 GameTune 的最终报告撰写器。任务是否结束、最终动作和已验证结论均由确定性分析模块决定，你不能修改这些结论。你只能依据提供的任务、最终决策、证据和最后计划撰写报告；不得虚构测试数据或硬件瓶颈，不得把未验证建议、失败动作或待回滚配置写成最佳已验证配置。
+使用玩家容易理解的日常用语；首次出现 1% Low 时解释为“卡顿时的帧率表现”。只返回 JSON 对象。"""
 
-报告要写给普通游戏玩家：用日常中文说清“最后保留什么设置、表现变好还是变差、玩家现在要做什么”。禁止使用“综合得分”“非退化”“置信区间”“方差”“显著性”“归因”“证据指向”等研究或统计术语；专有名词无法避免时要立即用白话解释。不复述内部字段名和英文动作名，不自行增加复测次数或新建议。只返回 JSON 对象。"""
+FINAL_REPORT_SYSTEM_PROMPT = """你是 GameTune 的最终结果撰写助手。用简洁自然的中文说明最终保留或恢复的设置、已测出的表现变化和玩家下一步要做的操作。
+
+以 final_decision 中的最终动作和验证状态为准，只引用输入数据。把已验证结果与待验证观察明确区分；未完成的建议不写成收益。省略重复提醒、泛化的“不确定”表述和免责套话。
+
+输出 summary（一句结论）、reasoning（2 到 3 条关键发现）、next_step（一条具体操作）。使用玩家容易理解的日常用语，只返回 JSON 对象。"""
 
 
 def decision_explanation_request(
@@ -38,23 +37,17 @@ def decision_explanation_request(
         "next_plan": _plan_dict(plan),
         "workflow": workflow or {},
         "required_output": {
-            "summary": "不超过 80 字；用白话说明这次调整是保留、撤销还是需要继续测",
-            "reasoning": ["2 到 3 条普通玩家能看懂的原因，每条一句"],
-            "next_step": "只写玩家接下来需要完成的具体操作",
-            "warning": "用白话说明尚不能确定的事，没有则返回空字符串",
+            "summary": "不超过 60 字；一句话写明确定结论",
+            "reasoning": ["1 到 2 条最重要的实测或历史依据，每条一句"],
+            "next_step": "一条玩家可以直接执行的操作",
         },
         "audience": "不熟悉性能分析和统计术语的普通游戏玩家",
-        "language": "简体中文，口语化，不使用学术术语或内部字段名",
+        "language": "简体中文，口语化",
         "must_follow": _next_step_guard(decision, plan),
         "constraints": [
-            "summary、reasoning 和 next_step 不能互相矛盾",
-            "next_step 必须严格遵守 must_follow，不得自行要求重复本轮实验",
-            "workflow.submitted_result 是本次提交值；evidence 是其他阶段的背景证据，不得混称本轮测量",
-            "workflow.evaluated_plan 是刚评估的实验，next_plan 是当前待执行计划，不能混淆",
-            "诊断实验只用于判断原因，不用这次调整有没有收益来描述；无效或不可比记录不得推断瓶颈或收益",
-            "缺失 GPU 占用是未知，不是 0%；不得从旧证据替换本次输入",
-            "decision.action 为 keep_change 时表示保留调整并进入下一步，不是重复本轮复测",
-            "decision.action 为 retest 时才能要求保持同一配置重新测试",
+            "结论以 decision 为准，next_step 严格照 must_follow 执行",
+            "历史影响排序先说明变化最大的设置和幅度，并标明已验证或待验证；不把历史值说成本轮测量",
+            "setting_weights 是相对影响排序，不是预期 FPS 增幅；组合调整按整组说明",
         ],
     }
     return ModelRequest(
@@ -83,18 +76,16 @@ def final_report_request(
         "last_plan": _plan_dict(plan),
         "workflow": workflow or {},
         "required_output": {
-            "summary": "不超过 120 字；用白话说明最后保留或恢复哪类设置，以及任务为什么结束",
-            "reasoning": ["3 到 4 条普通玩家能看懂的关键发现，每条一句"],
-            "next_step": "用白话写清保存设置、恢复设置或继续测试的具体操作",
-            "warning": "用白话说明未确认的事，没有则返回空字符串",
+            "summary": "不超过 80 字；一句话写明最终结论",
+            "reasoning": ["2 到 3 条最重要的已测发现，每条一句"],
+            "next_step": "一条具体操作",
         },
         "audience": "不熟悉性能分析和统计术语的普通游戏玩家",
-        "language": "简体中文，口语化，不使用学术术语或内部字段名",
+        "language": "简体中文，口语化",
         "constraints": [
-            "最终动作、数值变化和任务完成状态以 final_decision 为准",
-            "不能把 last_plan 中尚未验证的建议描述为已验证结果",
-            "final_decision.rollback_required 为真时，next_step 必须先要求恢复上一组已验证配置",
-            "证据不足时应在 warning 中明确说明，不能自行补充结论",
+            "最终动作、数值变化和完成状态以 final_decision 为准",
+            "区分已验证结果与待验证观察",
+            "需要恢复配置时，next_step 先写恢复操作",
         ],
     }
     return ModelRequest(
@@ -123,20 +114,18 @@ def parse_explanation(content: str) -> dict[str, str | list[str]]:
     summary = data.get("summary", "")
     next_step = data.get("next_step", "")
     reasoning = data.get("reasoning", [])
-    warning = data.get("warning", "")
     if (
         not isinstance(summary, str) or not summary.strip()
         or not isinstance(next_step, str) or not next_step.strip()
-        or not isinstance(warning, str)
         or not isinstance(reasoning, list) or not reasoning
         or any(not isinstance(item, str) or not item.strip() for item in reasoning)
     ):
         raise ValueError("模型响应缺少 summary、reasoning 或 next_step")
     return {
         "summary": summary.strip()[:160],
-        "reasoning": [item.strip()[:400] for item in reasoning][:4],
+        "reasoning": [item.strip()[:400] for item in reasoning][:3],
         "next_step": next_step.strip()[:400],
-        "warning": warning.strip()[:400],
+        "warning": "",
     }
 
 
@@ -151,14 +140,14 @@ def _plan_dict(plan: ExperimentPlan | None) -> dict | None:
 def _next_step_guard(decision: Decision, plan: ExperimentPlan | None) -> str:
     """Give the model a plain-language action boundary it must not exceed."""
     if decision.stop_reason == "player_profile":
-        return (f"按你实际采用的配置继续；下一项建议：{plan.method}" if plan else "已记录实际配置，按页面查看下一步建议；这不代表收益已经验证。")
+        return (f"按你实际采用的配置继续，下一项：{plan.method}" if plan else "按页面提示继续下一项操作。")
     if decision.rollback_required or decision.action.value == "revert_change":
-        return "先恢复上一组已验证配置，不能保留本轮调整。"
+        return "恢复上一组已验证配置。"
     if decision.action.value == "retest":
-        return (f"先核对并确认实际配置和测试条件；按本轮计划操作：{plan.method}"
-                if plan else "先核对并确认实际配置和测试条件，再重复本轮测试。")
+        return (f"核对实际配置和测试场景后，按原计划重测：{plan.method}"
+                if plan else "核对实际配置和测试场景后，重测本轮项目。")
     if decision.task_complete or decision.action.value == "finish":
-        return "任务已结束，保存最佳已验证配置和报告。"
+        return "保存最佳已验证配置和报告。"
     if plan is not None:
-        return f"保留本轮已接受的配置，然后执行下一项：{plan.method}"
-    return "保留本轮已接受的配置，等待程序生成下一项调整；不要重复本轮测试。"
+        return f"保留本轮通过评估的配置，执行下一项：{plan.method}"
+    return "保留本轮通过评估的配置，按页面提示继续。"

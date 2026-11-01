@@ -22,7 +22,7 @@ CONFIGURATION_LABELS = {
 
 
 _UNKNOWN = {"", "unknown", "未确认", "不确定"}
-_METADATA = {"planned_setting", "planned_setting_id", "planned_value", "actual_setting_value", "frame_limits"}
+_METADATA = {"planned_setting", "planned_setting_id", "planned_value", "actual_setting_value", "frame_limits", "measurement_source", "measurement_id", "log_avg_fps", "log_p1_fps"}
 _ALIASES = {
     "vsync": {"已禁用": "disabled", "已关闭": "disabled", "已启用": "enabled", "已开启": "enabled"},
     "display_mode": {"全屏": "fullscreen", "全屏窗口模式": "borderless", "无边框窗口": "borderless", "窗口模式": "windowed"},

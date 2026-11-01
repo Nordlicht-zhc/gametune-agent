@@ -11,6 +11,7 @@ from configuration_views import ConfigurationReport,ConfigurationComparison
 from configuration_capture import ConfigurationCapture
 from configuration_quick import ConfigurationQuick
 from tools.victoria3_report import ReportRepository
+from victoria3_motion import MotionTabs
 
 
 class ConfigurationWindow(Victoria3Window):
@@ -35,7 +36,7 @@ class ConfigurationWindow(Victoria3Window):
         self.stack.removeWidget(old);old.hide()
         page=QWidget();layout=set_margins(QVBoxLayout(page),24,22,24,22,10)
         layout.addWidget(PageHeader('配置档案','配置报告与自由对比','每份报告只属于一套配置；选择任意 A、B 配置单独比较。'))
-        self.config_tabs=QTabWidget()
+        self.config_tabs=MotionTabs()
         self.config_report=ConfigurationReport(self.configurations)
         self.comparison=ConfigurationComparison(self.configurations)
         self.config_tabs.addTab(self.config_report,'单个配置报告')
@@ -100,6 +101,7 @@ class ConfigurationWindow(Victoria3Window):
         if not hasattr(self,'configurations'):
             return super().navigate(index)
         self.stack.setCurrentIndex(index);self.group.button(index).setChecked(True)
+        self.navigation_marker.select(index)
         if index==0:self.refresh_overview()
         elif index==2:self.capture_page.suggest_stage()
         elif index==3:

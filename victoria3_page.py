@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, Q
 from tools.victoria3 import (SimulationConditions, SimulationRepository, compare_runs,
                              experiment_guidance, import_simulation_csv, save_fingerprint, summarize_runs)
 from victoria3_quick import Victoria3Quick
+from victoria3_ui import text, section
+from victoria3_motion import MotionTabs, reveal
 
 
 class Victoria3Page(QScrollArea):
@@ -23,8 +25,12 @@ class Victoria3Page(QScrollArea):
         body = QWidget()
         self.setWidget(body)
         layout = QVBoxLayout(body)
+        layout.setContentsMargins(30, 26, 30, 26)
+        layout.setSpacing(20)
         self.quick = (quick_factory or Victoria3Quick)(database_path=database_path)
-        self.tabs = QTabWidget()
+        self.tabs = MotionTabs()
+        self.tabs.setObjectName("v3Tabs")
+        self.tabs.setDocumentMode(True)
         self.tabs.addTab(self.quick, "一键优化")
         self.quick.report_embedded = True
         self.quick.report_view.setWindowFlags(Qt.WindowType.Widget)
@@ -34,14 +40,14 @@ class Victoria3Page(QScrollArea):
         layout.addWidget(self.tabs)
         self.advanced_toggle = QCheckBox("展开高级性能测试（可选）")
         layout.addWidget(self.advanced_toggle)
-        self.advanced = QWidget()
+        self.advanced, advanced_layout = section("受控性能测试", "固定测试条件，分别保存基线与单项调整后的复测。")
         self.advanced.setVisible(False)
-        self.advanced_toggle.toggled.connect(self.advanced.setVisible)
+        self.advanced_toggle.toggled.connect(lambda visible: reveal(self.advanced, visible))
         layout.addWidget(self.advanced)
         layout.addStretch()
-        layout = QVBoxLayout(self.advanced)
+        layout = advanced_layout
         title = QLabel("Victoria 3 · 模拟速度与画面性能")
-        title.setObjectName("pageTitle")
+        title.setObjectName("sectionTitle")
         layout.addWidget(title)
         help_text = QLabel("每次重新载入同一存档，固定日期区间、速度档位、视角和缩放，预热后计时。\n"
                            "记录推进相同游戏天数的实际秒数，每组至少三次。FPS 为可选辅助指标。\n"
@@ -49,6 +55,10 @@ class Victoria3Page(QScrollArea):
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
         form = QFormLayout()
+        form.setHorizontalSpacing(22)
+        form.setVerticalSpacing(12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.fields = {}
         for key, label, placeholder in [("save", "起始存档文件", "选择本机 .v3 存档"),
                 ("version", "游戏版本", "填写实际版本及校验码"), ("mods", "模组与 DLC", "无模组 / 有序模组及 DLC 列表"),
@@ -75,11 +85,14 @@ class Victoria3Page(QScrollArea):
         self.table.setHorizontalHeaderLabels(["推进游戏天数", "实际耗时（秒）", "平均 FPS（可选）", "1% Low（可选）"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(165)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(36)
         layout.addWidget(self.table)
         actions = QHBoxLayout()
         for text, callback in [("增加测试行", self.add_row), ("导入 CSV", self.import_csv),
                                ("保存为基线", self.set_baseline), ("评估并保存复测", self.evaluate)]:
             button = QPushButton(text)
+            button.setObjectName("primaryButton" if callback == self.evaluate else "secondaryButton")
             button.clicked.connect(callback)
             actions.addWidget(button)
         layout.addLayout(actions)
@@ -87,6 +100,7 @@ class Victoria3Page(QScrollArea):
         layout.addWidget(self.confirmed)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
+        self.output.setPlaceholderText("保存基线后，记录一项调整并提交复测。结果会显示在这里。")
         self.output.setMinimumHeight(150)
         layout.addWidget(self.output)
         self.history = QComboBox()

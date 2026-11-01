@@ -8,7 +8,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox
 
 from agent.controller import GameTuneController
 from app import ExperimentPage, TaskState
@@ -49,15 +49,14 @@ class ActualSettingsUITests(unittest.TestCase):
 
     def test_changed_conditions_reveal_quality_choices_and_preserve_edits(self):
         self.assertTrue(self.page.changed_settings_panel.isVisible())
+        self.assertEqual(self.page.findChildren(QCheckBox), [])
         self.page.condition.setCurrentIndex(1)
         self.assertTrue(self.page.changed_settings_panel.isVisible())
         fields = self.page.actual_video_fields
         self.assertTrue({"shadow_quality", "dynamic_shadows", "msaa_mode", "texture_detail", "fsr", "fps_cap"} <= fields.keys())
         self.assertEqual(fields["msaa_mode"].text(), "8x MSAA")
-        self.page.configuration_confirmed.setChecked(True)
         fields["msaa_mode"].setText("4x MSAA")
         fields["shadow_quality"].setText("中")
-        self.assertFalse(self.page.configuration_confirmed.isChecked())
         self.page.condition.setCurrentIndex(0)
         self.assertTrue(self.page.changed_settings_panel.isVisible())
         self.assertEqual(self.page._actual_configuration()["msaa_mode"], "4x_msaa")
@@ -115,12 +114,10 @@ class ActualSettingsUITests(unittest.TestCase):
     def test_mouse_save_submits_actual_values_without_checkbox_gate(self):
         self.page.state.has_task = True
         self.page._sync_input_enabled()
+        self.assertEqual(self.page.findChildren(QCheckBox), [])
         self.page.avg.setValue(233)
         self.page.low.setValue(140)
-        # A late configuration edit may clear the optional checkbox.
-        self.page.configuration_confirmed.setChecked(True)
         self.page.actual_resolution.setText("1680 × 1050")
-        self.assertFalse(self.page.configuration_confirmed.isChecked())
         saved = []
         self.page.result_saved.connect(saved.append)
         self.page.ensureWidgetVisible(self.page.save_button)

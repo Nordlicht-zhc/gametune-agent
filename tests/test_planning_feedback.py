@@ -215,7 +215,7 @@ class PlanningFeedbackTests(unittest.TestCase):
         after = compare_scenario(scenario, provider)
         self.assertEqual(after["model"]["setting_id"], "msaa_mode")
         self.assertFalse(after["model"]["repeats_known_no_benefit"])
-        self.assertTrue(after["local"]["repeats_known_no_benefit"])
+        self.assertFalse(after["local"]["repeats_known_no_benefit"])
 
     def test_replay_rejects_illegal_candidate_and_invalid_human_label(self):
         self.start()

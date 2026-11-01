@@ -16,6 +16,7 @@ from tools.victoria3_report import metric_rows
 from tools.windows_launch import is_admin
 from tools.app_version import APP_VERSION
 from admin_handoff import signal_ready
+from victoria3_motion import MotionStack, MotionTabs, NavigationMarker
 
 
 class CopyableLabels(QObject):
@@ -89,14 +90,16 @@ class Victoria3Window(QMainWindow):
         sidebar.addStretch()
         sidebar.addWidget(label('本地运行 · 自动备份\n模型仅提供解释与建议', 'sideTaskText', True))
         outer.addWidget(side)
-        self.stack = QStackedWidget()
+        self.stack = MotionStack()
         outer.addWidget(self.stack, 1)
         self.overview = QWidget()
         self.overview_layout = set_margins(QVBoxLayout(self.overview), 30, 26, 30, 26, 18)
         self.stack.addWidget(self.overview)
         self.stack.addWidget(self.wrap(self.quick))
         self.source.advanced.setVisible(True)
-        tests = QTabWidget()
+        tests = MotionTabs()
+        tests.setObjectName('v3Tabs')
+        tests.setDocumentMode(True)
         self.capture_page = CapturePage(self.quick)
         tests.addTab(self.wrap(self.capture_page), '自动采集与硬件监测')
         tests.addTab(self.wrap(self.source.advanced), '高级跑日测试')
@@ -137,6 +140,7 @@ class Victoria3Window(QMainWindow):
         self.settings.provider_applied.connect(self.set_provider)
         self.stack.addWidget(self.settings)
         self.quick.discovered.connect(lambda _: self.refresh_overview())
+        self.navigation_marker = NavigationMarker(self.group, self)
         self.navigate(0)
 
     @staticmethod
@@ -147,8 +151,11 @@ class Victoria3Window(QMainWindow):
         return area
 
     def navigate(self, index):
+        if not 0 <= index < self.stack.count():
+            return
         self.stack.setCurrentIndex(index)
         self.group.button(index).setChecked(True)
+        self.navigation_marker.select(index)
         if index == 0:
             self.refresh_overview()
         if index == 2:

@@ -148,9 +148,9 @@ class UiWorkflowTests(unittest.TestCase):
                 self.assertEqual(window.stack.currentIndex(), expected)
             window.close()
 
-    def test_actual_configuration_is_unchecked_by_default(self):
+    def test_actual_configuration_needs_no_confirmation_checkbox(self):
         page = ExperimentPage(TaskState())
-        self.assertFalse(page.configuration_confirmed.isChecked())
+        self.assertFalse(hasattr(page, "configuration_confirmed"))
         self.assertEqual(page.repeats.value(), 1)
         self.assertTrue(page.save_button.isEnabled())
         page.set_completed()
@@ -172,14 +172,12 @@ class UiWorkflowTests(unittest.TestCase):
             application().processEvents()
             submitted = []
             page.result_saved.connect(submitted.append)
-            self.assertFalse(page.configuration_confirmed.isChecked())
             page._actual_fields["fps_cap"].selectAll()
             QTest.keyClicks(page._actual_fields["fps_cap"], "0")
             page._actual_fields["vsync"].setText("已关闭")
             page.actual_setting.setText("不限帧且关闭垂直同步")
             page.avg.setValue(300)
             page.low.setValue(180)
-            page.configuration_confirmed.setChecked(True)
             QTest.mouseClick(page.save_button, Qt.MouseButton.LeftButton)
             self.assertEqual(len(submitted), 1)
             self.assertEqual(submitted[0]["configuration"]["fps_cap"], "0")

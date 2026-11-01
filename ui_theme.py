@@ -105,4 +105,9 @@ QStatusBar { background: #faf9f6; color: #756f66; border-top: 1px solid #e5e1d9;
 QScrollBar:vertical { background: transparent; width: 9px; margin: 3px; }
 QScrollBar::handle:vertical { background: #cec6ba; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QTabWidget#v3Tabs::pane { border: none; background: #faf9f6; top: 0; }
+QTabWidget#v3Tabs > QTabBar::tab { background: transparent; color: #756f66; padding: 12px 20px; margin-right: 12px; border: none; border-bottom: 2px solid transparent; }
+QTabWidget#v3Tabs > QTabBar::tab:selected { color: #984832; border-bottom: 2px solid #a9513c; }
+QTabWidget#v3Tabs > QTabBar::tab:hover { background: #f0eee8; }
+QTabWidget#v3Tabs > QTabBar::tab:focus { border-bottom: 2px solid #302d29; }
 """

@@ -21,6 +21,8 @@ from agent.validator import KnowledgeBase, validate_plan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from storage.repository import SQLiteRepository
 from tools.analyze_evidence import analyze_evidence
+from tools.history_impacts import historical_impacts
+from tools.setting_weights import setting_weights
 from tools.calculate_metrics import weighted_performance_score
 from tools.configuration import CONFIGURATION_LABELS, changed_graphics, canonical_value, unexpected_configuration_changes
 
@@ -203,6 +205,18 @@ class GameTuneController:
                 retry_count=retry_count,
                 max_retries=1,
             )
+            if (pending.setting_id in {"power_mode", "cooling_mode", "graphics_mode"}
+                    and decision.measurement_valid is True
+                    and not decision.rollback_required
+                    and (decision.stop_reason == "platform_confirmation" or decision.accepted)):
+                pending = replace(
+                    pending, purpose="optimization",
+                    title=f"保留当前设置并确认：{pending.setting}",
+                    method="保留本轮已执行的设置，其他配置和场景不变；已有测试继续累计到 3 次确认收益，无需先恢复原配置。",
+                    success_criteria="有效且可比的测试累计达到 3 次，再确认保留收益；明显退步时按评估提示处理。",
+                )
+                diagnostic_plan = False
+                retry_count = 0
         else:
             decision = evaluate_result(
                 task,
@@ -224,7 +238,7 @@ class GameTuneController:
             decision.rollback_required = True
             if decision.stop_reason == "target_reached":
                 decision.stop_reason = "uncapped_target_reached"
-                decision.summary = "不限帧验证已达到测试目标。"
+                decision.summary = "不限帧验证已进入目标的 95% 范围。"
             original = limit_context.get("original_limits", {})
             restore_instruction = f"恢复最高 FPS 为 {original.get('fps_cap')}，垂直同步恢复为{'开启' if original.get('vsync') == 'enabled' else '关闭'}。"
             decision.summary += " 正式验证结束后，" + restore_instruction + "本次收益仅在不限帧条件下验证。"
@@ -256,6 +270,8 @@ class GameTuneController:
             )
         next_workflow = Workflow(workflow.state, workflow.round_number, workflow.phase)
         next_workflow.begin_evaluation()
+        if pending is not None:
+            next_workflow.set_phase(pending.purpose, action=pending.action.value, setting_id=pending.setting_id)
         self._transition_after_decision(next_workflow, decision, pending)
         accepted_current = candidate if decision.accepted else self.current_records.get(task.task_id, baseline)
         best = self.best_records.get(task.task_id, baseline)
@@ -547,7 +563,8 @@ class GameTuneController:
         return (
             str(record.resolution),
             str(record.test_scene).strip(),
-            tuple(sorted((str(key), str(value)) for key, value in configuration.items())),
+            tuple(sorted((str(key), str(value)) for key, value in configuration.items()
+                         if key not in {"measurement_id", "log_avg_fps", "log_p1_fps"})),
         )
 
     @staticmethod
@@ -1286,7 +1303,7 @@ class GameTuneController:
                 continue
             valid.append(plan)
             seen.add(identity)
-        return rank_candidates(task, current, evidence, valid)
+        return rank_candidates(task, current, evidence, valid, self.experiment_history(task.task_id))
 
     def choose_next_step(
         self,
@@ -1518,4 +1535,7 @@ class GameTuneController:
         plan: ExperimentPlan | None = None,
         workflow: dict | None = None,
     ) -> dict[str, str | list[str]]:
+        history = self.experiment_history(task.task_id)
+        workflow = {**(workflow or {}), "historical_impacts": historical_impacts(history, task.mode),
+                    "setting_weights": setting_weights(task.game, task.mode, history, directory=self.knowledge.directory)}
         return explain_decision(self.model_provider, task, decision, evidence=evidence, plan=plan, workflow=workflow)

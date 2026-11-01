@@ -6,6 +6,7 @@
   "sources": [
     {
       "id": "erza_graphics_202604",
+      "name": "9Erza 画质逐项测试（单平台）",
       "url": "https://github.com/9Erza/CS2-Optimization-Guide",
       "section": "Section 8: Graphics Settings Performance Impact",
       "source_type": "author_reported_benchmark",

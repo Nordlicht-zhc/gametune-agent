@@ -10,22 +10,19 @@ from models.schemas import BenchmarkRecord, Evidence, ExperimentPlan, Optimizati
 from .api import ModelAPIError, ModelMessage, ModelProvider, ModelRequest
 from .planner import plan_candidate_id
 from .feedback import summarize_feedback
+from tools.history_impacts import historical_impacts
 from tools.performance_knowledge import performance_context
+from tools.configuration import canonical_value
+from tools.setting_weights import setting_weights, candidate_reference_weight
 
 
-SYSTEM_PROMPT = """你是 GameTune 的下一步实验规划助手。你的任务是根据本轮数据、诊断证据和玩家偏好，从程序提供的候选计划中选择最值得做的一项。
+SYSTEM_PROMPT = """你是 GameTune 的下一步实验规划助手。从程序提供的合法候选中，选择最符合玩家目标、且最有本地数据支持的一项。
 
-玩家可以偏离建议并同时调整多项画质。player_profile 表示玩家实际采用的新配置，后续候选已从该配置生成；不得要求玩家恢复设置来证明上一条建议。整组结果不能拆分为单项收益；adopted_unverified 不等于已验证改善。
+先看本任务有效历史：优先考虑影响较大、与当前实际配置相符的设置；组合改动按整组看待。历史收益是否验证按记录状态表述。设置权重是相对排序，不代表预期 FPS 增幅；外部参考与本机记录分开使用。
 
-无效或不可比的历史只用于理解重测原因，不能作为收益证据。诊断后的恢复不等于优化失败；程序的评估结论不可改写。
+玩家实际采用的配置就是后续规划的当前配置，直接基于它选择下一步。优先给出能推进优化的设置；只有本轮存在明确的数据缺项，且候选能直接补齐时，才选择补充或复测操作。GPU 占用偏低本身不作为 CPU 瓶颈依据。
 
-external_performance_reference 是带来源的外部测试，仅用于比较候选和用户改动的可能影响。优先结合本机证据，不把外部百分比称为本机预期或实测收益，不相加、不拆分组合贡献，缺失档位不推算。
-
-先判断当前是在排查原因还是验证优化效果。原因不清、关键设置未知或证据相互矛盾时，优先选择能排除干扰或区分原因的候选；只有现有证据足以支持某个优化方向时，才选择优化验证。GPU 占用偏低本身不能证明 CPU 瓶颈；没有温度、频率等数据时不能断言存在过热或降频。
-
-候选计划中的设置、数值、操作方式、成功条件和恢复方法已经由程序生成。你只能选择一个候选编号并解释选择理由，不得改写或创造设置、测试次数、数值、游戏菜单或实验动作。若所有候选都不理想，也必须选择最安全、最能补充信息的一项，并在理由中说明限制。
-
-只返回 JSON：{"candidate_id":"候选编号","reason":"不超过 120 字的简体中文理由"}。"""
+候选里的设置、数值、操作和恢复方法由程序生成。选择一个候选编号，理由用一句话说明最相关的数据依据和下一步。只返回 JSON：{"candidate_id":"候选编号","reason":"不超过 80 字的简体中文理由"}。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +34,7 @@ class NextStepSelection:
 
 def rank_candidates(
     task: OptimizationTask, current: BenchmarkRecord, evidence: list[Evidence],
-    candidates: list[ExperimentPlan],
+    candidates: list[ExperimentPlan], history: list[dict] | None = None, weights: dict | None = None,
 ) -> list[ExperimentPlan]:
     """Evidence-based local fallback; platform labels alone are weak evidence."""
     codes = {item.code for item in evidence}
@@ -61,12 +58,28 @@ def rank_candidates(
             return 9
         return 5
 
-    return sorted(candidates, key=priority)
+    effects = historical_impacts(history or [], task.mode)["single_setting_effects"]
+    def observed_priority(plan):
+        base = priority(plan)
+        if base <= 1:
+            return base, 0
+        for effect in effects:
+            key = plan.setting_id
+            before, after = effect["reference_configuration"], effect["result_configuration"]
+            if (effect["changed_settings"] == [key]
+                    and canonical_value(key, before.get(key)) == canonical_value(key, plan.old_value)
+                    and canonical_value(key, after.get(key)) == canonical_value(key, plan.new_value)
+                    and all(canonical_value(other, current.configuration.get(other, current.resolution if other == "resolution" else "unknown"))
+                            == canonical_value(other, value) for other, value in before.items() if other != key)):
+                gain = effect["weighted_delta_pct"]
+                return (2 if effect["status"] == "verified" else 3, -gain) if gain > 0 else (9, -gain)
+        return base, -candidate_reference_weight(weights or {}, plan)
+    return sorted(candidates, key=observed_priority)
 
 
 def _selection(
     plan: ExperimentPlan, candidates: list[ExperimentPlan], history: list[dict],
-    source: str, reason: str, *, elapsed_ms: float = 0, status: str = "local", warning: str = "",
+    source: str, reason: str, *, elapsed_ms: float = 0, status: str = "local", warning: str = "", weights: dict | None = None,
 ) -> NextStepSelection:
     context = {
         "candidate_options": [
@@ -78,6 +91,7 @@ def _selection(
         "selected_candidate_id": plan_candidate_id(plan),
         "source": source, "status": status, "elapsed_ms": round(elapsed_ms, 3),
         "feedback": summarize_feedback(history),
+        "setting_weights": weights or {},
     }
     return NextStepSelection(replace(plan, planning_source=source, selection_reason=reason,
                                      planning_context=context), source, warning)
@@ -96,13 +110,14 @@ def choose_next_step(
     """Ask the model to choose only among locally generated candidate plans."""
     if not candidates:
         raise ValueError("当前没有可供选择的下一步计划")
-    candidates = rank_candidates(task, current, evidence, candidates)
-    fallback = candidates[0]
     history = history or []
+    weights = setting_weights(task.game, task.mode, history, directory=knowledge_directory)
+    candidates = rank_candidates(task, current, evidence, candidates, history, weights)
+    fallback = candidates[0]
     if len(candidates) == 1:
-        return _selection(fallback, candidates, history, "local", "当前只有一个合法候选，直接采用本地计划。", status="single_candidate")
+        return _selection(fallback, candidates, history, "local", "当前只有一个合法候选，直接采用本地计划。", status="single_candidate", weights=weights)
     if provider is None:
-        return _selection(fallback, candidates, history, "local", "未连接模型，按测试条件、实测证据和历史结论选择本地方案。", warning="当前未连接模型，使用本地安全建议。")
+        return _selection(fallback, candidates, history, "local", "根据当前有效数据和本任务历史排序。", weights=weights)
     request = next_step_request(task, current, evidence, candidates, history=history, knowledge_directory=knowledge_directory)
     started = perf_counter()
     try:
@@ -112,12 +127,12 @@ def choose_next_step(
         if selected is None:
             raise ValueError("模型选择了候选列表之外的计划")
         return _selection(selected, candidates, history, "model", data["reason"],
-                          elapsed_ms=(perf_counter() - started) * 1000, status="model_selected")
+                          elapsed_ms=(perf_counter() - started) * 1000, status="model_selected", weights=weights)
     except (ModelAPIError, ValueError, KeyError, TypeError, IndexError):
         return _selection(fallback, candidates, history, "local",
-                          "模型建议暂不可用，已按证据优先级回退到本地计划。",
+                          "根据当前有效数据和本任务历史排序。",
                           elapsed_ms=(perf_counter() - started) * 1000, status="model_fallback",
-                          warning="AI 规划不可用，已回退到本地规则。")
+                          weights=weights)
 
 
 def next_step_request(
@@ -167,6 +182,8 @@ def next_step_request(
             for item in evidence
         ],
         "feedback_summary": summarize_feedback(history or []),
+        "historical_impacts": historical_impacts(history or [], task.mode),
+        "setting_weights": setting_weights(task.game, task.mode, history or [], directory=knowledge_directory),
         "external_performance_reference": performance_context(task, current, candidates, history or [], directory=knowledge_directory),
         "completed_experiments": [
             {

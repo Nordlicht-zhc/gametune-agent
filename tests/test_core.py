@@ -434,13 +434,13 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertEqual(provider.last_request.response_format, "json")
         self.assertEqual(provider.last_request.metadata["purpose"], "decision_explanation")
         self.assertEqual(provider.last_request.metadata["task_id"], current_task.task_id)
-        self.assertIn("普通游戏玩家", provider.last_request.messages[0].content)
-        self.assertIn("综合得分", provider.last_request.messages[0].content)
+        self.assertIn("结果说明助手", provider.last_request.messages[0].content)
+        self.assertIn("省略重复提醒", provider.last_request.messages[0].content)
         payload = json.loads(provider.last_request.messages[1].content)
         self.assertIn("不熟悉性能分析", payload["audience"])
-        self.assertIn("不使用学术术语", payload["language"])
-        self.assertIn("重复本轮测试", payload["must_follow"])
-        self.assertTrue(any("keep_change" in item for item in payload["constraints"]))
+        self.assertIn("简体中文", payload["language"])
+        self.assertIn("核对实际配置", payload["must_follow"])
+        self.assertTrue(any("must_follow" in item for item in payload["constraints"]))
 
     def test_completed_task_uses_final_report_prompt(self):
         provider = FakeProvider()
@@ -458,12 +458,12 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertIsNotNone(provider.last_request)
         self.assertEqual(provider.last_request.metadata["purpose"], "final_report")
         self.assertEqual(provider.last_request.max_output_tokens, 3000)
-        self.assertIn("最终报告撰写器", provider.last_request.messages[0].content)
-        self.assertIn("普通游戏玩家", provider.last_request.messages[0].content)
+        self.assertIn("最终结果撰写助手", provider.last_request.messages[0].content)
+        self.assertIn("最终结果撰写助手", provider.last_request.messages[0].content)
         payload = json.loads(provider.last_request.messages[1].content)
         self.assertEqual(payload["report_type"], "final_report")
         self.assertTrue(payload["final_decision"]["rollback_required"])
-        self.assertTrue(any("先要求恢复" in item for item in payload["constraints"]))
+        self.assertTrue(any("需要恢复配置" in item for item in payload["constraints"]))
 
     def test_invalid_submission_cannot_be_reinterpreted_by_model(self):
         provider = FakeProvider()
@@ -498,7 +498,7 @@ class ModelInterfaceTests(unittest.TestCase):
         explanation = explain_decision(None, current_task, decision)
         self.assertEqual(explanation["summary"], decision.summary)
         self.assertEqual(explanation["source"], "local")
-        self.assertIn("未使用模型 API", explanation["warning"])
+        self.assertEqual(explanation["warning"], "")
 
 
 class WorkflowTests(unittest.TestCase):

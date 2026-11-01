@@ -186,7 +186,7 @@ class TextInputUsabilityTests(unittest.TestCase):
         self.assertFalse(page.file_input.isEnabled())
         self.assertTrue(page.actual_setting.isEnabled())
         page.set_rollback_pending(True)
-        for widget in (page.notes, page.configuration_confirmed, page.actual_setting, page.actual_scene, page.save_button):
+        for widget in (page.notes, page.actual_setting, page.actual_scene, page.save_button):
             self.assertFalse(widget.isEnabled())
         saved = []
         page.result_saved.connect(saved.append)

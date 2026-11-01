@@ -6,6 +6,8 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
+from time import monotonic
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QEvent, Qt, QThread, QTimer, Signal, Slot, Property, QPropertyAnimation, QEasingCurve, QRectF, QSize, QSequentialAnimationGroup, QParallelAnimationGroup, QPauseAnimation
 from PySide6.QtGui import QFont, QPixmap, QPainter, QIcon, QPen, QColor, QBrush, QPainterPath, QRegion, QValidator
@@ -29,6 +31,9 @@ from agent.api import (
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from tools.configuration import CONFIGURATION_LABELS, canonical_value
 from tools.import_benchmark import import_benchmark_csv
+from tools.cs2_log import CS2LogTail, locate_console_logs
+from tools.setting_weights import setting_weights
+from tools import cs2_benchmark
 from tools.analyze_evidence import analyze_evidence, dominant_hypothesis, evidence_support_level
 from tools.resolution import RESOLUTION_PRESETS, aspect_ratio_name, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog, HardwareEntry
@@ -1390,7 +1395,9 @@ class ExperimentPage(QScrollArea):
         elif plan and plan.action == AgentAction.FINISH:
             subtitle = "暂时没有新的测试建议；补充程序支持的游戏设置后，可以继续优化。"
         elif plan and plan.purpose == "diagnostic":
-            subtitle = "这次测试是为了找出性能受限的原因。测完后，按提示改回原设置或再测一次。"
+            subtitle = ("先测 1 次了解这项设置的影响；有效且明显改善时保留当前设置，继续累计确认收益。"
+                        if plan.setting_id in {"power_mode", "cooling_mode", "graphics_mode"}
+                        else "这次测试是为了找出性能受限的原因。测完后，按评估提示决定是否恢复或补测。")
         else:
             subtitle = "先测 1 次，帧率没明显变差就继续测到累计 3 次。测试环境变了请注明。"
         entry_type = "诊断测试" if plan and plan.purpose == "diagnostic" else "优化验证"
@@ -1430,6 +1437,33 @@ class ExperimentPage(QScrollArea):
         file_row.addWidget(self.file_input, 1)
         file_row.addWidget(browse)
         input_layout.addLayout(file_row)
+        self._log_tail = None
+        self._benchmark_macro = None
+        self._log_queue = []
+        self._log_measurement = None
+        self._log_ready_for_next = False
+        self._log_timer = QTimer(self)
+        self._log_timer.setInterval(500)
+        self._log_timer.timeout.connect(self._poll_cs2_log)
+        self.log_path = QLineEdit()
+        self.log_path.setPlaceholderText("普通监听：选择 console.log；一键跑图会自动定位并开启日志")
+        self.log_browse = QPushButton("选择游戏日志")
+        self.log_browse.clicked.connect(self._choose_cs2_log)
+        self.log_benchmark = QPushButton("一键跑图并监听")
+        self.log_benchmark.clicked.connect(self._start_cs2_benchmark)
+        self.log_toggle = QPushButton("开始监听")
+        self.log_toggle.clicked.connect(self._toggle_cs2_log)
+        log_row = QHBoxLayout()
+        for widget in (self.log_path, self.log_browse, self.log_toggle, self.log_benchmark):
+            log_row.addWidget(widget)
+        input_layout.addLayout(log_row)
+        self.log_status = label("普通监听只读新增日志；一键跑图会启动或操作 CS2，需事先订阅 Benchmark 地图。P1 按游戏报告原值记录。", "metricNote", True)
+        input_layout.addWidget(self.log_status)
+        self.log_next = QPushButton("读取下一条已捕获结果")
+        self.log_next.clicked.connect(self._load_next_log_result)
+        self.log_next.setVisible(False)
+        input_layout.addWidget(self.log_next)
+
         form = QFormLayout()
         form.setVerticalSpacing(11)
         self.avg = NewTaskPage._spin(0, 2000, 0, placeholder="填写实测平均 FPS")
@@ -1437,6 +1471,8 @@ class ExperimentPage(QScrollArea):
         self.gpu = NewTaskPage._spin(0, 100, 0, placeholder="未记录（可不填）")
         self.repeats = NewTaskPage._spin(1, 10, 1)
         self.duration = NewTaskPage._spin(10, 3600, 60)
+        for field in (self.avg, self.low, self.gpu, self.repeats):
+            field.valueChanged.connect(self._clear_csv_if_manual_edit)
         self.condition = RoundedComboBox()
         self.condition.addItems(["与基线一致", "有变化，需要说明"])
         self.condition.setToolTip("仅按本轮计划修改设置时保持“与基线一致”；画质改动在下方如实记录，不算测试条件变化；仅场景、路线、采集方式等改变时选择“有变化”。")
@@ -1474,29 +1510,10 @@ class ExperimentPage(QScrollArea):
             self._actual_fields["vsync"].setPlaceholderText("填写已关闭或已开启")
             form.addRow("实际最高 FPS（0 为不限帧）", self._actual_fields["fps_cap"])
             form.addRow("实际垂直同步", self._actual_fields["vsync"])
-        for field in self._actual_fields.values():
-            field.textChanged.connect(self._configuration_edited)
-        self.actual_setting.currentTextChanged.connect(self._configuration_edited)
         if plan and plan.setting_id in {"resolution", "refresh_rate"}:
             related = self._actual_fields[plan.setting_id]
             self.actual_setting.currentTextChanged.connect(related.setText)
             related.textChanged.connect(self.actual_setting.setText)
-        if plan and plan.action == AgentAction.REQUEST_DATA:
-            confirmation_label = "我已核对并记录当前实际状态"
-        elif plan and plan.purpose == "diagnostic":
-            confirmation_label = "已提前核对实际配置（可选；保存时按表单提交）"
-        else:
-            confirmation_label = "已提前核对实际配置（可选；保存时按表单提交）"
-        self.configuration_confirmed = QCheckBox(confirmation_label)
-        # A proposed value is not evidence that the user executed it.
-        self.configuration_confirmed.setChecked(False)
-        for name, widget in [("平均 FPS", self.avg), ("1% Low", self.low), ("GPU 占用", self.gpu), ("测试次数", self.repeats), ("每次时长（秒）", self.duration), ("测试条件", self.condition)]:
-            form.addRow(name, widget)
-        form.addRow("处理器", self.actual_cpu)
-        form.addRow("显卡", self.actual_gpu)
-        form.addRow("分辨率", self.actual_resolution)
-        form.addRow("刷新率", self.actual_refresh_rate)
-        form.addRow("测试场景", self.actual_scene)
         setting_label = getattr(self.plan, "setting", "本轮设置") if self.plan else "本轮设置"
         if self.is_user_adjustment_request:
             form.addRow("优化方向", self.adjustment_direction)
@@ -1507,6 +1524,13 @@ class ExperimentPage(QScrollArea):
                 field.textChanged.connect(self._clear_csv_if_manual_edit)
         else:
             form.addRow(f"本轮{setting_label}", self.actual_setting)
+        for name, widget in [("平均 FPS", self.avg), ("1% Low", self.low), ("GPU 占用", self.gpu), ("测试次数", self.repeats), ("每次时长（秒）", self.duration), ("测试条件", self.condition)]:
+            form.addRow(name, widget)
+        form.addRow("处理器", self.actual_cpu)
+        form.addRow("显卡", self.actual_gpu)
+        form.addRow("分辨率", self.actual_resolution)
+        form.addRow("刷新率", self.actual_refresh_rate)
+        form.addRow("测试场景", self.actual_scene)
         input_layout.addLayout(form)
         self.changed_settings_panel = QWidget()
         changed_layout = set_margins(QVBoxLayout(self.changed_settings_panel), spacing=10)
@@ -1537,23 +1561,19 @@ class ExperimentPage(QScrollArea):
             field = ActualSettingInput(display, choices)
             self.actual_video_fields[key] = field
             changed_form.addRow(CONFIGURATION_LABELS.get(key, key), field)
-            field.currentTextChanged.connect(self._configuration_edited)
         if "fps_cap" not in self._actual_fields and not (plan and plan.setting_id == "fps_cap"):
             field = EditableChoiceInput("" if state.fps_cap is None else str(state.fps_cap), ["0", "120", "144", "240", "300", "500"])
             field.setPlaceholderText("未确认；0 为不限帧")
             self.actual_video_fields["fps_cap"] = field
             changed_form.addRow("游戏最高 FPS", field)
-            field.textChanged.connect(self._configuration_edited)
         if not (plan and plan.setting_id == "menu_fps_cap"):
             field = EditableChoiceInput(str((state.video_settings or {}).get("menu_fps_cap", "")), ["60", "120", "144", "240", "300"])
             field.setPlaceholderText("未确认")
             self.actual_video_fields["menu_fps_cap"] = field
             changed_form.addRow("菜单最高 FPS", field)
-            field.textChanged.connect(self._configuration_edited)
         form.insertRow(form.getWidgetPosition(self.condition)[0] + 1, self.changed_settings_panel)
         self.changed_settings_panel.show()
         self.condition.currentIndexChanged.connect(self._condition_changed)
-        input_layout.addWidget(self.configuration_confirmed)
         input_layout.addWidget(label("点击“保存并分析”即按以上实际配置提交；未执行建议也可以保存，程序将区分原配置复测与调整验证。", "metricNote", True))
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("备注（可选）：记录测试中的异常或变化")
@@ -1561,7 +1581,7 @@ class ExperimentPage(QScrollArea):
         input_layout.addWidget(self.notes)
         if plan and plan.setting_id == "uncapped_validation":
             for widget in (self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition,
-                           *self._actual_fields.values(), self.configuration_confirmed,
+                           *self._actual_fields.values(),
                            self.file_input, self.browse_button, self.notes):
                 if form.getWidgetPosition(widget)[0] >= 0:
                     form.setRowVisible(widget, False)
@@ -1591,6 +1611,10 @@ class ExperimentPage(QScrollArea):
         guide_layout.addWidget(label("临时排除帧率限制" if plan and plan.setting_id == "frame_limits" else "下一步建议（可按偏好调整）", "cardKicker"))
         change_title = f"{plan.setting}：{setting_value_label(plan.setting_id, plan.old_value)} → {setting_value_label(plan.setting_id, plan.new_value)}" if plan else "等待生成实验计划"
         guide_layout.addWidget(label(change_title, "actionTitle", True))
+        self.weights_button = QPushButton("查看各设置影响权重")
+        self.weights_button.clicked.connect(self._show_setting_weights)
+        guide_layout.addWidget(self.weights_button)
+
         guide_layout.addWidget(label("按建议单项测试便于判断原因；自行调整多项时，将按整组配置重新规划。", "metricNote", True))
         if plan and plan.setting_id == "uncapped_validation":
             test_requirement = "只选择目标，本步骤不会生成测试记录"
@@ -1610,7 +1634,7 @@ class ExperimentPage(QScrollArea):
             guide_layout.addWidget(RuleRow(name, value))
         if plan:
             guide_layout.addWidget(hline())
-            guide_layout.addWidget(RuleRow("实验用途", "选择后续验证目标" if plan.setting_id == "uncapped_validation" else ("排查原因，结束后恢复原设置" if plan.purpose == "diagnostic" else "验证用户选定的优化调整")))
+            guide_layout.addWidget(RuleRow("实验用途", "选择后续验证目标" if plan.setting_id == "uncapped_validation" else (("排查影响，改善时原地保留并确认" if plan.setting_id in {"power_mode", "cooling_mode", "graphics_mode"} else "临时诊断，按评估提示恢复") if plan.purpose == "diagnostic" else "验证用户选定的优化调整")))
             if plan.diagnostic_record_id:
                 guide_layout.addWidget(hline())
                 guide_layout.addWidget(RuleRow("诊断线索", plan.rationale))
@@ -1770,15 +1794,11 @@ class ExperimentPage(QScrollArea):
         aliases.update(advanced_aliases)
         return aliases.get(setting_id, {}).get(value, value)
 
-    def _configuration_edited(self, *_args):
-        if hasattr(self, "configuration_confirmed"):
-            self.configuration_confirmed.setChecked(False)
-
     def _condition_changed(self, *_args):
         self.changed_settings_panel.setVisible(True)
-        self._configuration_edited()
 
     def _clear_csv_if_manual_edit(self, *_args):
+        self._log_measurement = None
         if self._csv_metrics is not None:
             self._csv_metrics = None
             self._csv_values = None
@@ -1828,7 +1848,7 @@ class ExperimentPage(QScrollArea):
         editable = self.state.has_task and not self.completed and not self.rollback_pending and not self.planning
         for widget in (self.file_input, self.browse_button, self.avg, self.low, self.gpu, self.repeats, self.duration, self.condition):
             widget.setEnabled(editable and not self.is_data_request)
-        for field in (*self._actual_fields.values(), *self.actual_video_fields.values(), self.actual_setting, self.configuration_confirmed, self.notes,
+        for field in (*self._actual_fields.values(), *self.actual_video_fields.values(), self.actual_setting, self.notes,
                       self.adjustment_direction, self.adjustment_setting_name, self.adjustment_current_value,
                       self.adjustment_new_value):
             field.setEnabled(editable)
@@ -1839,6 +1859,10 @@ class ExperimentPage(QScrollArea):
         config = {key: field.text().strip() for key, field in self._actual_fields.items()}
         config.update({
             "display_mode": self.state.display_mode,
+            "power_mode": self.state.power_mode,
+            "cooling_mode": self.state.cooling_mode,
+            "graphics_mode": self.state.graphics_mode,
+            "gpu_power_w": str(self.state.gpu_power_w) if self.state.gpu_power_w is not None else "unknown",
             "fps_cap": "unknown" if self.state.fps_cap is None else str(self.state.fps_cap),
             "vsync": self.state.vsync,
             "shadow_quality": self.state.shadow_quality,
@@ -1858,6 +1882,190 @@ class ExperimentPage(QScrollArea):
         if setting_id and config["actual_setting_value"]:
             config[setting_id] = self._supplement_value()
         return {key: value for key, value in config.items() if value}
+
+    def _show_setting_weights(self):
+        weights = (self.plan.planning_context.get("setting_weights") if self.plan else None) or setting_weights(self.state.game, self.state.mode, [])
+        dialog = QDialog(self)
+        dialog.setWindowTitle("设置影响权重")
+        dialog.resize(800, 620)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label(weights["method"], "metricNote", True))
+        layout.addWidget(label("权重表示影响大小，不代表提升方向或预期 FPS 增幅。本机与各外部来源仅在已测项目中分别归一，未测不等于无影响。", "warningBox", True))
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["设置", "权重", "来源", "状态"])
+        rows = [(row, "本机历史") for row in weights["local_weights"]]
+        source_names = {source["id"]: (source.get("name") or "外部单平台测试") for source in weights["sources"]}
+        rows += [(row, source_names.get(row["source_id"], "外部测试")) for row in weights["external_weights"]]
+        rows += [(row, "无可用测量") for row in weights["unmeasured"]]
+        table.setRowCount(len(rows))
+        for index, (row, source) in enumerate(rows):
+            status = {"verified": "收益已确认", "observed_not_verified": "观察值，未确认收益", "external_reference": "外部平台参考"}.get(row.get("status"), "未测")
+            values = [row["label"], f"{row['weight_pct']:.2f}%" if row.get("weight_pct") is not None else "未测", source, status]
+            for column, value in enumerate(values):
+                table.setItem(index, column, QTableWidgetItem(value))
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def _choose_cs2_log(self):
+        candidates = locate_console_logs()
+        if len(candidates) == 1:
+            self.log_path.setText(str(candidates[0]))
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择 CS2 console.log", str(candidates[0].parent) if candidates else str(APP_DIR), "游戏日志 (*.log *.txt);;所有文件 (*)")
+        if path:
+            self.log_path.setText(path)
+
+    def _start_cs2_benchmark(self):
+        if self.completed or self.rollback_pending or self.planning or self.is_data_request:
+            self.log_status.setText("请先完成当前步骤，再启动 Benchmark。")
+            return
+        if self._benchmark_macro is not None:
+            self.log_status.setText("Benchmark 已在启动或等待结果，请勿重复启动。")
+            return
+        if self._log_measurement is not None and not self._log_ready_for_next:
+            self.log_status.setText("请先保存已捕获的测试结果，再启动下一次 Benchmark。")
+            return
+        try:
+            hwnd = cs2_benchmark.game_window()
+            selected_log = Path(self.log_path.text().strip().strip('"'))
+            installation = (cs2_benchmark.Installation(Path(), selected_log)
+                            if hwnd is not None and selected_log.is_file()
+                            else cs2_benchmark.find_installation())
+            # Arm the cursor before launching: a new file must be read from byte 0.
+            tail = (self._log_tail if self._log_tail is not None and self._log_tail.path == installation.console_log
+                    else CS2LogTail(installation.console_log, follow_creation=True))
+            if hwnd is not None and not installation.console_log.is_file():
+                raise ValueError("游戏已运行但尚无日志。请退出 CS2，再点击此按钮，程序会带 -condebug 启动。")
+            tail.expected_map = b"de_dust2"
+            tail.map_loaded = False
+            tail.echo_tokens.clear()
+            self._log_tail = tail
+            self.log_path.setText(str(installation.console_log))
+            self.log_path.setEnabled(False)
+            self.log_browse.setEnabled(False)
+            self.log_toggle.setText("停止监听")
+            self._log_timer.start()
+            token = "GAMETUNE_" + uuid4().hex
+            self._benchmark_macro = {"token": token, "hwnd": hwnd,
+                                     "phase": "launch" if hwnd is None else "opening",
+                                     "deadline": monotonic() + (240 if hwnd is None else 10)}
+            if hwnd is None:
+                self._benchmark_process = cs2_benchmark.launch_benchmark(installation)
+                self.log_status.setText("已请求 Steam 启动 CS2、开启日志并载入 Benchmark 地图。请确保已订阅地图；正在等待测试结果。")
+            else:
+                tail.expected_echo = token
+                cs2_benchmark.open_console(hwnd)
+                self.log_status.setText("正在打开 CS2 控制台并验证日志回执；验证成功后才会发送跑图指令。")
+                QTimer.singleShot(350, lambda: self._send_cs2_macro_echo(token))
+        except (OSError, ValueError) as error:
+            self._benchmark_macro = None
+            self.log_status.setText(str(error))
+
+    def _send_cs2_macro_echo(self, token):
+        context = self._benchmark_macro
+        if not context or context["token"] != token or self._log_tail is None:
+            return
+        try:
+            cs2_benchmark.console_command(context["hwnd"], "echo " + token)
+            context["phase"] = "echo"
+        except (OSError, ValueError) as error:
+            self._benchmark_macro = None
+            self.log_status.setText(str(error))
+
+    def _advance_cs2_benchmark(self):
+        context = self._benchmark_macro
+        if not context or self._log_tail is None:
+            return
+        if context["phase"] == "echo" and context["token"] in self._log_tail.echo_tokens:
+            try:
+                cs2_benchmark.console_command(context["hwnd"], cs2_benchmark.MAP_COMMAND)
+            except (OSError, ValueError) as error:
+                self._benchmark_macro = None
+                self.log_status.setText(str(error))
+                return
+            self._log_tail.map_loaded = False
+            context["phase"] = "running"
+            context["deadline"] = monotonic() + 240
+            self.log_status.setText("已确认控制台回执并发送地图指令，正在等待 Benchmark 结果。")
+        elif monotonic() >= context["deadline"]:
+            self._benchmark_macro = None
+            self._log_tail.expected_echo = None
+            if not self._log_tail.path.exists():
+                self._log_timer.stop()
+            self.log_status.setText("未收到测试结果或控制台回执。请确认已订阅地图、启用开发者控制台且使用默认 ~ 键，并以 -condebug 启动；日志监听仍保留。")
+
+    def _toggle_cs2_log(self):
+        if self._log_tail is not None:
+            self._benchmark_macro = None
+            self._log_tail.expected_echo = None
+            self._log_timer.stop()
+            self._log_tail = None
+            self.log_toggle.setText("开始监听")
+            self.log_path.setEnabled(True)
+            self.log_browse.setEnabled(True)
+            self.log_status.setText("已停止监听；已经捕获的结果仍可提交。")
+            return
+        try:
+            self._log_tail = CS2LogTail(self.log_path.text().strip().strip('"'))
+        except OSError:
+            self.log_status.setText("无法打开日志。请用 -condebug 启动 CS2，跑图前选择 game/csgo/console.log。")
+            return
+        self.log_path.setEnabled(False)
+        self.log_browse.setEnabled(False)
+        self.log_toggle.setText("停止监听")
+        self.log_status.setText("正在等待新增 Benchmark 结果；已有历史内容会跳过。跑完后自动带入，核对实际配置再保存。")
+        self._log_timer.start()
+
+    def _poll_cs2_log(self):
+        if self._log_tail is None:
+            return
+        try:
+            new_results = self._log_tail.poll()
+            macro = self._benchmark_macro
+            if macro is not None and (macro["phase"] not in {"launch", "running"} or not self._log_tail.map_loaded):
+                new_results = []
+            self._log_queue.extend(new_results)
+            if new_results:
+                self._benchmark_macro = None
+            self._advance_cs2_benchmark()
+        except OSError:
+            was_macro = self._benchmark_macro is not None
+            self._advance_cs2_benchmark()
+            if was_macro:
+                return
+            self.log_status.setText("日志暂时不可读，等待游戏继续写入；可停止后重新选择。")
+            return
+        if ((self._log_measurement is None or self._log_ready_for_next) and self._log_queue and not self.completed and not self.rollback_pending
+                and not self.planning and (self._log_ready_for_next or (self.avg.value() == 0 and self.low.value() == 0))):
+            self._load_next_log_result()
+        self.log_next.setVisible(bool(self._log_queue))
+        self.log_next.setText(f"读取下一条已捕获结果（{len(self._log_queue)} 条）")
+
+    def _load_next_log_result(self):
+        if not self._log_queue or self.completed or self.rollback_pending or self.planning or self.is_data_request:
+            return
+        if self._log_measurement is not None and not self._log_ready_for_next:
+            self.log_status.setText("请先保存当前日志结果，避免覆盖尚未提交的数据。")
+            return
+        self._log_ready_for_next = False
+        item = self._log_queue.pop(0)
+        self.avg.setValue(round(item.avg_fps))
+        self.low.setValue(round(item.p1_fps))
+        self.gpu.setValue(0)
+        self.repeats.setValue(1)
+        self.file_input.clear()
+        self._log_measurement = item
+        self._csv_metrics = {"avg_fps": item.avg_fps, "low_fps": item.p1_fps,
+                             "runs": [{"avg_fps": item.avg_fps, "low_fps": item.p1_fps}]}
+        self._csv_values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
+        self.log_status.setText(f"已读取 Avg {item.avg_fps:g} / P1 {item.p1_fps:g} FPS（显示值四舍五入，保存保留原精度）。GPU 占用未知；请填写实际测试时长与配置后保存。")
+        self.log_next.setVisible(bool(self._log_queue))
 
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择基准测试 CSV", str(APP_DIR), "CSV 文件 (*.csv);;所有文件 (*.*)")
@@ -1924,27 +2132,39 @@ class ExperimentPage(QScrollArea):
             return
         values = (self.avg.value(), self.low.value(), self.gpu.value(), self.repeats.value())
         metrics = self._csv_metrics if values == self._csv_values else None
-        # Saving is the explicit confirmation of the actual form snapshot.
-        # The optional checkbox must not prevent recording a real observation.
-        self.configuration_confirmed.setChecked(True)
+        # Saving submits the actual form snapshot, so this record confirms the
+        # configuration that accompanied the measurement.
+        log_item = self._log_measurement if metrics is not None else None
+        configuration = self._actual_configuration()
+        if log_item is not None:
+            configuration.update({"measurement_source": "cs2_vprof", "measurement_id": log_item.measurement_id,
+                                  "log_avg_fps": str(log_item.avg_fps), "log_p1_fps": str(log_item.p1_fps)})
         self.result_saved.emit({
-            "avg": self.avg.value(),
-            "low": self.low.value(),
+            "avg": log_item.avg_fps if log_item is not None else self.avg.value(),
+            "low": log_item.p1_fps if log_item is not None else self.low.value(),
             "gpu": self.gpu.value() if self.gpu.value() > 0 else None,
             "repeats": self.repeats.value(),
             "duration": self.duration.value(),
             "condition": self.condition.currentText(),
-            "configuration_confirmed": self.configuration_confirmed.isChecked(),
+            "configuration_confirmed": True,
             "notes": self.notes.toPlainText().strip(),
             "file": self.file_input.text().strip(),
             "resolution": resolution,
-            "configuration": self._actual_configuration(),
+            "configuration": configuration,
+            "source": "cs2_vprof" if log_item is not None else "",
+            "log_excerpt": log_item.excerpt if log_item is not None else "",
+            "measurement_id": log_item.measurement_id if log_item is not None else "",
             "runs": list(metrics.get("runs", [])) if metrics else [],
             "avg_spread_pct": metrics.get("avg_spread_pct") if metrics else None,
             "low_spread_pct": metrics.get("low_spread_pct") if metrics else None,
             "supplement": self.is_data_request,
             "supplement_value": self._supplement_value(),
         })
+
+    def closeEvent(self, event):
+        self._benchmark_macro = None
+        self._log_timer.stop()
+        super().closeEvent(event)
 
 
 class HistoryPage(QWidget):
@@ -1985,7 +2205,7 @@ class HistoryPage(QWidget):
                 self.table.setItem(row_idx, col_idx, item)
             self.table.setRowHeight(row_idx, 46)
         root.addWidget(self.table)
-        root.addWidget(GuidancePanel("读懂记录", "“已执行”表示你确认过实际设置；“保留”需要有效且可比较的测试支持。测试条件有变化时，先核对记录，再判断收益。"))
+        root.addWidget(GuidancePanel("读懂记录", "“已执行”表示提交时记录了本次实际设置；“保留”需要有效且可比较的测试支持。测试条件有变化时，先核对记录，再判断收益。"))
         root.addStretch()
         self.set_tasks(tasks or [])
 
@@ -2117,7 +2337,7 @@ class ReportPage(QScrollArea):
             source = f"AI 说明 · {model_name}" if explanation.get("source") == "model" and model_name else (
                 "AI 说明" if explanation.get("source") == "model" else "本地说明"
             )
-            summary_layout.addWidget(SectionHeader(source, "帮你理解结果，结论以测试为准"))
+            summary_layout.addWidget(SectionHeader("判断依据与操作", source))
             for reason in explanation.get("reasoning", []):
                 reason_label = label(f"• {reason}", "ruleText", True)
                 reason_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -2679,6 +2899,7 @@ class MainWindow(QMainWindow):
         self,
         database_path: str | Path | None = None,
         controller: GameTuneController | None = None,
+        include_victoria3: bool = True,
     ):
         super().__init__()
         self.state = TaskState(has_task=False)
@@ -2699,6 +2920,7 @@ class MainWindow(QMainWindow):
             model_provider=model_provider,
         )
         initial_api_config = model_provider.config if isinstance(model_provider, OpenAICompatibleProvider) else None
+        self._submitted_log_ids = set()
         self.current_explanation: dict[str, str | list[str]] | None = None
         self.core_task: OptimizationTask | None = None
         self.baseline_record: BenchmarkRecord | None = None
@@ -2731,14 +2953,18 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardPage(self.state, self.current_evidence, self.current_plan, current_record)
         self.new_task = NewTaskPage(self.state)
         self.experiment = ExperimentPage(self.state, self.current_plan)
+
         self.experiment.set_completed()
         self.history = HistoryPage(self.state, self._available_tasks())
         self.report = ReportPage(self.state)
         self.api_settings = APISettingsPage(initial_api_config)
         for page in [self.dashboard, self.new_task, self.experiment, self.history, self.report, self.api_settings]:
             self.stack.addWidget(page)
-        self.victoria3 = Victoria3Page(database_path or DATA_DIR / "gametune.db")
-        self.stack.addWidget(self.victoria3)
+        if include_victoria3:
+            self.victoria3 = Victoria3Page(database_path or DATA_DIR / "gametune.db")
+            self.stack.addWidget(self.victoria3)
+        else:
+            self.sidebar.group.button(6).hide()
         layout.addWidget(self.sidebar)
         layout.addWidget(self.stack, 1)
         self.sidebar.navigate.connect(self.set_page)
@@ -2976,9 +3202,21 @@ class MainWindow(QMainWindow):
         self.stack.insertWidget(0, self.dashboard)
 
         old_experiment = self.experiment
+        old_experiment._benchmark_macro = None
         self.stack.removeWidget(old_experiment)
         old_experiment.deleteLater()
         self.experiment = ExperimentPage(self.state, self.current_plan)
+        if not reset_results and getattr(old_experiment, "_log_tail", None) is not None:
+            old_experiment._log_timer.stop()
+            self.experiment._log_tail = old_experiment._log_tail
+            self.experiment._log_queue = old_experiment._log_queue
+            self.experiment._log_ready_for_next = True
+            self.experiment.log_path.setText(old_experiment.log_path.text())
+            self.experiment.log_path.setEnabled(False)
+            self.experiment.log_browse.setEnabled(False)
+            self.experiment.log_toggle.setText("停止监听")
+            self.experiment.log_status.setText("监听已延续，等待下一次 Benchmark 结果。")
+            self.experiment._log_timer.start()
         self.experiment.result_saved.connect(self._result_saved)
         self.experiment.task_requested.connect(lambda: self.set_page(1))
         self.experiment.overview_requested.connect(lambda: self.set_page(0))
@@ -3024,7 +3262,7 @@ class MainWindow(QMainWindow):
             "duration_seconds": result["duration"],
             "comparable": result["condition"] == "与基线一致",
             "notes": result.get("notes", ""),
-            "source": "csv" if result.get("file") else "manual",
+            "source": "cs2_vprof" if result.get("source") == "cs2_vprof" else "csv" if result.get("file") else "manual",
             "configuration": configuration,
             "configuration_confirmed": bool(result.get("configuration_confirmed", False)),
         }
@@ -3059,6 +3297,12 @@ class MainWindow(QMainWindow):
                 fps_cap_known=self.state.fps_cap_checked,
                 vsync_known=self.state.vsync_checked,
             )
+        measurement_id = result.get("measurement_id", "")
+        if measurement_id and (measurement_id in self._submitted_log_ids or any(
+                item.get("configuration", {}).get("measurement_id") == measurement_id
+                for item in self.controller.repository.task_history(self.core_task.task_id))):
+            self.statusBar().showMessage("这条日志结果已经保存，请跑下一次 Benchmark。", 6000)
+            return
         try:
             candidate = self._record_from_result(result)
             evaluated_round = self.state.round_number
@@ -3068,6 +3312,16 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError, KeyError) as error:
             QMessageBox.warning(self, "结果无法评估", str(error))
             return
+        if measurement_id:
+            self._submitted_log_ids.add(measurement_id)
+            captures = DATA_DIR / "captures" / "cs2"
+            try:
+                captures.mkdir(parents=True, exist_ok=True)
+                (captures / f"{candidate.record_id}.txt").write_text(result.get("log_excerpt", ""), encoding="utf-8")
+            except OSError:
+                self.statusBar().showMessage("测试记录已保存，但原始 VProf 摘要无法写入采集目录。", 8000)
+            self.experiment._log_ready_for_next = True
+            self.experiment.log_status.setText("当前日志结果已保存，等待下一次 Benchmark；重复点击不会重复录入。")
         context = {"result": result, "candidate": candidate, "decision": decision, "round": evaluated_round, "evaluated_plan": evaluated_plan}
         if decision.rollback_required:
             if decision.accepted:
@@ -3448,7 +3702,7 @@ class MainWindow(QMainWindow):
                 if selection.plan.selection_reason:
                     message += f" · {selection.plan.selection_reason}"
             else:
-                message = selection.warning or "AI 规划暂不可用，已保留本地规则建议。"
+                message = f"下一步建议：{selection.plan.title}"
             self.statusBar().showMessage(message, 7000)
         else:
             self.experiment.set_planning(False)
@@ -3549,11 +3803,14 @@ class MainWindow(QMainWindow):
             AgentAction.REVERT_CHANGE: "撤销调整", AgentAction.FINISH: "完成优化",
         }
         action = "按实际配置继续" if decision.stop_reason == "player_profile" else action_names.get(decision.action, decision.action.value)
-        details = "\n".join(f"• {item}" for item in explanation.get("reasoning", []))
-        warning = f"\n\n{explanation['warning']}" if explanation.get("warning") else ""
+        details = "\n".join(f"• {item}" for item in explanation.get("reasoning", [])[:2])
+        message = explanation["summary"]
+        if details:
+            message += f"\n\n{details}"
+        message += f"\n\n下一步：{explanation['next_step']}"
         QMessageBox.information(
             self, "评估已生成",
-            f"结论：{action}\n{explanation['summary']}\n\n{details}\n\n下一步：{explanation['next_step']}{warning}",
+            message,
         )
         self.statusBar().showMessage(f"复测结果已保存 · {action}", 6000)
         self.set_page(4 if decision.task_complete else 2)
@@ -3569,7 +3826,7 @@ class MainWindow(QMainWindow):
             plan=context.get("plan_snapshot"),
             workflow=context.get("workflow_snapshot"),
         )
-        fallback["warning"] = "模型暂不可用，已改用本地说明。"
+        fallback["warning"] = ""
         self._explanation_finished(job_id, fallback)
 
     def _explanation_thread_finished(self, job_id: int, thread: QThread):
@@ -3664,6 +3921,8 @@ class MainWindow(QMainWindow):
         return task, baseline
 
     def closeEvent(self, event):
+        self.experiment._benchmark_macro = None
+        self.experiment._log_timer.stop()
         # Stop the planning, explanation, and API settings workers.  A
         # provider call may be blocking in urllib, so use a bounded wait and
         # terminate only as a last resort during application shutdown.
@@ -3682,13 +3941,19 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run_app(screenshot: Path | None = None, page_index: int = 0) -> int:
+def run_app(screenshot: Path | None = None, page_index: int = 0, game: str | None = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("GameTune Agent")
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(STYLESHEET)
-    window = MainWindow()
+    from game_launcher import GameLauncher
+    # Preserve the existing page screenshot command for regression tooling.
+    launcher = GameLauncher() if not screenshot or game else None
+    window = launcher or MainWindow()
+    if launcher and game:
+        launcher.open_game(game)
+        window = launcher.windows[game]
     window.show()
     if screenshot:
         screenshot.parent.mkdir(parents=True, exist_ok=True)
@@ -3700,12 +3965,13 @@ def run_app(screenshot: Path | None = None, page_index: int = 0) -> int:
             pixmap.fill(Qt.GlobalColor.transparent)
             window.render(pixmap)
             pixmap.save(str(screenshot))
-            app.quit()
+            app.exit(0)
 
-        QTimer.singleShot(100, lambda: window.set_page(page_index))
+        QTimer.singleShot(100, lambda: window.navigate(page_index) if game == "victoria3" else window.set_page(page_index))
         QTimer.singleShot(900, capture)
     else:
-        window.set_page(page_index)
+        if game == "cs2":
+            window.set_page(page_index)
     return app.exec()
 
 
@@ -3713,8 +3979,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GameTune Agent desktop UI")
     parser.add_argument("--screenshot", type=Path, help="Render the dashboard to a PNG and exit")
     parser.add_argument("--page", type=int, choices=range(7), default=0, help="Page index used by screenshot mode (0-6)")
+    parser.add_argument("--game", choices=("cs2", "victoria3"), help="Open a game workspace directly")
     args = parser.parse_args()
-    return run_app(args.screenshot, args.page)
+    return run_app(args.screenshot, args.page, args.game)
 
 
 if __name__ == "__main__":
