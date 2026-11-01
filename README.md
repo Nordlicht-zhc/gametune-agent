@@ -92,7 +92,7 @@ python app.py
 
 也可以直接双击项目根目录的 `GameTune.exe`，无需手动运行 Python。单文件 EXE 已包含 Python、Qt 和知识库，首次启动需要等待解压；任务记录保存在 EXE 旁的 `.data/gametune.db`，放在当前项目根目录时会继续使用原来的记录。移动 EXE 时，请同时保留旁边的 `.data` 文件夹，并选择可写目录。模型设置仍保存在当前 Windows 用户的应用数据目录中，密钥不包含在 EXE 内。
 
-源码修改后需重新打包。安装 `requirements-build.txt` 后双击 `build_exe.bat`，或在根目录执行 `python -m PyInstaller --noconfirm --distpath . --workpath .qa/build GameTune.spec`；输出为根目录的 `GameTune.exe`，构建中间文件位于 `.qa/build`。打包仅收集源码依赖和 `knowledge/*.json`，不会包含本地数据库、截图或已保存的 API 配置。
+源码仓库不包含预打包 EXE，首次使用或源码修改后需重新打包。安装 `requirements-build.txt` 后双击 `build_exe.bat`，或在根目录执行 `python -m PyInstaller --noconfirm --distpath . --workpath .qa/build GameTune.spec`；输出为根目录的 `GameTune.exe`，构建中间文件位于 `.qa/build`。打包仅收集源码依赖和 `knowledge/*.json`，不会包含本地数据库、截图或已保存的 API 配置。
 
 运行核心测试：
 
