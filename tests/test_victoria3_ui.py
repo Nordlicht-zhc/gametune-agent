@@ -49,6 +49,26 @@ class Victoria3UiTests(unittest.TestCase):
             self.assertEqual(page.repository.history(), [])
             page.close()
 
+    def test_main_window_navigation_reaches_victoria3_and_returns(self):
+        from app import MainWindow
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("app.provider_from_env", return_value=None), patch("app.load_saved_api_config", return_value=None):
+                window = MainWindow(database_path=Path(folder) / "navigation.db")
+            try:
+                window.show()
+                self.app.processEvents()
+                window.sidebar.group.button(6).click()
+                self.app.processEvents()
+                self.assertEqual(window.stack.currentIndex(), 6)
+                self.assertIs(window.stack.currentWidget(), window.victoria3)
+                self.assertEqual(window.sidebar.group.checkedId(), 6)
+                window.sidebar.group.button(0).click()
+                self.app.processEvents()
+                self.assertIs(window.stack.currentWidget(), window.dashboard)
+                self.assertEqual(window.sidebar.group.checkedId(), 0)
+            finally:
+                window.close()
+
     def test_report_is_embedded_and_apply_switches_tab(self):
         import json
         from tools.victoria3_local import LocalVictoria3

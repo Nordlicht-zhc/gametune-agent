@@ -11,7 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from app import ExperimentPage, MainWindow, TaskState
+from agent.api import APIConfig, OpenAICompatibleProvider
+from app import APISettingsPage, ExperimentPage, MainWindow, NewTaskPage, ReportPage, TaskState
 from models.schemas import AgentAction, BenchmarkRecord, Decision, Evidence, ExperimentPlan, OptimizationTask
 from agent.controller import GameTuneController
 
@@ -109,13 +110,189 @@ class UiWorkflowTests(unittest.TestCase):
             self.assertEqual(window.controller.repository.list_tasks(), [])
             window.close()
 
-    def test_actual_configuration_is_unchecked_by_default(self):
+    def test_limit_steps_and_restore_are_visible_on_experiment_page(self):
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT, "排除限帧", "帧率限制", "144", "不限帧且关闭垂直同步",
+            "原因", "假设", "至少测试两次", "记录变化，不要求提升", "最高 FPS 恢复为 144，垂直同步开启。",
+            1, setting_id="frame_limits", purpose="diagnostic",
+            required_configuration={"fps_cap": "0", "vsync": "disabled"},
+        )
+        page = ExperimentPage(TaskState(has_task=True), plan)
+        self.assertIn("至少 2 次", page.execution_guide.text())
+        self.assertNotIn("平均帧率变化超过 5%", " ".join(item.text() for item in page.findChildren(QLabel)))
+        page.set_rollback_pending(True)
+        self.assertIn("最高 FPS 恢复为 144", page.execution_guide.text())
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertTrue(page.rollback_button.isEnabled())
+        page.deleteLater()
+
+    def test_experiment_belongs_to_overview_and_can_return(self):
+        with tempfile.TemporaryDirectory() as folder:
+            window = MainWindow(database_path=Path(folder) / "ui.db")
+            window.set_page(2)
+            window.experiment.overview_button.click()
+            self.assertEqual(window.stack.currentIndex(), 0)
+            self.assertIn("执行本轮实验", window.sidebar.group.button(2).text())
+            window.close()
+
+    def test_assessment_returns_to_action_page_until_task_is_complete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            window = MainWindow(database_path=Path(folder) / "ui.db", controller=FakeController())
+            window._replace_report = Mock()
+            for complete, expected in ((False, 2), (True, 4)):
+                decision = Decision(AgentAction.FINISH if complete else AgentAction.RETEST, "结果", task_complete=complete)
+                context = {"decision": decision, "result": {}, "task_id": "test"}
+                window._explanation_context = Mock(return_value=context)
+                with patch("app.QMessageBox.information"):
+                    window._explanation_finished(1, {"summary": "结果", "reasoning": [], "next_step": "继续"})
+                self.assertEqual(window.stack.currentIndex(), expected)
+            window.close()
+
+    def test_actual_configuration_needs_no_confirmation_checkbox(self):
         page = ExperimentPage(TaskState())
-        self.assertFalse(page.configuration_confirmed.isChecked())
+        self.assertFalse(hasattr(page, "configuration_confirmed"))
+        self.assertEqual(page.repeats.value(), 1)
         self.assertTrue(page.save_button.isEnabled())
         page.set_completed()
         self.assertFalse(page.save_button.isEnabled())
         page.deleteLater()
+
+    def test_limit_diagnostic_inputs_submit_actual_values_and_block_during_restore(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        with tempfile.TemporaryDirectory() as folder:
+            controller = GameTuneController(Path(folder) / "cap-ui.db")
+            current_task = replace(task(), fps_cap=144, vsync="enabled")
+            baseline = replace(record(144, 100), configuration={"fps_cap": "144", "vsync": "enabled"})
+            _, plan = controller.create_task(current_task, baseline)
+            page = ExperimentPage(TaskState(fps_cap=144, vsync="enabled"), plan)
+            page.resize(1100, 1000)
+            page.show()
+            application().processEvents()
+            submitted = []
+            page.result_saved.connect(submitted.append)
+            page._actual_fields["fps_cap"].selectAll()
+            QTest.keyClicks(page._actual_fields["fps_cap"], "0")
+            page._actual_fields["vsync"].setText("已关闭")
+            page.actual_setting.setText("不限帧且关闭垂直同步")
+            page.avg.setValue(300)
+            page.low.setValue(180)
+            QTest.mouseClick(page.save_button, Qt.MouseButton.LeftButton)
+            self.assertEqual(len(submitted), 1)
+            self.assertEqual(submitted[0]["configuration"]["fps_cap"], "0")
+            self.assertEqual(submitted[0]["configuration"]["vsync"], "disabled")
+            self.assertTrue(submitted[0]["configuration_confirmed"])
+            page.set_rollback_pending(True)
+            QTest.mouseClick(page.save_button, Qt.MouseButton.LeftButton)
+            self.assertEqual(len(submitted), 1)
+            self.assertFalse(page._actual_fields["fps_cap"].isEnabled())
+            restored = []
+            page.rollback_requested.connect(lambda: restored.append(True))
+            QTest.mouseClick(page.rollback_button, Qt.MouseButton.LeftButton)
+            self.assertEqual(restored, [True])
+            page.close()
+            page.deleteLater()
+
+    def test_uncapped_choice_and_final_restore_preserve_verified_settings_and_report_basis(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        with tempfile.TemporaryDirectory() as folder:
+            controller = GameTuneController(Path(folder) / "uncapped-ui.db")
+            current_task = replace(task(), fps_cap=144, vsync="enabled", max_rounds=2,
+                                   target_avg_fps=1000, target_low_fps=600)
+            config = {"fps_cap": "144", "vsync": "enabled", "shadow_quality": "高", "dynamic_shadows": "all", "msaa_mode": "8x_msaa"}
+            baseline = replace(record(144, 100), gpu_usage=60, configuration=config)
+            controller.create_task(current_task, baseline)
+            reference = replace(record(300, 150), gpu_usage=99,
+                                configuration={**config, "fps_cap": "0", "vsync": "disabled"}, repeats=2)
+            controller.evaluate(current_task, baseline, reference, 1)
+            controller.confirm_rollback(current_task)
+            evidence, choice = controller.plan_after_result(current_task, baseline, baseline, 2)
+            window = MainWindow(database_path=Path(folder) / "uncapped-ui.db", controller=controller)
+            window.core_task, window.baseline_record = current_task, baseline
+            window._load_state_from_task(current_task, baseline)
+            window.current_evidence, window.current_plan = evidence, choice
+            window._start_plan_selection = Mock()
+            window._start_explanation = Mock()
+            window._rebuild_task_pages()
+            self.assertEqual(window.experiment.actual_setting.text(), "请选择验证目标")
+            self.assertFalse(window.experiment.avg.isEnabled())
+            window.experiment.actual_setting.setText("不限帧验证，最终恢复原限帧")
+            QTest.mouseClick(window.experiment.save_button, Qt.MouseButton.LeftButton)
+            self.assertEqual(window.current_plan.setting_id, "shadow_quality")
+            self.assertEqual(len(controller.repository.task_history(current_task.task_id)), 2)
+            plan = window.current_plan
+            with patch("app.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
+                window._result_saved({
+                    "avg": 330, "low": 180, "gpu": 99, "repeats": 3, "duration": 60,
+                    "condition": "与基线一致", "configuration_confirmed": True,
+                    "resolution": current_task.resolution,
+                    "configuration": {**reference.configuration, plan.setting_id: plan.new_value},
+                })
+            self.assertTrue(window.experiment.rollback_pending)
+            self.assertEqual(controller.workflow_state(current_task.task_id).value, "awaiting_rollback")
+            self.assertIn("保留本轮已验证画面设置", window.current_plan.rollback)
+            with patch("app.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+                window._confirm_pending_rollback()
+            self.assertEqual(window.state.fps_cap, 144)
+            self.assertEqual(window.state.vsync, "enabled")
+            self.assertEqual(window.state.shadow_quality, "中")
+            self.assertFalse(window.experiment.save_button.isEnabled())
+            window._replace_report(best_record=controller.best_record(current_task.task_id))
+            text = " ".join(item.text() for item in window.report.findChildren(QLabel))
+            self.assertIn("+10.0%", text)
+            self.assertIn("恢复限帧后的性能尚未重新测量", text)
+            window.close()
+
+    def test_baseline_and_experiment_copy_explain_adaptive_test_count(self):
+        new_task = NewTaskPage(TaskState())
+        self.assertTrue(new_task.baseline_stage.isHidden())
+        self.assertEqual(len(new_task.baseline_run_inputs), 3)
+        self.assertEqual(new_task.baseline_run_inputs[0]["avg_fps"].value(), 0)
+        self.assertIn("实际测试", new_task.baseline_confirmed_input.text())
+        new_task.deleteLater()
+
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT,
+            "降低分辨率",
+            "分辨率",
+            "2560 × 1440",
+            "1920 × 1080",
+            "原因", "假设", "方法", "标准", "恢复", 1,
+            setting_id="resolution",
+        )
+        page = ExperimentPage(TaskState(), plan)
+        guide_text = " ".join(item.text() for item in page.findChildren(QLabel))
+        self.assertIn("先测 1 次", guide_text)
+        self.assertIn("累计 3 次", guide_text)
+        page.deleteLater()
+
+    def test_model_picker_accepts_discovered_and_manual_models(self):
+        page = APISettingsPage()
+        self.assertTrue(page.model.isEditable())
+        self.assertEqual(page.model.count(), 0)
+        page._models_succeeded(0, ["gpt-zeta", "gpt-alpha"])
+        self.assertEqual([page.model.itemText(i) for i in range(page.model.count())], ["gpt-zeta", "gpt-alpha"])
+        self.assertEqual(page.model.currentText(), "gpt-zeta")
+
+        page.model.setCurrentText("custom-model")
+        page._models_succeeded(0, ["gpt-alpha"])
+        self.assertEqual(page.model.itemText(0), "custom-model")
+        self.assertEqual(page.model.currentText(), "custom-model")
+        page.deleteLater()
+
+    def test_main_window_loads_saved_api_config(self):
+        config = APIConfig("https://example.test/v1", "secret-token", "model-a", 20, "low")
+        with tempfile.TemporaryDirectory() as folder, patch("app.load_saved_api_config", return_value=config):
+            window = MainWindow(database_path=Path(folder) / "ui.db")
+            self.assertIsInstance(window.controller.model_provider, OpenAICompatibleProvider)
+            self.assertEqual(window.api_settings.base_url.text(), config.base_url)
+            self.assertEqual(window.api_settings.api_key.text(), config.api_key)
+            self.assertEqual(window.api_settings.model.currentText(), config.model)
+            self.assertEqual(window.api_settings.reasoning.currentData(), config.reasoning_effort)
+            window.close()
 
     def test_internal_graphics_mode_is_shown_as_clear_chinese(self):
         plan = ExperimentPlan(
@@ -137,6 +314,107 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertEqual(page._supplement_value(), "hybrid")
         page.actual_setting.setText("独显直连")
         self.assertEqual(page._supplement_value(), "dgpu")
+        page.deleteLater()
+
+    def test_power_mode_uses_selectable_values_and_stores_domain_value(self):
+        plan = ExperimentPlan(
+            AgentAction.PROPOSE_EXPERIMENT,
+            "开启笔记本性能模式",
+            "供电 / 性能模式",
+            "接通电源 · 平衡模式",
+            "接通电源 · 性能模式",
+            "原因", "假设", "方法", "标准", "恢复", 1,
+            setting_id="power_mode",
+        )
+        page = ExperimentPage(TaskState(power_mode="ac_balanced"), plan)
+        self.assertFalse(page.actual_setting.isEditable())
+        self.assertEqual(page.actual_setting.count(), 4)
+        page.actual_setting.setText("接通电源 · 性能模式")
+        configuration = page._actual_configuration()
+        self.assertEqual(configuration["actual_setting_value"], "接通电源 · 性能模式")
+        self.assertEqual(configuration["power_mode"], "ac_performance")
+        page.deleteLater()
+
+    def test_generic_optimization_request_has_direction_and_single_setting_fields(self):
+        plan = ExperimentPlan(
+            AgentAction.REQUEST_DATA,
+            "选择通用优化方向并指定一项设置",
+            "方向与单项设置",
+            "由你填写当前值",
+            "由你填写调整值",
+            "原因", "假设", "方法", "标准", "不修改设置", 1,
+            setting_id="user_adjustment",
+        )
+        page = ExperimentPage(TaskState(), plan)
+        self.assertEqual(
+            [page.adjustment_direction.itemText(index) for index in range(page.adjustment_direction.count())],
+            ["请选择优化方向", "GPU 画面负载", "CPU 后台负载", "供电与散热", "画面稳定性", "游戏内画面质量"],
+        )
+        page.adjustment_direction.setCurrentText("GPU 画面负载")
+        page.adjustment_setting_name.setText("全局阴影效果")
+        page.adjustment_current_value.setText("高")
+        page.adjustment_new_value.setText("中")
+        self.assertEqual(page._supplement_value(), "GPU 画面负载 | 全局阴影效果 | 高 | 中")
+        page.deleteLater()
+
+    def test_cs2_choices_match_installed_simplified_chinese_menu(self):
+        page = NewTaskPage(TaskState())
+        labels = {item.text() for item in page.findChildren(QLabel)}
+        self.assertTrue({"游戏最高FPS", "V-Sync", "全局阴影效果", "动态阴影"}.issubset(labels))
+        self.assertEqual(
+            [page.display_mode_input.itemText(index) for index in range(page.display_mode_input.count())],
+            ["全屏", "全屏窗口模式", "窗口模式"],
+        )
+        self.assertEqual(
+            [page.vsync_input.itemText(index) for index in range(page.vsync_input.count())],
+            ["已禁用", "已启用", "未确认"],
+        )
+        self.assertEqual(
+            [page.dynamic_shadows_input.itemText(index) for index in range(page.dynamic_shadows_input.count())],
+            ["全部", "仅限日光", "未确认"],
+        )
+        self.assertEqual(
+            [page.advanced_video_inputs["texture_filtering"].itemText(index) for index in range(6)],
+            ["双线性", "三线性", "异向 2X", "异向 4X", "异向 8X", "异向 16X"],
+        )
+        self.assertEqual(
+            set(page.advanced_video_inputs),
+            {"video_preset", "player_contrast", "nvidia_gsync", "nvidia_reflex", "amd_anti_lag", "msaa_mode",
+             "texture_detail", "texture_filtering", "shader_detail", "particle_detail",
+             "ambient_occlusion", "hdr", "fsr"},
+        )
+        page.deleteLater()
+
+    def test_report_identifies_the_model_that_generated_ai_text(self):
+        page = ReportPage(
+            TaskState(),
+            explanation={
+                "summary": "这次调整可以保留。",
+                "reasoning": ["帧率变化很小。"],
+                "next_step": "继续下一项。",
+                "warning": "",
+                "source": "model",
+                "model": "deepseek-flash",
+            },
+        )
+        texts = {item.text() for item in page.findChildren(QLabel)}
+        self.assertIn("AI 说明 · deepseek-flash", texts)
+        page.deleteLater()
+
+    def test_report_warning_text_keeps_vertical_padding(self):
+        page = ReportPage(
+            TaskState(),
+            explanation={
+                "summary": "这次调整可以保留。",
+                "reasoning": ["帧率变化很小。"],
+                "next_step": "继续下一项。",
+                "warning": "当前只有汇总数据，请补充逐次测试记录后再下结论。",
+                "source": "local",
+            },
+        )
+        warning = page.findChild(QLabel, "warningBox")
+        self.assertIsNotNone(warning)
+        self.assertGreaterEqual(warning.minimumHeight(), 30)
         page.deleteLater()
 
     def test_retest_keeps_the_same_round_and_plan(self):
@@ -190,7 +468,7 @@ class UiWorkflowTests(unittest.TestCase):
             window.current_plan = ExperimentPlan(
                 AgentAction.REQUEST_DATA,
                 "确认阴影质量",
-                "全局阴影质量",
+                "全局阴影效果",
                 "未知",
                 "记录当前值",
                 "原因",
@@ -215,13 +493,14 @@ class UiWorkflowTests(unittest.TestCase):
             baseline = replace(
                 record(200, 100),
                 gpu_usage=99,
-                configuration={"shadow_quality": "高", "resolution": current_task.resolution},
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all", "resolution": current_task.resolution},
             )
             controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
             candidate = replace(
                 record(100, 50),
                 configuration={
                     "shadow_quality": "中",
+                    "dynamic_shadows": "all",
                     "resolution": current_task.resolution,
                     "planned_setting_id": "shadow_quality",
                     "actual_setting_value": "中",

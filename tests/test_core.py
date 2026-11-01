@@ -12,15 +12,15 @@ from agent.evaluator import evaluate_result
 from agent.api import APIConfig, ModelMessage, ModelRequest, ModelResponse, OpenAICompatibleProvider
 from agent.explainer import explain_decision
 from agent.planner import plan_next_experiment
-from agent.state_machine import Workflow, WorkflowState
+from agent.state_machine import Workflow, WorkflowPhase, WorkflowState
 from agent.validator import KnowledgeBase, PlanValidationError, validate_plan
 from models.schemas import ExperimentPlan
 from models.schemas import AgentAction, BenchmarkRecord, Decision, OptimizationTask
-from tools.calculate_metrics import metrics_from_frame_times, normalized_score
+from tools.calculate_metrics import metrics_from_frame_times, normalized_score, weighted_relative_change
 from tools.import_benchmark import import_benchmark_csv
 from tools.resolution import aspect_ratio_name, lower_resolution_same_aspect, normalize_resolution
 from tools.hardware_catalog import HardwareCatalog
-from tools.analyze_evidence import analyze_evidence
+from tools.analyze_evidence import analyze_evidence, dominant_hypothesis, evidence_support_level
 
 
 def task() -> OptimizationTask:
@@ -49,6 +49,10 @@ class MetricsTests(unittest.TestCase):
 
     def test_score_is_capped_at_target(self):
         self.assertEqual(normalized_score(600, 500, 300, 210, "competitive"), 100.0)
+
+    def test_weighted_change_is_not_capped_at_target(self):
+        self.assertAlmostEqual(weighted_relative_change(12.5, 0.0, "competitive"), 4.375)
+        self.assertAlmostEqual(weighted_relative_change(0.0, 10.0, "competitive"), 6.5)
 
 
 class ResolutionTests(unittest.TestCase):
@@ -97,6 +101,46 @@ class HardwareCatalogTests(unittest.TestCase):
         self.assertEqual(plan.setting, "GPU 功耗")
 
 
+class EvidenceWeightTests(unittest.TestCase):
+    def test_missing_conditions_reduce_support_strength(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 100, 57, current_task.resolution, current_task.test_scene, repeats=3)
+        known = analyze_evidence(current_task, current, fps_cap_known=True, vsync_known=True)
+        unknown = analyze_evidence(current_task, current, fps_cap_known=False, vsync_known=False)
+        known_hypothesis, known_strength = dominant_hypothesis(known)
+        unknown_hypothesis, unknown_strength = dominant_hypothesis(unknown)
+        self.assertEqual(known_hypothesis, "cpu_or_other")
+        self.assertEqual(unknown_hypothesis, "cpu_or_other")
+        self.assertLess(unknown_strength, known_strength)
+        self.assertEqual(evidence_support_level(unknown), "不足")
+
+    def test_invalid_resolution_diagnostic_cannot_become_cpu_evidence(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 100, 60, current_task.resolution, current_task.test_scene, repeats=3)
+        evidence = analyze_evidence(
+            current_task,
+            current,
+            fps_cap_known=True,
+            vsync_known=True,
+            diagnostic_results=[{
+                "kind": "resolution",
+                "avg_delta_pct": 0.0,
+                "supports": "insufficient",
+                "valid": False,
+                "summary": "诊断结果无效：测试条件不一致。",
+            }],
+        )
+        self.assertNotIn("diagnostic_resolution_flat", {item.code for item in evidence})
+        self.assertEqual(dominant_hypothesis(evidence)[0], "cpu_or_other")
+
+    def test_measured_cause_is_not_overruled_by_target_miss_symptom(self):
+        current_task = task()
+        current = BenchmarkRecord(180, 50, 98, current_task.resolution, current_task.test_scene, repeats=3)
+        evidence = analyze_evidence(current_task, current, fps_cap_known=True, vsync_known=True)
+        hypothesis, _ = dominant_hypothesis(evidence)
+        self.assertEqual(hypothesis, "gpu")
+
+
 class ImportTests(unittest.TestCase):
     def test_imports_summary_runs_and_uses_median(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -129,6 +173,44 @@ class EvaluationTests(unittest.TestCase):
         decision = evaluate_result(task(), record(284, 168), record(310, 215), round_number=1)
         self.assertEqual(decision.action, AgentAction.FINISH)
 
+    def test_above_target_average_gain_is_not_hidden_by_capped_score(self):
+        decision = evaluate_result(task(), record(320, 180), record(360, 180), round_number=1)
+        self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
+        self.assertGreater(decision.weighted_delta_pct, 1.0)
+
+    def test_regression_is_checked_before_target_completion(self):
+        decision = evaluate_result(task(), record(400, 205), record(310, 210), round_number=1)
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertTrue(decision.rollback_required)
+
+    def test_tiny_weighted_gain_requests_retest(self):
+        decision = evaluate_result(task(), record(200, 150), record(210, 146.25), round_number=1)
+        self.assertEqual(decision.action, AgentAction.RETEST)
+        self.assertLess(decision.weighted_delta_pct, 1.0)
+
+    def test_visual_mode_rejects_unconfirmed_quality_drop(self):
+        visual_task = OptimizationTask(
+            "视觉模式", "Counter-Strike 2", "CPU", "GPU", "2560 × 1440", "144 Hz", "Workshop", 300, 210,
+            mode="visual",
+        )
+        baseline = BenchmarkRecord(
+            250, 170, 95, visual_task.resolution, visual_task.test_scene, repeats=3,
+            configuration={"shadow_quality": "高"},
+        )
+        candidate = BenchmarkRecord(
+            300, 220, 95, visual_task.resolution, visual_task.test_scene, repeats=3,
+            configuration={"shadow_quality": "中"},
+        )
+        decision = evaluate_result(visual_task, baseline, candidate, round_number=1, setting_id="shadow_quality")
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertIn("画质下降", decision.reasons[0])
+
+    def test_best_record_ranking_keeps_above_target_weighted_gain(self):
+        best = record(320, 220)
+        candidate = record(400, 215)
+        selected = GameTuneController._better_record(task(), candidate, best)
+        self.assertIs(selected, candidate)
+
     def test_changed_conditions_are_not_evaluated(self):
         decision = evaluate_result(task(), record(284, 168), record(330, 220, comparable=False), round_number=1)
         self.assertEqual(decision.action, AgentAction.RETEST)
@@ -153,6 +235,56 @@ class EvaluationTests(unittest.TestCase):
         decision = evaluate_result(task(), record(284, 168), candidate, round_number=1)
         self.assertEqual(decision.action, AgentAction.RETEST)
 
+    def test_adaptive_screen_reverts_obvious_regression_after_one_run(self):
+        candidate = record(250, 140)
+        candidate.repeats = 1
+        candidate.runs = [{"avg_fps": 250, "low_fps": 140}]
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertTrue(decision.rollback_required)
+        self.assertFalse(decision.task_complete)
+
+    def test_adaptive_screen_accumulates_promising_runs_before_acceptance(self):
+        candidate = record(296, 174)
+        candidate.repeats = 1
+        candidate.runs = [{"avg_fps": 296, "low_fps": 174}]
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.RETEST)
+        self.assertIn("累计达到 3 次", decision.summary)
+
+    def test_adaptive_screen_does_not_repeat_three_evidence_backed_neutral_runs(self):
+        candidate = record(285, 169)
+        candidate.runs = [
+            {"avg_fps": 285, "low_fps": 169},
+            {"avg_fps": 285, "low_fps": 169},
+            {"avg_fps": 285, "low_fps": 169},
+        ]
+        candidate.repeats = 3
+        decision = evaluate_result(
+            task(),
+            record(284, 168),
+            candidate,
+            round_number=1,
+            minimum_repeats=1,
+            acceptance_repeats=3,
+        )
+        self.assertEqual(decision.action, AgentAction.REVERT_CHANGE)
+        self.assertIn("下一项设置", decision.summary)
+
 
 class PersistenceTests(unittest.TestCase):
     def test_controller_persists_history(self):
@@ -174,9 +306,16 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             controller = GameTuneController(Path(folder) / "state.db")
             current_task = task()
-            baseline = record(284, 168)
+            baseline = BenchmarkRecord(
+                284, 168, 99, "2560 × 1440", "Workshop", repeats=3,
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all"},
+            )
             _, first_plan = controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
-            candidate = record(296, 174, resolution="1920 × 1080")
+            candidate = BenchmarkRecord(
+                296, 174, 99, baseline.resolution, baseline.test_scene,
+                repeats=3,
+                configuration={"shadow_quality": "中", "dynamic_shadows": "all"},
+            )
             decision = controller.evaluate(current_task, baseline, candidate, 1)
             self.assertEqual(decision.action, AgentAction.RETEST)
             evidence, plan = controller.plan_after_result(current_task, candidate, baseline, 1)
@@ -189,9 +328,16 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             controller = GameTuneController(Path(folder) / "state.db")
             current_task = task()
-            baseline = record(284, 168)
+            baseline = BenchmarkRecord(
+                284, 168, 99, "2560 × 1440", "Workshop", repeats=3,
+                configuration={"shadow_quality": "高", "dynamic_shadows": "all"},
+            )
             controller.create_task(current_task, baseline, fps_cap_known=True, vsync_known=True)
-            candidate = record(320, 190)
+            candidate = BenchmarkRecord(
+                320, 190, 99, baseline.resolution, baseline.test_scene,
+                repeats=3,
+                configuration={"shadow_quality": "中", "dynamic_shadows": "all"},
+            )
             decision = controller.evaluate(current_task, baseline, candidate, 1)
             self.assertEqual(decision.action, AgentAction.KEEP_CHANGE)
             self.assertEqual(controller.current_record(current_task.task_id).record_id, candidate.record_id)
@@ -256,6 +402,26 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", sent_payloads[0])
         self.assertEqual(sent_payloads[1]["reasoning_effort"], "high")
 
+    def test_openai_compatible_lists_models(self):
+        class HTTPResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"data": [{"id": "zeta"}, {"id": "alpha"}, {"id": "alpha"}]}).encode("utf-8")
+
+        def fake_urlopen(http_request, timeout):
+            self.assertTrue(http_request.full_url.endswith("/v1/models"))
+            self.assertEqual(timeout, 7.0)
+            return HTTPResponse()
+
+        with patch("agent.api.urllib.request.urlopen", side_effect=fake_urlopen):
+            models = OpenAICompatibleProvider.list_models("https://example.test/v1/", "secret", 7)
+        self.assertEqual(models, ["alpha", "zeta"])
+
     def test_provider_receives_structured_request(self):
         provider = FakeProvider()
         current_task = task()
@@ -263,10 +429,18 @@ class ModelInterfaceTests(unittest.TestCase):
         explanation = explain_decision(provider, current_task, decision)
         self.assertEqual(explanation["summary"], "建议复测")
         self.assertEqual(explanation["source"], "model")
+        self.assertEqual(explanation["model"], "fake-model")
         self.assertIsNotNone(provider.last_request)
         self.assertEqual(provider.last_request.response_format, "json")
         self.assertEqual(provider.last_request.metadata["purpose"], "decision_explanation")
         self.assertEqual(provider.last_request.metadata["task_id"], current_task.task_id)
+        self.assertIn("结果说明助手", provider.last_request.messages[0].content)
+        self.assertIn("省略重复提醒", provider.last_request.messages[0].content)
+        payload = json.loads(provider.last_request.messages[1].content)
+        self.assertIn("不熟悉性能分析", payload["audience"])
+        self.assertIn("简体中文", payload["language"])
+        self.assertIn("核对实际配置", payload["must_follow"])
+        self.assertTrue(any("must_follow" in item for item in payload["constraints"]))
 
     def test_completed_task_uses_final_report_prompt(self):
         provider = FakeProvider()
@@ -283,12 +457,40 @@ class ModelInterfaceTests(unittest.TestCase):
         self.assertEqual(explanation["source"], "model")
         self.assertIsNotNone(provider.last_request)
         self.assertEqual(provider.last_request.metadata["purpose"], "final_report")
-        self.assertEqual(provider.last_request.max_output_tokens, 900)
-        self.assertIn("最终报告撰写器", provider.last_request.messages[0].content)
+        self.assertEqual(provider.last_request.max_output_tokens, 3000)
+        self.assertIn("最终结果撰写助手", provider.last_request.messages[0].content)
+        self.assertIn("最终结果撰写助手", provider.last_request.messages[0].content)
         payload = json.loads(provider.last_request.messages[1].content)
         self.assertEqual(payload["report_type"], "final_report")
         self.assertTrue(payload["final_decision"]["rollback_required"])
-        self.assertTrue(any("先要求恢复" in item for item in payload["constraints"]))
+        self.assertTrue(any("需要恢复配置" in item for item in payload["constraints"]))
+
+    def test_invalid_submission_cannot_be_reinterpreted_by_model(self):
+        provider = FakeProvider()
+        current_task = task()
+        candidate = record(596, 208)
+        candidate.gpu_usage = 95
+        candidate.configuration_confirmed = False
+        decision = Decision(AgentAction.RETEST, "请核对实际配置后重新提交。",
+                            reasons=["诊断设置未确认"], retry_same_experiment=True)
+        workflow = {"submitted_result": candidate.to_dict(), "evaluated_plan": None}
+        explanation = explain_decision(provider, current_task, decision, workflow=workflow)
+        self.assertEqual(explanation["summary"], decision.summary)
+        self.assertEqual(explanation["reasoning"], decision.reasons)
+        payload = json.loads(provider.last_request.messages[-1].content)
+        self.assertEqual(payload["workflow"]["submitted_result"]["gpu_usage"], 95)
+        self.assertIn("核对", explanation["next_step"])
+
+    def test_generated_operations_are_replaced_by_workflow_action(self):
+        provider = FakeProvider()
+        decision = Decision(AgentAction.REVERT_CHANGE, "诊断完成，请恢复原配置。",
+                            rollback_required=True)
+        explanation = explain_decision(provider, task(), decision)
+        self.assertIn("恢复", explanation["next_step"])
+        self.assertNotEqual(explanation["next_step"], "复测")
+        restored = explain_decision(provider, task(), decision,
+                                    workflow={"rollback_confirmed": True, "submitted_result": None})
+        self.assertIn("已确认恢复", restored["next_step"])
 
     def test_missing_provider_uses_local_fallback(self):
         current_task = task()
@@ -296,7 +498,7 @@ class ModelInterfaceTests(unittest.TestCase):
         explanation = explain_decision(None, current_task, decision)
         self.assertEqual(explanation["summary"], decision.summary)
         self.assertEqual(explanation["source"], "local")
-        self.assertIn("未使用模型 API", explanation["warning"])
+        self.assertEqual(explanation["warning"], "")
 
 
 class WorkflowTests(unittest.TestCase):
@@ -314,6 +516,15 @@ class WorkflowTests(unittest.TestCase):
     def test_illegal_transition_is_rejected(self):
         with self.assertRaises(ValueError):
             Workflow().finish()
+
+    def test_data_collection_phase_depends_on_its_purpose(self):
+        workflow = Workflow()
+        workflow.set_phase("optimization", action="request_data", setting_id="cpu_metrics")
+        self.assertEqual(workflow.phase, WorkflowPhase.DIAGNOSIS)
+        workflow.set_phase("diagnostic", action="request_data", setting_id="user_adjustment")
+        self.assertEqual(workflow.phase, WorkflowPhase.OPTIMIZATION)
+        workflow.set_phase("diagnostic", action="request_data", setting_id="shadow_quality")
+        self.assertEqual(workflow.phase, WorkflowPhase.OPTIMIZATION)
 
     def test_unknown_recommendation_is_rejected(self):
         plan = ExperimentPlan(

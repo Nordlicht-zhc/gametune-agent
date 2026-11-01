@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 .data/
 .qa/
+GameTune*.exe
+Lecture*.pdf

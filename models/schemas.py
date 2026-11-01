@@ -40,6 +40,12 @@ class OptimizationTask:
     graphics_mode: str = "unknown"
     power_mode: str = "unknown"
     cooling_mode: str = "unknown"
+    display_mode: str = "fullscreen"
+    fps_cap: int | None = None
+    vsync: str = "unknown"
+    shadow_quality: str = "unknown"
+    dynamic_shadows: str = "unknown"
+    video_settings: dict[str, str] = field(default_factory=dict)
     task_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=utc_now)
 
@@ -59,6 +65,23 @@ class OptimizationTask:
             or not 20 <= self.gpu_power_w <= 250
         ):
             raise ValueError("笔记本 GPU 功耗应在 20W 到 250W 之间，未知时请留空")
+        if self.fps_cap is not None and (
+            isinstance(self.fps_cap, bool) or not isinstance(self.fps_cap, int) or not 0 <= self.fps_cap <= 1000
+        ):
+            raise ValueError("游戏内最大 FPS 应在 0 到 1000 之间，0 表示不限制")
+        if self.display_mode not in {"fullscreen", "borderless", "windowed"}:
+            raise ValueError("显示模式不受支持")
+        if self.vsync not in {"disabled", "enabled", "unknown"}:
+            raise ValueError("垂直同步状态不受支持")
+        if self.shadow_quality not in {"低", "中", "高", "非常高", "unknown"}:
+            raise ValueError("全局阴影质量档位不受支持")
+        if self.dynamic_shadows not in {"sun_only", "all", "unknown"}:
+            raise ValueError("动态阴影档位不受支持")
+        if not isinstance(self.video_settings, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.video_settings.items()
+        ):
+            raise ValueError("高级视频设置必须是文本键值对")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -151,6 +174,23 @@ class ExperimentPlan:
     # Stable rule identifier.  Keep it optional for existing callers and
     # persisted plans that only contain the display label.
     setting_id: str = ""
+    purpose: str = "auto"
+    planning_source: str = "local"
+    selection_reason: str = ""
+    reference_record_id: str = ""
+    reference_avg_fps: float | None = None
+    reference_low_fps: float | None = None
+    diagnostic_record_id: str = ""
+    required_configuration: dict[str, str] = field(default_factory=dict)
+    planning_context: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.purpose == "auto":
+            self.purpose = "diagnostic" if self.action == AgentAction.REQUEST_DATA else "optimization"
+        if self.purpose not in {"diagnostic", "optimization"}:
+            raise ValueError("实验用途必须是诊断或优化验证")
+        if self.planning_source not in {"local", "model"}:
+            raise ValueError("计划来源不受支持")
 
 
 @dataclass(slots=True)
@@ -160,6 +200,10 @@ class Decision:
     avg_delta_pct: float = 0.0
     low_delta_pct: float = 0.0
     score_delta: float = 0.0
+    # Raw, uncapped change using the task mode's FPS/1% Low preference.  This
+    # is kept separate from ``score_delta`` because the latter is a capped
+    # target-completion display value.
+    weighted_delta_pct: float = 0.0
     needs_retest: bool = False
     reasons: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
@@ -170,6 +214,8 @@ class Decision:
     stop_reason: str = ""
     retry_same_experiment: bool = False
     rollback_required: bool = False
+    diagnostic_summary: str = ""
+    measurement_valid: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

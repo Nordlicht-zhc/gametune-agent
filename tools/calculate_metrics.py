@@ -5,6 +5,53 @@ from statistics import median
 from typing import Iterable
 
 
+# These weights describe the user's optimization preference.  They are used
+# for comparing a candidate with the currently accepted configuration; the
+# target-completion score below remains a separate, capped display metric.
+MODE_WEIGHTS: dict[str, tuple[float, float]] = {
+    "competitive": (0.35, 0.65),
+    "balanced": (0.50, 0.50),
+    "visual": (0.60, 0.40),
+}
+
+
+def metric_weights(mode: str) -> tuple[float, float]:
+    """Return the average-FPS and 1% Low weights for an optimization mode."""
+    return MODE_WEIGHTS.get(str(mode).strip(), MODE_WEIGHTS["competitive"])
+
+
+def weighted_relative_change(avg_delta_pct: float, low_delta_pct: float, mode: str) -> float:
+    """Combine raw percentage changes without capping values at the target.
+
+    This is deliberately different from :func:`normalized_score`: a target
+    completion score answers "how close are we to the user's target?", while
+    this value answers "did the candidate actually improve the accepted
+    configuration?".  Keeping those concepts separate prevents an
+    above-target FPS gain from disappearing behind a 100-point cap.
+    """
+    avg_weight, low_weight = metric_weights(mode)
+    return avg_weight * float(avg_delta_pct) + low_weight * float(low_delta_pct)
+
+
+def weighted_performance_score(
+    avg_fps: float,
+    low_fps: float,
+    target_avg: float,
+    target_low: float,
+    mode: str,
+) -> float:
+    """Return an uncapped weighted performance index for record ranking.
+
+    Unlike :func:`normalized_score`, this index does not clamp values above
+    the target.  It is used only to choose the best verified record after a
+    candidate has already passed the evaluator's regression and repeat checks.
+    """
+    avg_weight, low_weight = metric_weights(mode)
+    avg_ratio = float(avg_fps) / float(target_avg)
+    low_ratio = float(low_fps) / float(target_low)
+    return round((avg_weight * avg_ratio + low_weight * low_ratio) * 100, 4)
+
+
 def metrics_from_frame_times(frame_times_ms: Iterable[float]) -> dict[str, float | int]:
     """Calculate FPS using the documented slowest-1%-frame definition."""
     values = [float(value) for value in frame_times_ms if isfinite(float(value)) and float(value) > 0]
@@ -51,12 +98,7 @@ def median_summary(runs: Iterable[dict[str, float]]) -> dict:
 
 
 def normalized_score(avg_fps: float, low_fps: float, target_avg: float, target_low: float, mode: str) -> float:
-    weights = {
-        "competitive": (0.35, 0.65),
-        "balanced": (0.50, 0.50),
-        "visual": (0.60, 0.40),
-    }
-    avg_weight, low_weight = weights.get(mode, weights["competitive"])
+    avg_weight, low_weight = metric_weights(mode)
     avg_ratio = min(max(avg_fps / target_avg, 0.0), 1.0)
     low_ratio = min(max(low_fps / target_low, 0.0), 1.0)
     return round((avg_weight * avg_ratio + low_weight * low_ratio) * 100, 2)
